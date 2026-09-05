@@ -1,7 +1,6 @@
 import time
 import os
 import pandas as pd
-import pandas_ta as ta
 import ccxt
 from flask import Flask
 from threading import Thread
@@ -50,11 +49,20 @@ positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. INDICATOR CALCULATIONS (CRSI + STOCH)
+# 3. PURE PYTHON INDICATOR CALCULATIONS
 # ==========================================
-def calculate_indicators(df):
-    df['rsi'] = ta.rsi(df['close'], length=3)
+def calculate_rsi(series, period):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
+def calculate_indicators(df):
+    # RSI (Length 3)
+    df['rsi'] = calculate_rsi(df['close'], 3)
+
+    # Up/Down Streak Calculation
     updn = [0.0] * len(df)
     close_vals = df['close'].values
     for i in range(1, len(df)):
@@ -66,17 +74,22 @@ def calculate_indicators(df):
             updn[i] = 0
             
     df['updn'] = updn
-    df['updn_rsi'] = ta.rsi(df['updn'], length=2)
+    df['updn_rsi'] = calculate_rsi(pd.Series(updn), 2)
 
-    df['roc'] = ta.roc(df['close'], length=1)
-    df['percent_rank'] = df['roc'].rolling(2).apply(
+    # Percent Rank of 1-day ROC (Length 2)
+    roc = df['close'].pct_change(1)
+    df['percent_rank'] = roc.rolling(2).apply(
         lambda x: (pd.Series(x).rank(pct=True).iloc[-1]) * 100, raw=False
     )
 
+    # Connors RSI Calculation
     df['crsi'] = (df['rsi'] + df['updn_rsi'] + df['percent_rank']) / 3
 
-    stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
-    df['stoch_k'] = stoch['STOCHk_14_3_3']
+    # Stochastic %K (14, 3, 3) Calculation
+    low_min = df['low'].rolling(window=14).min()
+    high_max = df['high'].rolling(window=14).max()
+    stoch_raw = 100 * ((df['close'] - low_min) / (high_max - low_min))
+    df['stoch_k'] = stoch_raw.rolling(window=3).mean().rolling(window=3).mean()
 
     return df
 
