@@ -1,3 +1,4 @@
+setuptools
 ccxt
 pandas
-https://files.pythonhosted.org/packages/37/10/a50a11229a59c98692621f357ff8ee6b2e11895aefea42cbfe8ea1bc3f21/pandas_ta-0.3.14b0.tar.gz
+pandas-ta
