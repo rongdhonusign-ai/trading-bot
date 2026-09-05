@@ -2,3 +2,4 @@ setuptools
 ccxt
 pandas
 pandas-ta
+flask
