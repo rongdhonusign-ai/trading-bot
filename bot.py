@@ -45,6 +45,9 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot'}
 })
 
+# Rate Limit / IP Ban বাইপাস করার জন্য অল্টারনেট পাবলিক সার্ভার
+exchange.urls['api']['public'] = 'https://api1.binance.com/api/v3'
+
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
@@ -103,6 +106,7 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
+                time.sleep(0.5)  # 👈 IP Ban/Rate Limit সামলানোর জন্য বিরতি
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
