@@ -40,12 +40,11 @@ stop_loss_pct = 0.02      # ২% স্টপ লস
 
 # Binance Connection Setup
 exchange = ccxt.binance({
-    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',       # আপনার Binance API Key বসাবেন
-    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',   # আপনার Binance Secret Key বসাবেন
+    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',       
+    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',   
     'enableRateLimit': True,
 })
 
-# Positions and Entry Price Tracker
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
@@ -89,12 +88,13 @@ def calculate_indicators(df):
 # 4. MAIN MULTI-SYMBOL TRADING LOOP
 # ==========================================
 def run_bot():
-    print(f"Bot started for {len(symbols)} coins on {timeframe} timeframe with ${trade_amount_usdt} per trade.")
+    print(f"🚀 Bot started for {len(symbols)} coins on {timeframe} timeframe (${trade_amount_usdt}/trade)", flush=True)
 
     while True:
+        print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # Fetch OHLCV Market Data for 5m
+                # Fetch Market Data
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
@@ -107,10 +107,9 @@ def run_bot():
                 stoch_k = last_row['stoch_k']
                 close_price = last_row['close']
 
-                # Live Scan Output Log
-                print(f"🔍 [{symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
+                # LIVE PRINT WITH FLUSH (মেসেজ সাথে সাথে স্ক্রিনে দেখাবে)
+                print(f"🔍 [{symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
 
-                # Signals
                 buy_condition = (crsi < 20) and (stoch_k < 20)
                 sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
 
@@ -118,45 +117,29 @@ def run_bot():
                 if not positions[symbol]:
                     if buy_condition:
                         crypto_quantity = trade_amount_usdt / close_price
-                        print(f"🚀 BUY SIGNAL: {symbol} at ${close_price} | Qty: {crypto_quantity:.4f} (${trade_amount_usdt})")
-                        
-                        # Live Order Line (Uncomment when API keys are ready)
-                        # exchange.create_market_buy_order(symbol, crypto_quantity)
-                        
+                        print(f"🔥 BUY SIGNAL: {symbol} at ${close_price} | Qty: {crypto_quantity:.4f}", flush=True)
                         positions[symbol] = True
                         entry_prices[symbol] = close_price
 
-                # SELL / EXIT EXECUTION
+                # SELL EXECUTION
                 elif positions[symbol]:
                     stop_price = entry_prices[symbol] * (1 - stop_loss_pct)
 
-                    # 2% Stop Loss Trigger
                     if close_price <= stop_price:
-                        crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                        print(f"🛑 STOP LOSS TRIGGERED: {symbol} at ${close_price}")
-                        
-                        # Live Order Line (Uncomment when API keys are ready)
-                        # exchange.create_market_sell_order(symbol, crypto_quantity)
-                        
+                        print(f"🛑 STOP LOSS TRIGGERED: {symbol} at ${close_price}", flush=True)
                         positions[symbol] = False
                         entry_prices[symbol] = 0.0
 
-                    # Technical Exit Condition
                     elif sell_condition:
-                        crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                        print(f"🎯 EXIT SIGNAL (CRSI & Stoch > 80): {symbol} at ${close_price}")
-                        
-                        # Live Order Line (Uncomment when API keys are ready)
-                        # exchange.create_market_sell_order(symbol, crypto_quantity)
-                        
+                        print(f"🎯 EXIT SIGNAL: {symbol} at ${close_price}", flush=True)
                         positions[symbol] = False
                         entry_prices[symbol] = 0.0
 
             except Exception as e:
-                pass
+                print(f"⚠️ Error scanning {symbol}: {e}", flush=True)
 
-        # 30 সেকেন্ড পর পর আবার স্ক্যান শুরু হবে
-        time.sleep(30)
+        print("--- Scan Loop Completed. Waiting 15s ---\n", flush=True)
+        time.sleep(15)
 
 # Run loop
 run_bot()
