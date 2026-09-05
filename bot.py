@@ -1,32 +1,31 @@
 import time
+import os
 import pandas as pd
 import pandas_ta as ta
 import ccxt
+from flask import Flask
+from threading import Thread
 
 # ==========================================
-# 1. API KEY & EXCHANGE SETUP (SPOT)
+# 1. DUMMY FLASK SERVER (For Render Web Service)
 # ==========================================
-API_KEY = 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'        # আপনার Binance API Key বসান
-SECRET_KEY = '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'  # আপনার Binance Secret Key বসান
+app = Flask('')
 
-# Binance Spot Setup
-exchange = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'spot'
-    }
-})
+@app.route('/')
+def home():
+    return "Trading Bot is Running Alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Background Thread for Flask
+Thread(target=run_flask).start()
 
 # ==========================================
-# 2. CONFIGURATION & SYMBOLS
+# 2. BOT CONFIGURATION & SYMBOL LIST
 # ==========================================
-TIMEFRAME = '5m'
-STOP_LOSS_PCT = 0.02  # 2% Stop Loss
-TRADE_USDT_AMOUNT = 6.0  # Trade amount $6 USDT
-
-SYMBOLS = [
+symbols = [
     'LISTA/USDT', 'FLOKI/USDT', 'BMT/USDT', 'BNB/USDT', 'THE/USDT', 
     'BEL/USDT', 'CAKE/USDT', 'ONT/USDT', 'ZAMA/USDT', 'MEGA/USDT', 
     'ENS/USDT', 'BICO/USDT', 'T/USDT', 'SSV/USDT', 'GLM/USDT', 
@@ -35,130 +34,131 @@ SYMBOLS = [
     'ZEN/USDT', 'IOTX/USDT', 'BERA/USDT'
 ]
 
+timeframe = '5m'          # ৫ মিনিটের টাইমফ্রেম
+trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলার
+stop_loss_pct = 0.02      # ২% স্টপ লস
+
+# Binance Connection Setup
+exchange = ccxt.binance({
+    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',       # আপনার Binance API Key বসাবেন
+    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',   # আপনার Binance Secret Key বসাবেন
+    'enableRateLimit': True,
+})
+
+# Positions and Entry Price Tracker
+positions = {}      # Symbol -> True/False
+entry_prices = {}   # Symbol -> Price
+
+for sym in symbols:
+    positions[sym] = False
+    entry_prices[sym] = 0.0
+
 # ==========================================
-# 3. INDICATOR CALCULATIONS
+# 3. INDICATOR CALCULATIONS (CRSI + STOCH)
 # ==========================================
-def fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=150):
-    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+def calculate_indicators(df):
+    # RSI (Length 3)
+    df['rsi'] = ta.rsi(df['close'], length=3)
+
+    # Streak Calculation for Connors RSI
+    updn = [0.0] * len(df)
+    close_vals = df['close'].values
+    for i in range(1, len(df)):
+        if close_vals[i] > close_vals[i-1]:
+            updn[i] = updn[i-1] + 1 if updn[i-1] > 0 else 1
+        elif close_vals[i] < close_vals[i-1]:
+            updn[i] = updn[i-1] - 1 if updn[i-1] < 0 else -1
+        else:
+            updn[i] = 0
+            
+    df['updn'] = updn
+    df['updn_rsi'] = ta.rsi(df['updn'], length=2)
+
+    # Percent Rank of 1-day ROC (Length 2)
+    df['roc'] = ta.roc(df['close'], length=1)
+    df['percent_rank'] = df['roc'].rolling(2).apply(
+        lambda x: (pd.Series(x).rank(pct=True).iloc[-1]) * 100, raw=False
+    )
+
+    # Connors RSI
+    df['crsi'] = (df['rsi'] + df['updn_rsi'] + df['percent_rank']) / 3
+
+    # Stochastic %K (14, 3, 3)
+    stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
+    df['stoch_k'] = stoch['STOCHk_14_3_3']
+
     return df
 
-def calculate_crsi(df, rsi_len=3, updn_len=2, roc_len=2):
-    rsi_val = ta.rsi(df['close'], length=rsi_len)
-    
-    streak = [0]
-    for i in range(1, len(df)):
-        if df['close'].iloc[i] > df['close'].iloc[i-1]:
-            streak.append(streak[-1] + 1 if streak[-1] > 0 else 1)
-        elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-            streak.append(streak[-1] - 1 if streak[-1] < 0 else -1)
-        else:
-            streak.append(0)
-    
-    df['streak'] = streak
-    updn_rsi = ta.rsi(df['streak'], length=updn_len)
-    
-    roc = ta.roc(df['close'], length=1)
-    roc_rank = roc.rolling(window=roc_len).apply(
-        lambda x: (pd.Series(x).rank().iloc[-1] - 1) / (len(x) - 1) * 100 if len(x) > 1 else 0
-    )
-    
-    return (rsi_val + updn_rsi + roc_rank) / 3.0
-
-def calculate_stoch_k(df, k_len=14, k_smooth=3):
-    stoch = ta.stoch(high=df['high'], low=df['low'], close=df['close'], k=k_len, d=14, smooth_k=k_smooth)
-    k_col = [col for col in stoch.columns if col.startswith('STOCHk')][0]
-    return stoch[k_col]
-
 # ==========================================
-# 4. BOT CYCLE EXECUTION
+# 4. MAIN MULTI-SYMBOL TRADING LOOP
 # ==========================================
-def check_markets():
-    print("\n--- [ Scanning Spot Markets... ] ---")
-    
-    for symbol in SYMBOLS:
-        while True:
+def run_bot():
+    print(f"Bot started for {len(symbols)} coins on {timeframe} timeframe with ${trade_amount_usdt} per trade.")
+
+    while True:
+        for symbol in symbols:
             try:
-                df = fetch_ohlcv(symbol)
-                if df.empty or len(df) < 100:
-                    break
-
-                df['crsi'] = calculate_crsi(df)
-                df['stoch_k'] = calculate_stoch_k(df)
-
-                crsi_curr = df['crsi'].iloc[-1]
-                stoch_k_curr = df['stoch_k'].iloc[-1]
-                crsi_prev = df['crsi'].iloc[-2]
-                stoch_k_prev = df['stoch_k'].iloc[-2]
-
-                buy_condition = (crsi_curr < 20) and (stoch_k_curr < 20)
-                sell_condition = (crsi_prev <= 80 and crsi_curr > 80) and (stoch_k_prev <= 80 and stoch_k_curr > 80)
-
-                print(f"[{symbol}] CRSI: {crsi_curr:.2f} | Stoch %K: {stoch_k_curr:.2f}")
-
-                current_price = df['close'].iloc[-1]
-
-                # 1. LIVE MARKET BUY ORDER TRIGGER
-                if buy_condition:
-                    raw_amount = TRADE_USDT_AMOUNT / current_price
-                    amount = float(exchange.amount_to_precision(symbol, raw_amount))
-                    stop_price = current_price * (1 - STOP_LOSS_PCT)
-                    
-                    print(f"\n🚀 [BUY SIGNAL DETECTED] {symbol}")
-                    print(f"Size: ${TRADE_USDT_AMOUNT} | Quantity: {amount}")
-                    print(f"Entry Price: ${current_price:.4f} | Stop Loss (2%): ${stop_price:.4f}")
-                    
-                    # 🛒 Executing Market Buy Order
-                    try:
-                        buy_order = exchange.create_market_buy_order(symbol, amount)
-                        print(f"✅ MARKET BUY ORDER SUCCESSFUL! Order ID: {buy_order['id']}")
-                    except Exception as buy_error:
-                        print(f"❌ BUY FAILED: {buy_error}")
-
-                # 2. LIVE MARKET SELL ORDER TRIGGER
-                elif sell_condition:
-                    print(f"\n🔻 [EXIT SIGNAL DETECTED] {symbol} - CRSI & Stoch Cross Above 80")
-                    
-                    # 🏷️ Executing Market Sell Order for Available Balance
-                    try:
-                        coin_name = symbol.split('/')[0]
-                        balance = exchange.fetch_balance()
-                        coin_balance = balance['free'].get(coin_name, 0)
-                        
-                        if coin_balance > 0:
-                            sell_amount = float(exchange.amount_to_precision(symbol, coin_balance))
-                            sell_order = exchange.create_market_sell_order(symbol, sell_amount)
-                            print(f"✅ MARKET SELL ORDER SUCCESSFUL! Order ID: {sell_order['id']}")
-                        else:
-                            print(f"⚠️ No balance found for {coin_name} to sell.")
-                    except Exception as sell_error:
-                        print(f"❌ SELL FAILED: {sell_error}")
-
-                break
-
-            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
-                print(f"\n⚠️ Network Drop! Reconnecting in 10s...")
-                time.sleep(10)
-            except Exception as e:
-                print(f"Error checking {symbol}: {e}")
-                break
-
-# ==========================================
-# 5. MAIN LOOP
-# ==========================================
-if __name__ == "__main__":
-    print("Bot Started Successfully! (Spot Mode - $6 Per Trade - Live Market Orders Enabled)")
-    try:
-        while True:
-            try:
-                check_markets()
-            except Exception as main_e:
-                print(f"\n⚠️ Error: {main_e}")
-                time.sleep(10)
-
-            # Wait 5 minutes for next candle scan
-            for _ in range(300):
-                time.sleep(1)
+                # Fetch OHLCV Market Data for 5m
+                bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+                df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
-    except KeyboardInterrupt:
-        print("\nBot Stopped by User.")
+                df = calculate_indicators(df)
+
+                last_row = df.iloc[-1]
+                prev_row = df.iloc[-2]
+
+                crsi = last_row['crsi']
+                stoch_k = last_row['stoch_k']
+                close_price = last_row['close']
+
+                # Signals
+                buy_condition = (crsi < 20) and (stoch_k < 20)
+                sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
+
+                # BUY EXECUTION
+                if not positions[symbol]:
+                    if buy_condition:
+                        crypto_quantity = trade_amount_usdt / close_price
+                        print(f"🚀 BUY SIGNAL: {symbol} at ${close_price} | Qty: {crypto_quantity:.4f} (${trade_amount_usdt})")
+                        
+                        # Live Order Line (Uncomment when API keys are ready)
+                        # exchange.create_market_buy_order(symbol, crypto_quantity)
+                        
+                        positions[symbol] = True
+                        entry_prices[symbol] = close_price
+
+                # SELL / EXIT EXECUTION
+                elif positions[symbol]:
+                    stop_price = entry_prices[symbol] * (1 - stop_loss_pct)
+
+                    # 2% Stop Loss Trigger
+                    if close_price <= stop_price:
+                        crypto_quantity = trade_amount_usdt / entry_prices[symbol]
+                        print(f"🛑 STOP LOSS TRIGGERED: {symbol} at ${close_price}")
+                        
+                        # Live Order Line (Uncomment when API keys are ready)
+                        # exchange.create_market_sell_order(symbol, crypto_quantity)
+                        
+                        positions[symbol] = False
+                        entry_prices[symbol] = 0.0
+
+                    # Technical Exit Condition
+                    elif sell_condition:
+                        crypto_quantity = trade_amount_usdt / entry_prices[symbol]
+                        print(f"🎯 EXIT SIGNAL (CRSI & Stoch > 80): {symbol} at ${close_price}")
+                        
+                        # Live Order Line (Uncomment when API keys are ready)
+                        # exchange.create_market_sell_order(symbol, crypto_quantity)
+                        
+                        positions[symbol] = False
+                        entry_prices[symbol] = 0.0
+
+            except Exception as e:
+                # Binance-এ যেসব নতুন বা আনলিস্টেড কয়েনে ডাটা মিলবে না সেগুলো স্কিপ করবে
+                pass
+
+        # 5 মিনিটের ক্যান্ডেল চেক করতে ৩০ সেকেন্ড পর পর স্ক্র্যান করবে
+        time.sleep(30)
+
+# Run loop
+run_bot()
