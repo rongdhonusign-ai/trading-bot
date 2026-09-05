@@ -1,5 +1,4 @@
-setuptools
 ccxt
 pandas
-pandas-ta
-flask
+Flask
+git+https://github.com/twopirllc/pandas-ta.git
