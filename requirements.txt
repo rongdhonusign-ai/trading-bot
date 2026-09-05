@@ -1,4 +1,3 @@
 ccxt
 pandas
 Flask
-git+https://github.com/twopirllc/pandas-ta.git
