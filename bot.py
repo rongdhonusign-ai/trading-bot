@@ -46,12 +46,8 @@ exchange = ccxt.binance({
 })
 
 # Positions and Entry Price Tracker
-positions = {}      # Symbol -> True/False
-entry_prices = {}   # Symbol -> Price
-
-for sym in symbols:
-    positions[sym] = False
-    entry_prices[sym] = 0.0
+positions = {sym: False for sym in symbols}
+entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
 # 3. INDICATOR CALCULATIONS (CRSI + STOCH)
@@ -111,6 +107,9 @@ def run_bot():
                 stoch_k = last_row['stoch_k']
                 close_price = last_row['close']
 
+                # Live Scan Output Log
+                print(f"🔍 [{symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
+
                 # Signals
                 buy_condition = (crsi < 20) and (stoch_k < 20)
                 sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
@@ -154,10 +153,9 @@ def run_bot():
                         entry_prices[symbol] = 0.0
 
             except Exception as e:
-                # Binance-এ যেসব নতুন বা আনলিস্টেড কয়েনে ডাটা মিলবে না সেগুলো স্কিপ করবে
                 pass
 
-        # 5 মিনিটের ক্যান্ডেল চেক করতে ৩০ সেকেন্ড পর পর স্ক্র্যান করবে
+        # 30 সেকেন্ড পর পর আবার স্ক্যান শুরু হবে
         time.sleep(30)
 
 # Run loop
