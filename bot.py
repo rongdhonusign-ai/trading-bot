@@ -6,7 +6,7 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. DUMMY FLASK SERVER FOR RENDER HEALTH CHECK
+# 1. FLASK APP FOR RENDER HEALTH CHECK & UPTIMEROBOT
 # ==========================================
 app = Flask(__name__)
 
@@ -87,7 +87,6 @@ def calculate_indicators(df):
 
     low_min = df['low'].rolling(window=14).min()
     high_max = df['high'].rolling(window=14).max()
-    # 👈 বিয়োগ চিহ্ন (-) সংশোধন করা হয়েছে
     stoch_raw = 100 * ((df['close'] - low_min) / (high_max - low_min))
     df['stoch_k'] = stoch_raw.rolling(window=3).mean().rolling(window=3).mean()
 
@@ -155,7 +154,10 @@ def run_bot():
         print("--- Scan Loop Completed. Waiting 15s ---\n", flush=True)
         time.sleep(15)
 
-# Background Thread for Trading Bot
+# ==========================================
+# 5. BACKGROUND THREAD LAUNCH
+# ==========================================
+# গ্যানিকর্ন লোড হওয়ার সাথে সাথেই ব্যাকগ্রাউন্ড থ্রেড রান করবে
 bot_thread = Thread(target=run_bot)
 bot_thread.daemon = True
 bot_thread.start()
