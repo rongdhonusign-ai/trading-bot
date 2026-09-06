@@ -6,20 +6,14 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. DUMMY FLASK SERVER (For Render Web Service)
+# 1. DUMMY FLASK SERVER FOR RENDER HEALTH CHECK
 # ==========================================
-app = Flask('')
+app = Flask(__name__)
 
-# যেকোনো রুটে রিকোয়েস্ট আসলেই যেন 200 OK রিটার্ন করে (UptimeRobot 404 Fix)
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
     return "Trading Bot is Running Alive!", 200
-
-def run_flask():
-    # Render-এর ফ্রি ইনস্ট্যান্সের জন্য পোর্ট ১০০০০ বা PORT পরিবেশগত ভেরিয়েবল গ্রহণ করা
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
 
 # ==========================================
 # 2. BOT CONFIGURATION & SYMBOL LIST
@@ -37,34 +31,29 @@ timeframe = '5m'          # ৫ মিনিটের টাইমফ্রে�
 trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলার
 stop_loss_pct = 0.02      # ২% স্টপ লস
 
-# 🛑 PROXY SETUP (Binance Restricted Location Bypass)
 PROXY_URL = os.environ.get('PROXY_URL', '')
 
 exchange_config = {
-    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',     # 👈 আপনার Binance API Key বসান
-    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',  # 👈 আপনার Binance Secret Key বসান
+    'apiKey': os.environ.get('yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
+    'secret': os.environ.get('3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 }
 
-# যদি প্রক্সি ইউআরএল থাকে তবে যুক্ত হবে
 if PROXY_URL:
     exchange_config['proxies'] = {
         'http': PROXY_URL,
         'https': PROXY_URL
     }
 
-# Binance Connection Setup
 exchange = ccxt.binance(exchange_config)
-
-# Rate Limit / IP Ban বাইপাস করার জন্য অল্টারনেট পাবলিক সার্ভার
 exchange.urls['api']['public'] = 'https://api1.binance.com/api/v3'
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. PURE PYTHON INDICATOR CALCULATIONS
+# 3. INDICATOR CALCULATIONS
 # ==========================================
 def calculate_rsi(series, period):
     delta = series.diff()
@@ -74,10 +63,8 @@ def calculate_rsi(series, period):
     return 100 - (100 / (1 + rs))
 
 def calculate_indicators(df):
-    # RSI (Length 3)
     df['rsi'] = calculate_rsi(df['close'], 3)
 
-    # Up/Down Streak Calculation
     updn = [0.0] * len(df)
     close_vals = df['close'].values
     for i in range(1, len(df)):
@@ -91,34 +78,31 @@ def calculate_indicators(df):
     df['updn'] = updn
     df['updn_rsi'] = calculate_rsi(pd.Series(updn), 2)
 
-    # Percent Rank of 1-day ROC (Length 2)
     roc = df['close'].pct_change(1)
     df['percent_rank'] = roc.rolling(2).apply(
         lambda x: (pd.Series(x).rank(pct=True).iloc[-1]) * 100, raw=False
     )
 
-    # Connors RSI Calculation
     df['crsi'] = (df['rsi'] + df['updn_rsi'] + df['percent_rank']) / 3
 
-    # Stochastic %K (14, 3, 3) Calculation
     low_min = df['low'].rolling(window=14).min()
     high_max = df['high'].rolling(window=14).max()
-    stoch_raw = 100 * ((df['close'] - low_min) / (high_max - low_min))
+    stoch_raw = 100 * ((df['close'] low_min) / (high_max - low_min))
     df['stoch_k'] = stoch_raw.rolling(window=3).mean().rolling(window=3).mean()
 
     return df
 
 # ==========================================
-# 4. MAIN MULTI-SYMBOL TRADING LOOP
+# 4. MAIN TRADING LOOP
 # ==========================================
 def run_bot():
-    print(f"🚀 Real Trading Bot started for {len(symbols)} coins on {timeframe} timeframe (${trade_amount_usdt}/trade)", flush=True)
+    print(f"🚀 Trading Bot started for {len(symbols)} coins", flush=True)
 
     while True:
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                time.sleep(0.5)  # 👈 IP Ban/Rate Limit সামলানোর জন্য বিরতি
+                time.sleep(0.5)
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
@@ -136,41 +120,31 @@ def run_bot():
                 buy_condition = (crsi < 20) and (stoch_k < 20)
                 sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
 
-                # REAL BUY EXECUTION
                 if not positions[symbol]:
                     if buy_condition:
                         crypto_quantity = trade_amount_usdt / close_price
-                        print(f"🔥 BUY SIGNAL DETECTED: {symbol} at ${close_price} | Purchasing ${trade_amount_usdt}", flush=True)
-                        
+                        print(f"🔥 BUY SIGNAL: {symbol} at ${close_price}", flush=True)
                         order = exchange.create_market_buy_order(symbol, crypto_quantity)
-                        print(f"✅ REAL BUY ORDER EXECUTED: {order}", flush=True)
-                        
+                        print(f"✅ EXECUTED BUY: {order}", flush=True)
                         positions[symbol] = True
                         entry_prices[symbol] = close_price
 
-                # REAL SELL EXECUTION
                 elif positions[symbol]:
                     stop_price = entry_prices[symbol] * (1 - stop_loss_pct)
 
-                    # Stop Loss
                     if close_price <= stop_price:
                         crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                        print(f"🛑 STOP LOSS TRIGGERED: {symbol} at ${close_price}", flush=True)
-                        
+                        print(f"🛑 STOP LOSS: {symbol} at ${close_price}", flush=True)
                         order = exchange.create_market_sell_order(symbol, crypto_quantity)
-                        print(f"✅ REAL STOP LOSS SELL EXECUTED: {order}", flush=True)
-                        
+                        print(f"✅ EXECUTED STOP LOSS: {order}", flush=True)
                         positions[symbol] = False
                         entry_prices[symbol] = 0.0
 
-                    # Technical Target Exit
                     elif sell_condition:
                         crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                        print(f"🎯 EXIT SIGNAL TRIGGERED: {symbol} at ${close_price}", flush=True)
-                        
+                        print(f"🎯 EXIT SIGNAL: {symbol} at ${close_price}", flush=True)
                         order = exchange.create_market_sell_order(symbol, crypto_quantity)
-                        print(f"✅ REAL EXIT SELL EXECUTED: {order}", flush=True)
-                        
+                        print(f"✅ EXECUTED EXIT: {order}", flush=True)
                         positions[symbol] = False
                         entry_prices[symbol] = 0.0
 
@@ -180,14 +154,11 @@ def run_bot():
         print("--- Scan Loop Completed. Waiting 15s ---\n", flush=True)
         time.sleep(15)
 
-# ==========================================
-# 5. EXECUTION POINT (CONCURRENT RUN)
-# ==========================================
-if __name__ == '__main__':
-    # ১. প্রথমে ব্যাকগ্রাউন্ড থ্রেডে Flask সার্ভার চালু করা
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+# Background Thread for Trading Bot
+bot_thread = Thread(target=run_bot)
+bot_thread.daemon = True
+bot_thread.start()
 
-    # ২. এরপর মূল থ্রেডে ট্রেডিং বট লুপ চালু করা
-    run_bot()
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
