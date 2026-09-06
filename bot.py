@@ -48,7 +48,7 @@ if PROXY_URL:
 
 exchange = ccxt.binance(exchange_config)
 
-# 🛑 IP BAN BYPASS: Binance-এর অল্টারনেট ডোমেইন সেটআপ
+# IP Ban / Rate Limit এড়াতে অল্টারনেট পাবলিক সার্ভার
 exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
 
 positions = {sym: False for sym in symbols}
@@ -104,7 +104,7 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # 🛑 IP Ban এড়াতে ৪ সেকেন্ডের বিরতি
+                # প্রতিটি রিকোয়েস্টের আগে ৪ সেকেন্ড বিরতি
                 time.sleep(4.0) 
                 
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -155,8 +155,9 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        print("--- Scan Loop Completed. Waiting 30s ---\n", flush=True)
-        time.sleep(30)
+        # 🛑 Rate Limit এড়াতে লুপ শেষে বিরতি বাড়িয়ে ৬০ সেকেন্ড করা হলো
+        print("--- Scan Loop Completed. Waiting 60s ---\n", flush=True)
+        time.sleep(60)
 
 # ==========================================
 # 5. BACKGROUND THREAD LAUNCH
