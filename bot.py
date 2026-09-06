@@ -37,13 +37,27 @@ timeframe = '5m'          # ৫ মিনিটের টাইমফ্রে�
 trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলার
 stop_loss_pct = 0.02      # ২% স্টপ লস
 
-# Binance Connection Setup
-exchange = ccxt.binance({
-    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',       # 👈 এখানে আপনার Binance API Key বসান
-    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',   # 👈 এখানে আপনার Binance Secret Key বসান
+# 🛑 PROXY SETUP (Binance Restricted Location Bypass)
+# আপনার কেনা/পছন্দের প্রক্সি IP নিচে বসিয়ে দিন। 
+# উদাহরণ: 'http://username:password@proxy_ip:port' অথবা 'http://proxy_ip:port'
+PROXY_URL = os.environ.get('PROXY_URL', '') # Environment Variable থেকে নিতে পারেন অথবা সরাসরি স্ট্রিং দিন
+
+exchange_config = {
+    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',   # 👈 আপনার Binance API Key
+    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',  # 👈 আপনার Binance Secret Key
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
-})
+}
+
+# যদি প্রক্সি ইউআরএল থাকে তবে যুক্ত হবে
+if PROXY_URL:
+    exchange_config['proxies'] = {
+        'http': PROXY_URL,
+        'https': PROXY_URL
+    }
+
+# Binance Connection Setup
+exchange = ccxt.binance(exchange_config)
 
 # Rate Limit / IP Ban বাইপাস করার জন্য অল্টারনেট পাবলিক সার্ভার
 exchange.urls['api']['public'] = 'https://api1.binance.com/api/v3'
