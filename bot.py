@@ -34,8 +34,8 @@ stop_loss_pct = 0.02      # ২% স্টপ লস
 PROXY_URL = os.environ.get('PROXY_URL', '')
 
 exchange_config = {
-    'apiKey': os.environ.get('yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
-    'secret': os.environ.get('3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
+    'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
+    'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 }
@@ -87,7 +87,8 @@ def calculate_indicators(df):
 
     low_min = df['low'].rolling(window=14).min()
     high_max = df['high'].rolling(window=14).max()
-    stoch_raw = 100 * ((df['close'] low_min) / (high_max - low_min))
+    # 👈 বিয়োগ চিহ্ন (-) সংশোধন করা হয়েছে
+    stoch_raw = 100 * ((df['close'] - low_min) / (high_max - low_min))
     df['stoch_k'] = stoch_raw.rolling(window=3).mean().rolling(window=3).mean()
 
     return df
