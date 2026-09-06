@@ -47,7 +47,9 @@ if PROXY_URL:
     }
 
 exchange = ccxt.binance(exchange_config)
-exchange.urls['api']['public'] = 'https://api1.binance.com/api/v3'
+
+# 🛑 IP BAN BYPASS: Binance-এর অল্টারনেট ডোমেইন সেটআপ
+exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
@@ -102,7 +104,9 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                time.sleep(0.5)
+                # 🛑 IP Ban এড়াতে ৪ সেকেন্ডের বিরতি
+                time.sleep(4.0) 
+                
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
@@ -151,13 +155,12 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        print("--- Scan Loop Completed. Waiting 15s ---\n", flush=True)
-        time.sleep(15)
+        print("--- Scan Loop Completed. Waiting 30s ---\n", flush=True)
+        time.sleep(30)
 
 # ==========================================
 # 5. BACKGROUND THREAD LAUNCH
 # ==========================================
-# গ্যানিকর্ন লোড হওয়ার সাথে সাথেই ব্যাকগ্রাউন্ড থ্রেড রান করবে
 bot_thread = Thread(target=run_bot)
 bot_thread.daemon = True
 bot_thread.start()
