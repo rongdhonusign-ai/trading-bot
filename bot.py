@@ -10,19 +10,16 @@ from threading import Thread
 # ==========================================
 app = Flask('')
 
-# যেকোনো পাথে নক আসলেই যেন 200 OK রেসপন্স দেয়
+# যেকোনো রুটে রিকোয়েস্ট আসলেই যেন 200 OK রিটার্ন করে (UptimeRobot 404 Fix)
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
     return "Trading Bot is Running Alive!", 200
 
 def run_flask():
-    # Render-এর জন্য ডিফল্ট পোর্ট ১০০০০ সেট করা হয়েছে
+    # Render-এর ফ্রি ইনস্ট্যান্সের জন্য পোর্ট ১০০০০ বা PORT পরিবেশগত ভেরিয়েবল গ্রহণ করা
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
-# Background Thread for Flask
-Thread(target=run_flask).start()
 
 # ==========================================
 # 2. BOT CONFIGURATION & SYMBOL LIST
@@ -44,8 +41,8 @@ stop_loss_pct = 0.02      # ২% স্টপ লস
 PROXY_URL = os.environ.get('PROXY_URL', '')
 
 exchange_config = {
-    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',   # 👈 আপনার Binance API Key
-    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',  # 👈 আপনার Binance Secret Key
+    'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',     # 👈 আপনার Binance API Key বসান
+    'secret': '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV',  # 👈 আপনার Binance Secret Key বসান
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 }
@@ -183,5 +180,14 @@ def run_bot():
         print("--- Scan Loop Completed. Waiting 15s ---\n", flush=True)
         time.sleep(15)
 
-# Run loop
-run_bot()
+# ==========================================
+# 5. EXECUTION POINT (CONCURRENT RUN)
+# ==========================================
+if __name__ == '__main__':
+    # ১. প্রথমে ব্যাকগ্রাউন্ড থ্রেডে Flask সার্ভার চালু করা
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # ২. এরপর মূল থ্রেডে ট্রেডিং বট লুপ চালু করা
+    run_bot()
