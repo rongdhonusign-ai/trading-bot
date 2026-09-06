@@ -10,12 +10,15 @@ from threading import Thread
 # ==========================================
 app = Flask('')
 
+# যেকোনো পাথে নক আসলেই যেন 200 OK রেসপন্স দেয়
 @app.route('/')
-def home():
-    return "Trading Bot is Running Alive!"
+@app.route('/<path:path>')
+def home(path=""):
+    return "Trading Bot is Running Alive!", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    # Render-এর জন্য ডিফল্ট পোর্ট ১০০০০ সেট করা হয়েছে
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # Background Thread for Flask
@@ -38,9 +41,7 @@ trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলা�
 stop_loss_pct = 0.02      # ২% স্টপ লস
 
 # 🛑 PROXY SETUP (Binance Restricted Location Bypass)
-# আপনার কেনা/পছন্দের প্রক্সি IP নিচে বসিয়ে দিন। 
-# উদাহরণ: 'http://username:password@proxy_ip:port' অথবা 'http://proxy_ip:port'
-PROXY_URL = os.environ.get('PROXY_URL', '') # Environment Variable থেকে নিতে পারেন অথবা সরাসরি স্ট্রিং দিন
+PROXY_URL = os.environ.get('PROXY_URL', '')
 
 exchange_config = {
     'apiKey': 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M',   # 👈 আপনার Binance API Key
