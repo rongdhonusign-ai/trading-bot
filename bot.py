@@ -32,8 +32,6 @@ timeframe = '5m'          # ৫ মিনিটের টাইমফ্রে�
 trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলার
 stop_loss_pct = 0.02      # ২% স্টপ লস
 
-PROXY_URL = os.environ.get('PROXY_URL', '').strip()
-
 # ------------------------------------------
 # PRIVATE EXCHANGE INSTANCE (Buy/Sell Trades)
 # ------------------------------------------
@@ -45,34 +43,23 @@ trade_exchange = ccxt.binance({
         'defaultType': 'spot',
         'adjustForTimeDifference': False,
         'recvWindow': 10000
-    },
-    'urls': {
-        'api': {
-            'public': 'https://api3.binance.com/api/v3',
-            'private': 'https://api3.binance.com/api/v3',
-            'sapi': 'https://api3.binance.com/sapi/v1',
-        }
     }
 })
 
 trade_exchange.has['fetchMarkets'] = False
 
-if PROXY_URL:
-    trade_exchange.proxies = {'http': PROXY_URL, 'https': PROXY_URL}
-
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. DIRECT REST API CANDLESTICK FETCH WITH PROXY
+# 3. PUBLIC API CANDLESTICK FETCH (NO PROXY NEEDED)
 # ==========================================
 def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
     clean_symbol = symbol.replace('/', '') 
-    url = f"https://api3.binance.com/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
+    # Binance Vision Public API Endpoint
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
     
-    proxies = {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None
-    
-    response = requests.get(url, proxies=proxies, timeout=12)
+    response = requests.get(url, timeout=12)
     
     if response.status_code == 200:
         data = response.json()
@@ -140,7 +127,7 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                time.sleep(2.0)
+                time.sleep(1.5)
                 
                 bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
