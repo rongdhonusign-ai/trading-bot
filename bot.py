@@ -34,19 +34,22 @@ stop_loss_pct = 0.02      # ২% স্টপ লস
 PROXY_URL = os.environ.get('PROXY_URL', '')
 
 # ------------------------------------------
-# A. PUBLIC EXCHANGE INSTANCE (ক্যান্ডেলস্টিক/ডেটা নেওয়ার জন্য - No Signature/API key needed)
+# A. PUBLIC EXCHANGE INSTANCE (ক্যান্ডেলস্টিক/ডেটা নেওয়ার জন্য)
 # ------------------------------------------
 public_config = {
     'enableRateLimit': True,
-    'hostname': 'api3.binance.com' # IP Ban ও SAPI Error এড়াতে Alt Host
 }
 if PROXY_URL:
     public_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
 
 public_exchange = ccxt.binance(public_config)
 
+# 🛑 IP Ban বাইপাস: CCXT-এর সব API রিকোয়েস্টকে api3 ডোমেইনে রিডাইরেক্ট করা হচ্ছে
+public_exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
+public_exchange.urls['api']['sapi'] = 'https://api3.binance.com/sapi/v1'
+
 # ------------------------------------------
-# B. PRIVATE EXCHANGE INSTANCE (শুধুমাত্র বাই/সেল ট্রেড নেওয়ার জন্য)
+# B. PRIVATE EXCHANGE INSTANCE (বাই/সেল অর্ডার নেওয়ার জন্য)
 # ------------------------------------------
 private_config = {
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
@@ -58,6 +61,8 @@ if PROXY_URL:
     private_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
 
 trade_exchange = ccxt.binance(private_config)
+trade_exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
+trade_exchange.urls['api']['private'] = 'https://api3.binance.com/api/v3'
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
@@ -115,7 +120,7 @@ def run_bot():
                 # রিকোয়েস্টের আগে ৪ সেকেন্ড বিরতি
                 time.sleep(4.0) 
                 
-                # Public Exchange দিয়ে ক্যান্ডেল ডেটা নেওয়া হচ্ছে
+                # exchangeInfo কল না করার জন্য সরাসরি OHLCV আনা
                 bars = public_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
