@@ -37,7 +37,10 @@ exchange_config = {
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
     'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+    'options': {
+        'defaultType': 'spot',
+        'fetchCurrencies': False  # 🛑 এটি যোগ করায় ব্যাকগ্রাউন্ডের /sapi/v1/capital/config/getall রিকোয়েস্ট বন্ধ হবে
+    }
 }
 
 if PROXY_URL:
@@ -48,7 +51,7 @@ if PROXY_URL:
 
 exchange = ccxt.binance(exchange_config)
 
-# IP Ban / Rate Limit এড়াতে অল্টারনেট পাবলিক সার্ভার
+# IP Ban / Rate Limit এড়াতে অল্টারনেট পাবলিক সার্ভার
 exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
 
 positions = {sym: False for sym in symbols}
@@ -104,8 +107,8 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # প্রতিটি রিকোয়েস্টের আগে ৪ সেকেন্ড বিরতি
-                time.sleep(4.0) 
+                # প্রতিটি রিকোয়েস্টের আগে ৩ সেকেন্ড বিরতি (Rate Limit এড়াতে)
+                time.sleep(3.0) 
                 
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -128,6 +131,7 @@ def run_bot():
                     if buy_condition:
                         crypto_quantity = trade_amount_usdt / close_price
                         print(f"🔥 BUY SIGNAL: {symbol} at ${close_price}", flush=True)
+                        # অর্ডার করার জন্য প্রস্তুত
                         order = exchange.create_market_buy_order(symbol, crypto_quantity)
                         print(f"✅ EXECUTED BUY: {order}", flush=True)
                         positions[symbol] = True
@@ -155,7 +159,6 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        # 🛑 Rate Limit এড়াতে লুপ শেষে বিরতি বাড়িয়ে ৬০ সেকেন্ড করা হলো
         print("--- Scan Loop Completed. Waiting 60s ---\n", flush=True)
         time.sleep(60)
 
