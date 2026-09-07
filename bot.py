@@ -39,7 +39,7 @@ exchange_config = {
     'enableRateLimit': True,
     'options': {
         'defaultType': 'spot',
-        'fetchCurrencies': False  # 🛑 এটি যোগ করায় ব্যাকগ্রাউন্ডের /sapi/v1/capital/config/getall রিকোয়েস্ট বন্ধ হবে
+        'fetchCurrencies': False  # ব্যাকগ্রাউন্ডের অনাকাঙ্ক্ষিত ক্যাপিটাল/কারেন্সি ফেচ বন্ধ রাখবে
     }
 }
 
@@ -50,9 +50,6 @@ if PROXY_URL:
     }
 
 exchange = ccxt.binance(exchange_config)
-
-# IP Ban / Rate Limit এড়াতে অল্টারনেট পাবলিক সার্ভার
-exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
@@ -103,11 +100,19 @@ def calculate_indicators(df):
 def run_bot():
     print(f"🚀 Trading Bot started for {len(symbols)} coins", flush=True)
 
+    # 🛑 লুপ শুরু হওয়ার আগে একবার পুরো মার্কেট ডাটা লোড করে নেওয়া
+    try:
+        print("🔄 Loading Binance Markets...", flush=True)
+        exchange.load_markets()
+        print("✅ Markets Loaded Successfully!", flush=True)
+    except Exception as e:
+        print(f"⚠️ Initial market load warning: {e}", flush=True)
+
     while True:
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # প্রতিটি রিকোয়েস্টের আগে ৩ সেকেন্ড বিরতি (Rate Limit এড়াতে)
+                # প্রতিটি রিকোয়েস্টের আগে ৩ সেকেন্ড বিরতি
                 time.sleep(3.0) 
                 
                 bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -131,7 +136,6 @@ def run_bot():
                     if buy_condition:
                         crypto_quantity = trade_amount_usdt / close_price
                         print(f"🔥 BUY SIGNAL: {symbol} at ${close_price}", flush=True)
-                        # অর্ডার করার জন্য প্রস্তুত
                         order = exchange.create_market_buy_order(symbol, crypto_quantity)
                         print(f"✅ EXECUTED BUY: {order}", flush=True)
                         positions[symbol] = True
