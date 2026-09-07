@@ -33,23 +33,31 @@ stop_loss_pct = 0.02      # ২% স্টপ লস
 
 PROXY_URL = os.environ.get('PROXY_URL', '')
 
-exchange_config = {
+# ------------------------------------------
+# A. PUBLIC EXCHANGE INSTANCE (ক্যান্ডেলস্টিক/ডেটা নেওয়ার জন্য - No Signature/API key needed)
+# ------------------------------------------
+public_config = {
+    'enableRateLimit': True,
+    'hostname': 'api3.binance.com' # IP Ban ও SAPI Error এড়াতে Alt Host
+}
+if PROXY_URL:
+    public_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
+
+public_exchange = ccxt.binance(public_config)
+
+# ------------------------------------------
+# B. PRIVATE EXCHANGE INSTANCE (শুধুমাত্র বাই/সেল ট্রেড নেওয়ার জন্য)
+# ------------------------------------------
+private_config = {
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
     'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 }
-
 if PROXY_URL:
-    exchange_config['proxies'] = {
-        'http': PROXY_URL,
-        'https': PROXY_URL
-    }
+    private_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
 
-exchange = ccxt.binance(exchange_config)
-
-# IP Ban / Rate Limit এড়াতে অল্টারনেট পাবলিক সার্ভার
-exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
+trade_exchange = ccxt.binance(private_config)
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
@@ -104,10 +112,11 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # প্রতিটি রিকোয়েস্টের আগে ৪ সেকেন্ড বিরতি
+                # রিকোয়েস্টের আগে ৪ সেকেন্ড বিরতি
                 time.sleep(4.0) 
                 
-                bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+                # Public Exchange দিয়ে ক্যান্ডেল ডেটা নেওয়া হচ্ছে
+                bars = public_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
                 df = calculate_indicators(df)
@@ -128,7 +137,7 @@ def run_bot():
                     if buy_condition:
                         crypto_quantity = trade_amount_usdt / close_price
                         print(f"🔥 BUY SIGNAL: {symbol} at ${close_price}", flush=True)
-                        order = exchange.create_market_buy_order(symbol, crypto_quantity)
+                        order = trade_exchange.create_market_buy_order(symbol, crypto_quantity)
                         print(f"✅ EXECUTED BUY: {order}", flush=True)
                         positions[symbol] = True
                         entry_prices[symbol] = close_price
@@ -139,7 +148,7 @@ def run_bot():
                     if close_price <= stop_price:
                         crypto_quantity = trade_amount_usdt / entry_prices[symbol]
                         print(f"🛑 STOP LOSS: {symbol} at ${close_price}", flush=True)
-                        order = exchange.create_market_sell_order(symbol, crypto_quantity)
+                        order = trade_exchange.create_market_sell_order(symbol, crypto_quantity)
                         print(f"✅ EXECUTED STOP LOSS: {order}", flush=True)
                         positions[symbol] = False
                         entry_prices[symbol] = 0.0
@@ -147,7 +156,7 @@ def run_bot():
                     elif sell_condition:
                         crypto_quantity = trade_amount_usdt / entry_prices[symbol]
                         print(f"🎯 EXIT SIGNAL: {symbol} at ${close_price}", flush=True)
-                        order = exchange.create_market_sell_order(symbol, crypto_quantity)
+                        order = trade_exchange.create_market_sell_order(symbol, crypto_quantity)
                         print(f"✅ EXECUTED EXIT: {order}", flush=True)
                         positions[symbol] = False
                         entry_prices[symbol] = 0.0
@@ -155,7 +164,6 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        # 🛑 Rate Limit এড়াতে লুপ শেষে বিরতি বাড়িয়ে ৬০ সেকেন্ড করা হলো
         print("--- Scan Loop Completed. Waiting 60s ---\n", flush=True)
         time.sleep(60)
 
