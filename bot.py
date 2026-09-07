@@ -1,6 +1,7 @@
 import time
 import os
 import pandas as pd
+import requests
 import ccxt
 from flask import Flask
 from threading import Thread
@@ -34,41 +35,58 @@ stop_loss_pct = 0.02      # ২% স্টপ লস
 PROXY_URL = os.environ.get('PROXY_URL', '')
 
 # ------------------------------------------
-# A. PUBLIC EXCHANGE INSTANCE (ক্যান্ডেলস্টিক/ডেটা নেওয়ার জন্য)
+# PRIVATE EXCHANGE INSTANCE (শুধুমাত্র বাই/সেল ট্রেড এক্সিকিউশনের জন্য)
 # ------------------------------------------
-public_config = {
-    'enableRateLimit': True,
-}
-if PROXY_URL:
-    public_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
-
-public_exchange = ccxt.binance(public_config)
-
-# 🛑 IP Ban বাইপাস: CCXT-এর সব API রিকোয়েস্টকে api3 ডোমেইনে রিডাইরেক্ট করা হচ্ছে
-public_exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
-public_exchange.urls['api']['sapi'] = 'https://api3.binance.com/sapi/v1'
-
-# ------------------------------------------
-# B. PRIVATE EXCHANGE INSTANCE (বাই/সেল অর্ডার নেওয়ার জন্য)
-# ------------------------------------------
-private_config = {
+trade_exchange = ccxt.binance({
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
     'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-}
-if PROXY_URL:
-    private_config['proxies'] = {'http': PROXY_URL, 'https': PROXY_URL}
+    'options': {'defaultType': 'spot'},
+    'urls': {
+        'api': {
+            'public': 'https://api3.binance.com/api/v3',
+            'private': 'https://api3.binance.com/api/v3',
+            'sapi': 'https://api3.binance.com/sapi/v1',
+        }
+    }
+})
 
-trade_exchange = ccxt.binance(private_config)
-trade_exchange.urls['api']['public'] = 'https://api3.binance.com/api/v3'
-trade_exchange.urls['api']['private'] = 'https://api3.binance.com/api/v3'
+if PROXY_URL:
+    trade_exchange.proxies = {'http': PROXY_URL, 'https': PROXY_URL}
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. INDICATOR CALCULATIONS
+# 3. DIRECT API CANDLESTICK FETCH (No CCXT exchangeInfo Issue)
+# ==========================================
+def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
+    # 'LISTA/USDT' -> 'LISTAUSDT'
+    clean_symbol = symbol.replace('/', '') 
+    url = f"https://api3.binance.com/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
+    
+    proxies = {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None
+    response = requests.get(url, proxies=proxies, timeout=10)
+    
+    if response.status_code == 200:
+        data = response.json()
+        # [time, open, high, low, close, volume, ...]
+        parsed_data = []
+        for row in data:
+            parsed_data.append([
+                int(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5])
+            ])
+        return parsed_data
+    else:
+        raise Exception(f"HTTP {response.status_code}: {response.text}")
+
+# ==========================================
+# 4. INDICATOR CALCULATIONS
 # ==========================================
 def calculate_rsi(series, period):
     delta = series.diff()
@@ -108,7 +126,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. MAIN TRADING LOOP
+# 5. MAIN TRADING LOOP
 # ==========================================
 def run_bot():
     print(f"🚀 Trading Bot started for {len(symbols)} coins", flush=True)
@@ -117,11 +135,10 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # রিকোয়েস্টের আগে ৪ সেকেন্ড বিরতি
-                time.sleep(4.0) 
+                time.sleep(2.0) # ২ সেকেন্ড বিরতি
                 
-                # exchangeInfo কল না করার জন্য সরাসরি OHLCV আনা
-                bars = public_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+                # সরাসরি Binance API3 থেকে ডেটা ফেচ করা
+                bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
                 df = calculate_indicators(df)
@@ -173,7 +190,7 @@ def run_bot():
         time.sleep(60)
 
 # ==========================================
-# 5. BACKGROUND THREAD LAUNCH
+# 6. BACKGROUND THREAD LAUNCH
 # ==========================================
 bot_thread = Thread(target=run_bot)
 bot_thread.daemon = True
