@@ -7,7 +7,7 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. FLASK APP FOR RENDER HEALTH CHECK & UPTIMEROBOT
+# 1. FLASK APP FOR RENDER HEALTH CHECK
 # ==========================================
 app = Flask(__name__)
 
@@ -32,16 +32,20 @@ timeframe = '5m'          # ৫ মিনিটের টাইমফ্রে�
 trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলার
 stop_loss_pct = 0.02      # ২% স্টপ লস
 
-PROXY_URL = os.environ.get('PROXY_URL', '')
+PROXY_URL = os.environ.get('PROXY_URL', '').strip()
 
 # ------------------------------------------
-# PRIVATE EXCHANGE INSTANCE (শুধুমাত্র বাই/সেল ট্রেড এক্সিকিউশনের জন্য)
+# PRIVATE EXCHANGE INSTANCE (Buy/Sell Trades)
 # ------------------------------------------
 trade_exchange = ccxt.binance({
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
     'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'},
+    'options': {
+        'defaultType': 'spot',
+        'adjustForTimeDifference': False,
+        'recvWindow': 10000
+    },
     'urls': {
         'api': {
             'public': 'https://api3.binance.com/api/v3',
@@ -51,6 +55,8 @@ trade_exchange = ccxt.binance({
     }
 })
 
+trade_exchange.has['fetchMarkets'] = False
+
 if PROXY_URL:
     trade_exchange.proxies = {'http': PROXY_URL, 'https': PROXY_URL}
 
@@ -58,19 +64,18 @@ positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. DIRECT API CANDLESTICK FETCH (No CCXT exchangeInfo Issue)
+# 3. DIRECT REST API CANDLESTICK FETCH WITH PROXY
 # ==========================================
 def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
-    # 'LISTA/USDT' -> 'LISTAUSDT'
     clean_symbol = symbol.replace('/', '') 
     url = f"https://api3.binance.com/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
     
     proxies = {'http': PROXY_URL, 'https': PROXY_URL} if PROXY_URL else None
-    response = requests.get(url, proxies=proxies, timeout=10)
+    
+    response = requests.get(url, proxies=proxies, timeout=12)
     
     if response.status_code == 200:
         data = response.json()
-        # [time, open, high, low, close, volume, ...]
         parsed_data = []
         for row in data:
             parsed_data.append([
@@ -135,9 +140,8 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                time.sleep(2.0) # ২ সেকেন্ড বিরতি
+                time.sleep(2.0)
                 
-                # সরাসরি Binance API3 থেকে ডেটা ফেচ করা
                 bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 
