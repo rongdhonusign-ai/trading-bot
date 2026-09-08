@@ -1,8 +1,10 @@
 import time
 import os
+import json
 import pandas as pd
 import requests
 import ccxt
+import websocket
 from flask import Flask
 from threading import Thread
 
@@ -28,13 +30,10 @@ symbols = [
     'ZEN/USDT', 'IOTX/USDT', 'BERA/USDT'
 ]
 
-timeframe = '5m'          # ৫ মিনিটের টাইমফ্রেম
-trade_amount_usdt = 6.0   # প্রতিটি ট্রেড ৬ ডলার
-stop_loss_pct = 0.02      # ২% স্টপ লস
+timeframe = '5m'          
+trade_amount_usdt = 6.0   
+stop_loss_pct = 0.02      
 
-# ------------------------------------------
-# PRIVATE EXCHANGE INSTANCE (Buy/Sell Trades)
-# ------------------------------------------
 trade_exchange = ccxt.binance({
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
     'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
@@ -42,12 +41,10 @@ trade_exchange = ccxt.binance({
     'options': {
         'defaultType': 'spot',
         'adjustForTimeDifference': False,
-        'recvWindow': 10000,
-        'warnOnFetchOpenOrders': False
+        'recvWindow': 10000
     }
 })
 
-# CCXT-এর অতিরিক্ত ব্যাকগ্রাউন্ড নেটওয়ার্ক কল পুরোপুরি বন্ধ রাখা হচ্ছে
 trade_exchange.has['fetchMarkets'] = False
 trade_exchange.has['fetchCurrencies'] = False
 
@@ -55,33 +52,15 @@ positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. PUBLIC API CANDLESTICK FETCH
+# 3. PUBLIC KLINE FETCH (REST fallback)
 # ==========================================
 def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
-    clean_symbol = symbol.replace('/', '') 
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    
-    response = requests.get(url, headers=headers, timeout=12)
-    
+    clean_symbol = symbol.replace('/', '').lower()
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_symbol.upper()}&interval={interval}&limit={limit}"
+    response = requests.get(url, timeout=10)
     if response.status_code == 200:
-        data = response.json()
-        parsed_data = []
-        for row in data:
-            parsed_data.append([
-                int(row[0]),
-                float(row[1]),
-                float(row[2]),
-                float(row[3]),
-                float(row[4]),
-                float(row[5])
-            ])
-        return parsed_data
-    else:
-        raise Exception(f"HTTP {response.status_code}: {response.text}")
+        return [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in response.json()]
+    return []
 
 # ==========================================
 # 4. INDICATOR CALCULATIONS
@@ -95,7 +74,6 @@ def calculate_rsi(series, period):
 
 def calculate_indicators(df):
     df['rsi'] = calculate_rsi(df['close'], 3)
-
     updn = [0.0] * len(df)
     close_vals = df['close'].values
     for i in range(1, len(df)):
@@ -108,23 +86,19 @@ def calculate_indicators(df):
             
     df['updn'] = updn
     df['updn_rsi'] = calculate_rsi(pd.Series(updn), 2)
-
     roc = df['close'].pct_change(1)
     df['percent_rank'] = roc.rolling(2).apply(
         lambda x: (pd.Series(x).rank(pct=True).iloc[-1]) * 100, raw=False
     )
-
     df['crsi'] = (df['rsi'] + df['updn_rsi'] + df['percent_rank']) / 3
-
     low_min = df['low'].rolling(window=14).min()
     high_max = df['high'].rolling(window=14).max()
     stoch_raw = 100 * ((df['close'] - low_min) / (high_max - low_min))
     df['stoch_k'] = stoch_raw.rolling(window=3).mean().rolling(window=3).mean()
-
     return df
 
 # ==========================================
-# 5. MAIN TRADING LOOP
+# 5. MAIN TRADING LOOP WITH DELAY
 # ==========================================
 def run_bot():
     print(f"🚀 Trading Bot started for {len(symbols)} coins", flush=True)
@@ -133,12 +107,14 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # Rate limit এড়াতে পজ সময় ৫ সেকেন্ডে উন্নীত করা হলো
-                time.sleep(5.0)
+                # প্রতিটি কইন স্ক্যানের মাঝে ৮ সেকেন্ড ডিলে যাতে API ব্যান না হয়
+                time.sleep(8.0)
                 
                 bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
+                if not bars:
+                    continue
+                    
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                
                 df = calculate_indicators(df)
 
                 last_row = df.iloc[-1]
@@ -184,8 +160,8 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        print("--- Scan Loop Completed. Waiting 180s ---\n", flush=True)
-        time.sleep(180)
+        print("--- Scan Loop Completed. Waiting 120s ---\n", flush=True)
+        time.sleep(120)
 
 # ==========================================
 # 6. BACKGROUND THREAD LAUNCH
