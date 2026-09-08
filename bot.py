@@ -52,14 +52,18 @@ positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. PUBLIC API CANDLESTICK FETCH (NO PROXY NEEDED)
+# 3. PUBLIC API CANDLESTICK FETCH
 # ==========================================
 def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
     clean_symbol = symbol.replace('/', '') 
-    # Binance Vision Public API Endpoint
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
     
-    response = requests.get(url, timeout=12)
+    # User-Agent যুক্ত করা হয়েছে যেন ব্রাউজার রিকোয়েস্টের মতো মনে হয়
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    response = requests.get(url, headers=headers, timeout=12)
     
     if response.status_code == 200:
         data = response.json()
@@ -127,7 +131,8 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                time.sleep(1.5)
+                # Rate limit এড়াতে ৩.৫ সেকেন্ড পজ
+                time.sleep(3.5)
                 
                 bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -177,8 +182,8 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        print("--- Scan Loop Completed. Waiting 60s ---\n", flush=True)
-        time.sleep(60)
+        print("--- Scan Loop Completed. Waiting 120s ---\n", flush=True)
+        time.sleep(120)
 
 # ==========================================
 # 6. BACKGROUND THREAD LAUNCH
