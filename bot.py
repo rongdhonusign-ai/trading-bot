@@ -42,11 +42,14 @@ trade_exchange = ccxt.binance({
     'options': {
         'defaultType': 'spot',
         'adjustForTimeDifference': False,
-        'recvWindow': 10000
+        'recvWindow': 10000,
+        'warnOnFetchOpenOrders': False
     }
 })
 
+# CCXT-এর অতিরিক্ত ব্যাকগ্রাউন্ড নেটওয়ার্ক কল পুরোপুরি বন্ধ রাখা হচ্ছে
 trade_exchange.has['fetchMarkets'] = False
+trade_exchange.has['fetchCurrencies'] = False
 
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
@@ -58,7 +61,6 @@ def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
     clean_symbol = symbol.replace('/', '') 
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_symbol}&interval={interval}&limit={limit}"
     
-    # User-Agent যুক্ত করা হয়েছে যেন ব্রাউজার রিকোয়েস্টের মতো মনে হয়
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
@@ -131,8 +133,8 @@ def run_bot():
         print("\n--- Starting New Market Scan Loop ---", flush=True)
         for symbol in symbols:
             try:
-                # Rate limit এড়াতে ৩.৫ সেকেন্ড পজ
-                time.sleep(3.5)
+                # Rate limit এড়াতে পজ সময় ৫ সেকেন্ডে উন্নীত করা হলো
+                time.sleep(5.0)
                 
                 bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
                 df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -182,8 +184,8 @@ def run_bot():
             except Exception as e:
                 print(f"⚠️ Error processing {symbol}: {e}", flush=True)
 
-        print("--- Scan Loop Completed. Waiting 120s ---\n", flush=True)
-        time.sleep(120)
+        print("--- Scan Loop Completed. Waiting 180s ---\n", flush=True)
+        time.sleep(180)
 
 # ==========================================
 # 6. BACKGROUND THREAD LAUNCH
