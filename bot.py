@@ -9,17 +9,22 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. FLASK APP FOR RENDER HEALTH CHECK
+# 1. FLASK APP (HEALTH CHECK FOR RENDER)
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
-    return "Trading Bot is Running via Live WebSocket Ticker!", 200
+    return "Trading Bot is Live!", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    # Flask-এর লগ যেন কনসোল না ভরিয়ে ফেলে তার জন্য quiet রান করা হচ্ছে
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ==========================================
-# 2. BOT CONFIGURATION & SYMBOL LIST
+# 2. CONFIGURATION & SYMBOL LIST
 # ==========================================
 symbols = [
     'listaUsdt', 'flokiUsdt', 'bmtUsdt', 'bnbUsdt', 'theUsdt', 
@@ -52,7 +57,7 @@ positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. INDICATOR CALCULATIONS
+# 3. INDICATORS
 # ==========================================
 def calculate_rsi(series, period):
     delta = series.diff()
@@ -87,7 +92,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. PROCESS TICKER DATA & TRADING LOGIC
+# 4. WEBSOCKET CALLBACKS
 # ==========================================
 def process_ticker_data(symbol_key, current_price, high_price, low_price):
     formatted_symbol = symbol_key.upper().replace('USDT', '/USDT')
@@ -111,19 +116,16 @@ def process_ticker_data(symbol_key, current_price, high_price, low_price):
         crsi = last_row.get('crsi', 0)
         stoch_k = last_row.get('stoch_k', 0)
 
-        print(f"⚡ [WS SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
-        sys.stdout.flush()
+        print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
 
         buy_condition = (crsi < 20) and (stoch_k < 20)
         sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
 
         if not positions[formatted_symbol] and buy_condition:
             crypto_quantity = trade_amount_usdt / current_price
-            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
-            sys.stdout.flush()
+            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}", flush=True)
             order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-            print(f"✅ EXECUTED BUY: {order}")
-            sys.stdout.flush()
+            print(f"✅ EXECUTED BUY: {order}", flush=True)
             positions[formatted_symbol] = True
             entry_prices[formatted_symbol] = current_price
 
@@ -131,16 +133,13 @@ def process_ticker_data(symbol_key, current_price, high_price, low_price):
             stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
             if current_price <= stop_price or sell_condition:
                 crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
-                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
-                sys.stdout.flush()
+                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}", flush=True)
                 order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-                print(f"✅ EXECUTED SELL: {order}")
-                sys.stdout.flush()
+                print(f"✅ EXECUTED SELL: {order}", flush=True)
                 positions[formatted_symbol] = False
                 entry_prices[formatted_symbol] = 0.0
     else:
-        print(f"⏳ [WS SCAN {formatted_symbol}] Gathering Data... Price: {current_price} ({len(df)}/14)")
-        sys.stdout.flush()
+        print(f"⏳ [SCAN {formatted_symbol}] Gathering Price Data: {current_price} ({len(df)}/14)", flush=True)
 
 def on_message(ws, message):
     try:
@@ -154,42 +153,36 @@ def on_message(ws, message):
             
             process_ticker_data(symbol, current_price, high_price, low_price)
     except Exception as e:
-        print(f"Error parsing WS message: {e}")
-        sys.stdout.flush()
+        print(f"WS Parsing Error: {e}", flush=True)
 
 def on_open(ws):
-    print("✅ Binance Ticker WebSocket Connected Successfully!")
-    sys.stdout.flush()
+    print("✅ LIVE WEBSOCKET CONNECTED! STARTING REAL-TIME MARKET SCAN...", flush=True)
 
-def start_websocket():
+# ==========================================
+# 5. MAIN ENTRY POINT
+# ==========================================
+if __name__ == '__main__':
+    # ১. Flask-কে ব্যাকগ্রাউন্ড থ্রেডে চালনা
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # ২. WebSocket-কে মেইন থ্রেডে চালানো
     streams = "/".join([f"{sym}@ticker" for sym in symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     
     while True:
         try:
-            print("⏳ Connecting to Binance Ticker Stream...")
-            sys.stdout.flush()
+            print("⏳ Connecting to Binance WebSocket Stream...", flush=True)
             ws = websocket.WebSocketApp(
                 ws_url,
                 on_open=on_open,
                 on_message=on_message,
-                on_error=lambda ws, err: print(f"WS Error: {err}"),
-                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...")
+                on_error=lambda ws, err: print(f"WS Error: {err}", flush=True),
+                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...", flush=True)
             )
             ws.run_forever()
             time.sleep(3)
         except Exception as e:
-            print(f"WS Exception: {e}")
-            sys.stdout.flush()
+            print(f"WS Main Loop Exception: {e}", flush=True)
             time.sleep(3)
-
-# ==========================================
-# 5. BACKGROUND THREAD LAUNCH
-# ==========================================
-ws_thread = Thread(target=start_websocket)
-ws_thread.daemon = True
-ws_thread.start()
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
