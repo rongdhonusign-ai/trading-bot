@@ -1,7 +1,6 @@
 import time
 import os
 import json
-import sys
 import pandas as pd
 import ccxt
 import websocket
@@ -16,23 +15,22 @@ app = Flask(__name__)
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
-    return "Trading Bot is Live!", 200
+    return "Trading Bot is Active!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    # Flask-এর লগ যেন কনসোল না ভরিয়ে ফেলে তার জন্য quiet রান করা হচ্ছে
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ==========================================
-# 2. CONFIGURATION & SYMBOL LIST
+# 2. CONFIGURATION & TARGET SYMBOLS
 # ==========================================
-symbols = [
-    'listaUsdt', 'flokiUsdt', 'bmtUsdt', 'bnbUsdt', 'theUsdt', 
-    'belUsdt', 'cakeUsdt', 'ontUsdt', 'zamaUsdt', 'megaUsdt', 
-    'ensUsdt', 'bicoUsdt', 'tUsdt', 'ssvUsdt', 'glmUsdt', 
-    'altUsdt', 'axlUsdt', 'ioUsdt', 'zroUsdt', 'heiUsdt', 
-    'redUsdt', 'zkUsdt', 'qntUsdt', 'thetaUsdt', 'trbUsdt', 
-    'zenUsdt', 'iotxUsdt', 'beraUsdt'
+target_symbols = [
+    'LISTAUSDT', 'FLOKIUSDT', 'BMTUSDT', 'BNBUSDT', 'THEUSDT', 
+    'BELUSDT', 'CAKEUSDT', 'ONTUSDT', 'ZAMAUSDT', 'MEGAUSDT', 
+    'ENSUSDT', 'BICOUSDT', 'TUSDT', 'SSVUSDT', 'GLMUSDT', 
+    'ALTUSDT', 'AXLUSDT', 'IOUSDT', 'ZROUSDT', 'HEIUSDT', 
+    'REDUSDT', 'ZKUSDT', 'QNTUSDT', 'THETAUSDT', 'TRBUSDT', 
+    'ZENUSDT', 'IOTXUSDT', 'BERAUSDT'
 ]
 
 trade_amount_usdt = 6.0   
@@ -52,12 +50,13 @@ trade_exchange = ccxt.binance({
 trade_exchange.has['fetchMarkets'] = False
 trade_exchange.has['fetchCurrencies'] = False
 
-prices_history = {sym: [] for sym in symbols}
-positions = {sym: False for sym in symbols}
-entry_prices = {sym: 0.0 for sym in symbols}
+prices_history = {sym: [] for sym in target_symbols}
+positions = {sym: False for sym in target_symbols}
+entry_prices = {sym: 0.0 for sym in target_symbols}
+last_print_time = {sym: 0 for sym in target_symbols}
 
 # ==========================================
-# 3. INDICATORS
+# 3. INDICATOR CALCULATIONS
 # ==========================================
 def calculate_rsi(series, period):
     delta = series.diff()
@@ -92,21 +91,22 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET CALLBACKS
+# 4. TICKER DATA PROCESSOR
 # ==========================================
-def process_ticker_data(symbol_key, current_price, high_price, low_price):
-    formatted_symbol = symbol_key.upper().replace('USDT', '/USDT')
+def process_single_ticker(symbol, current_price, high_price, low_price):
+    formatted_symbol = symbol.replace('USDT', '/USDT')
     
-    prices_history[symbol_key].append({
+    prices_history[symbol].append({
         'close': current_price,
         'high': high_price,
         'low': low_price
     })
     
-    if len(prices_history[symbol_key]) > 30:
-        prices_history[symbol_key].pop(0)
+    if len(prices_history[symbol]) > 30:
+        prices_history[symbol].pop(0)
 
-    df = pd.DataFrame(prices_history[symbol_key])
+    df = pd.DataFrame(prices_history[symbol])
+    current_time = time.time()
 
     if len(df) >= 14:
         df = calculate_indicators(df)
@@ -116,7 +116,10 @@ def process_ticker_data(symbol_key, current_price, high_price, low_price):
         crsi = last_row.get('crsi', 0)
         stoch_k = last_row.get('stoch_k', 0)
 
-        print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+        # কনসোলে অতিরিক্ত মেসেজের চাপ কমাতে ৩ সেকেন্ড পর পর ১বার প্রিন্ট দেবে
+        if current_time - last_print_time[symbol] >= 3:
+            print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+            last_print_time[symbol] = current_time
 
         buy_condition = (crsi < 20) and (stoch_k < 20)
         sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
@@ -139,41 +142,41 @@ def process_ticker_data(symbol_key, current_price, high_price, low_price):
                 positions[formatted_symbol] = False
                 entry_prices[formatted_symbol] = 0.0
     else:
-        print(f"⏳ [SCAN {formatted_symbol}] Gathering Price Data: {current_price} ({len(df)}/14)", flush=True)
+        if current_time - last_print_time[symbol] >= 3:
+            print(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)", flush=True)
+            last_print_time[symbol] = current_time
 
 def on_message(ws, message):
     try:
         data = json.loads(message)
-        if 'data' in data:
-            ticker = data['data']
-            symbol = ticker['s'].lower()
-            current_price = float(ticker['c'])
-            high_price = float(ticker['h'])
-            low_price = float(ticker['l'])
-            
-            process_ticker_data(symbol, current_price, high_price, low_price)
+        # Global ticker array থেকে কেবল আমাদের লিস্টে থাকা টোকেন ফিল্টার
+        for item in data:
+            sym = item.get('s')
+            if sym in target_symbols:
+                close_price = float(item['c'])
+                high_price = float(item['h'])
+                low_price = float(item['l'])
+                process_single_ticker(sym, close_price, high_price, low_price)
     except Exception as e:
-        print(f"WS Parsing Error: {e}", flush=True)
+        pass
 
 def on_open(ws):
-    print("✅ LIVE WEBSOCKET CONNECTED! STARTING REAL-TIME MARKET SCAN...", flush=True)
+    print("✅ GLOBAL WEBSOCKET CONNECTED! REAL-TIME SCANNING RUNNING...", flush=True)
 
 # ==========================================
-# 5. MAIN ENTRY POINT
+# 5. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
-    # ১. Flask-কে ব্যাকগ্রাউন্ড থ্রেডে চালনা
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
-    # ২. WebSocket-কে মেইন থ্রেডে চালানো
-    streams = "/".join([f"{sym}@ticker" for sym in symbols])
-    ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    # Binance All Market Tickers Stream
+    ws_url = "wss://stream.binance.com:9443/ws/!ticker@arr"
     
     while True:
         try:
-            print("⏳ Connecting to Binance WebSocket Stream...", flush=True)
+            print("⏳ Connecting to Binance Global Stream...", flush=True)
             ws = websocket.WebSocketApp(
                 ws_url,
                 on_open=on_open,
@@ -184,5 +187,5 @@ if __name__ == '__main__':
             ws.run_forever()
             time.sleep(3)
         except Exception as e:
-            print(f"WS Main Loop Exception: {e}", flush=True)
+            print(f"WS Exception: {e}", flush=True)
             time.sleep(3)
