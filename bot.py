@@ -22,15 +22,15 @@ def run_flask():
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ==========================================
-# 2. CONFIGURATION & TARGET SYMBOLS
+# 2. CONFIGURATION & TARGET SYMBOLS (LOWERCASE)
 # ==========================================
 target_symbols = [
-    'LISTAUSDT', 'FLOKIUSDT', 'BMTUSDT', 'BNBUSDT', 'THEUSDT', 
-    'BELUSDT', 'CAKEUSDT', 'ONTUSDT', 'ZAMAUSDT', 'MEGAUSDT', 
-    'ENSUSDT', 'BICOUSDT', 'TUSDT', 'SSVUSDT', 'GLMUSDT', 
-    'ALTUSDT', 'AXLUSDT', 'IOUSDT', 'ZROUSDT', 'HEIUSDT', 
-    'REDUSDT', 'ZKUSDT', 'QNTUSDT', 'THETAUSDT', 'TRBUSDT', 
-    'ZENUSDT', 'IOTXUSDT', 'BERAUSDT'
+    'listausdt', 'flokiusdt', 'bmtusdt', 'bnbusdt', 'theusdt', 
+    'belusdt', 'cakeusdt', 'ontusdt', 'zamausdt', 'megausdt', 
+    'ensusdt', 'bicousdt', 'tusdt', 'ssvusdt', 'glmusdt', 
+    'altusdt', 'axlusdt', 'iousdt', 'zrousdt', 'heiusdt', 
+    'redusdt', 'zkusdt', 'qntusdt', 'thetausdt', 'trbusdt', 
+    'zenusdt', 'iotxusdt', 'berausdt'
 ]
 
 trade_amount_usdt = 6.0   
@@ -94,7 +94,7 @@ def calculate_indicators(df):
 # 4. TICKER DATA PROCESSOR
 # ==========================================
 def process_single_ticker(symbol, current_price, high_price, low_price):
-    formatted_symbol = symbol.replace('USDT', '/USDT')
+    formatted_symbol = symbol.upper().replace('USDT', '/USDT')
     
     prices_history[symbol].append({
         'close': current_price,
@@ -116,7 +116,6 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
         crsi = last_row.get('crsi', 0)
         stoch_k = last_row.get('stoch_k', 0)
 
-        # কনসোলে অতিরিক্ত মেসেজের চাপ কমাতে ৩ সেকেন্ড পর পর ১বার প্রিন্ট দেবে
         if current_time - last_print_time[symbol] >= 3:
             print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
             last_print_time[symbol] = current_time
@@ -149,9 +148,8 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
 def on_message(ws, message):
     try:
         data = json.loads(message)
-        # Global ticker array থেকে কেবল আমাদের লিস্টে থাকা টোকেন ফিল্টার
         for item in data:
-            sym = item.get('s')
+            sym = item.get('s', '').lower()
             if sym in target_symbols:
                 close_price = float(item['c'])
                 high_price = float(item['h'])
@@ -161,7 +159,7 @@ def on_message(ws, message):
         pass
 
 def on_open(ws):
-    print("✅ GLOBAL WEBSOCKET CONNECTED! REAL-TIME SCANNING RUNNING...", flush=True)
+    print("✅ GLOBAL WEBSOCKET CONNECTED! SCANNING IS RUNNING...", flush=True)
 
 # ==========================================
 # 5. MAIN EXECUTION
@@ -171,7 +169,6 @@ if __name__ == '__main__':
     flask_thread.daemon = True
     flask_thread.start()
     
-    # Binance All Market Tickers Stream
     ws_url = "wss://stream.binance.com:9443/ws/!ticker@arr"
     
     while True:
