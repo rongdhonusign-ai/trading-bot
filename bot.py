@@ -46,7 +46,6 @@ trade_exchange = ccxt.binance({
 trade_exchange.has['fetchMarkets'] = False
 trade_exchange.has['fetchCurrencies'] = False
 
-# ডাটা স্টোরেজ
 klines_data = {sym: [] for sym in symbols}
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
@@ -87,7 +86,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET HANDLERS
+# 4. WEBSOCKET PROCESSOR
 # ==========================================
 def process_symbol_data(symbol_key, df):
     formatted_symbol = symbol_key.upper().replace('USDT', '/USDT')
@@ -124,46 +123,52 @@ def process_symbol_data(symbol_key, df):
             entry_prices[formatted_symbol] = 0.0
 
 def on_message(ws, message):
-    data = json.loads(message)
-    if 'data' in data:
-        kline = data['data']['k']
-        symbol = kline['s'].lower()
-        
-        # ক্যান্ডেল ক্লোজ হলে বা নতুন ডাটা আসলে প্রসেস করবে
-        close_price = float(kline['c'])
-        high_price = float(kline['h'])
-        low_price = float(kline['l'])
-        open_price = float(kline['o'])
-        
-        if symbol not in klines_data:
-            klines_data[symbol] = []
+    try:
+        data = json.loads(message)
+        if 'data' in data:
+            kline = data['data']['k']
+            symbol = kline['s'].lower()
             
-        klines_data[symbol].append([0, open_price, high_price, low_price, close_price, 0])
-        if len(klines_data[symbol]) > 50:
-            klines_data[symbol].pop(0)
+            close_price = float(kline['c'])
+            high_price = float(kline['h'])
+            low_price = float(kline['l'])
+            open_price = float(kline['o'])
             
-        if len(klines_data[symbol]) >= 20:
-            df = pd.DataFrame(klines_data[symbol], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-            process_symbol_data(symbol, df)
+            if symbol not in klines_data:
+                klines_data[symbol] = []
+                
+            klines_data[symbol].append([0, open_price, high_price, low_price, close_price, 0])
+            if len(klines_data[symbol]) > 30:
+                klines_data[symbol].pop(0)
+                
+            if len(klines_data[symbol]) >= 15:
+                df = pd.DataFrame(klines_data[symbol], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+                process_symbol_data(symbol, df)
+    except Exception as e:
+        print(f"Error parsing WS data: {e}", flush=True)
+
+def on_open(ws):
+    print("✅ Binance WebSocket Connected Successfully!", flush=True)
 
 def start_websocket():
     streams = "/".join([f"{sym}@kline_5m" for sym in symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_message=on_message,
-        on_error=lambda ws, err: print(f"WS Error: {err}"),
-        on_close=lambda ws, status, msg: print("WS Closed. Reconnecting...")
-    )
-    
     while True:
         try:
+            print("⏳ Connecting to Binance WebSocket Stream...", flush=True)
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=lambda ws, err: print(f"WS Error: {err}", flush=True),
+                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...", flush=True)
+            )
             ws.run_forever()
-            time.sleep(5)
+            time.sleep(3)
         except Exception as e:
-            print(f"WS Exception: {e}")
-            time.sleep(5)
+            print(f"WS Loop Exception: {e}", flush=True)
+            time.sleep(3)
 
 # ==========================================
 # 5. BACKGROUND THREAD LAUNCH
