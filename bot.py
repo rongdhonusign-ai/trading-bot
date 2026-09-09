@@ -1,6 +1,7 @@
 import time
 import os
 import json
+import sys
 import pandas as pd
 import ccxt
 import websocket
@@ -15,7 +16,7 @@ app = Flask(__name__)
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
-    return "Trading Bot is Running via WebSocket!", 200
+    return "Trading Bot is Running via Live WebSocket Ticker!", 200
 
 # ==========================================
 # 2. BOT CONFIGURATION & SYMBOL LIST
@@ -46,7 +47,7 @@ trade_exchange = ccxt.binance({
 trade_exchange.has['fetchMarkets'] = False
 trade_exchange.has['fetchCurrencies'] = False
 
-klines_data = {sym: [] for sym in symbols}
+prices_history = {sym: [] for sym in symbols}
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
@@ -86,13 +87,22 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. DATA PROCESSOR & SCAN LOGS
+# 4. PROCESS TICKER DATA & TRADING LOGIC
 # ==========================================
-def process_symbol_data(symbol_key, df):
+def process_ticker_data(symbol_key, current_price, high_price, low_price):
     formatted_symbol = symbol_key.upper().replace('USDT', '/USDT')
-    close_price = df.iloc[-1]['close']
+    
+    prices_history[symbol_key].append({
+        'close': current_price,
+        'high': high_price,
+        'low': low_price
+    })
+    
+    if len(prices_history[symbol_key]) > 30:
+        prices_history[symbol_key].pop(0)
 
-    # যথেষ্ট ক্যান্ডেল ডাটা জমে গেলে ইন্ডিকেটর ক্যালকুলেশন করবে
+    df = pd.DataFrame(prices_history[symbol_key])
+
     if len(df) >= 14:
         df = calculate_indicators(df)
         last_row = df.iloc[-1]
@@ -101,79 +111,76 @@ def process_symbol_data(symbol_key, df):
         crsi = last_row.get('crsi', 0)
         stoch_k = last_row.get('stoch_k', 0)
 
-        print(f"⚡ [WS SCAN {formatted_symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+        print(f"⚡ [WS SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
+        sys.stdout.flush()
 
         buy_condition = (crsi < 20) and (stoch_k < 20)
         sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
 
         if not positions[formatted_symbol] and buy_condition:
-            crypto_quantity = trade_amount_usdt / close_price
-            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${close_price}", flush=True)
+            crypto_quantity = trade_amount_usdt / current_price
+            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
+            sys.stdout.flush()
             order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-            print(f"✅ EXECUTED BUY: {order}", flush=True)
+            print(f"✅ EXECUTED BUY: {order}")
+            sys.stdout.flush()
             positions[formatted_symbol] = True
-            entry_prices[formatted_symbol] = close_price
+            entry_prices[formatted_symbol] = current_price
 
         elif positions[formatted_symbol]:
             stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
-            if close_price <= stop_price or sell_condition:
+            if current_price <= stop_price or sell_condition:
                 crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
-                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${close_price}", flush=True)
+                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
+                sys.stdout.flush()
                 order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-                print(f"✅ EXECUTED SELL: {order}", flush=True)
+                print(f"✅ EXECUTED SELL: {order}")
+                sys.stdout.flush()
                 positions[formatted_symbol] = False
                 entry_prices[formatted_symbol] = 0.0
     else:
-        # ১৪টি ক্যান্ডেল না হওয়া পর্যন্ত ডাটা জমার আপডেট দেখাবে
-        print(f"⏳ [WS SCAN {formatted_symbol}] Gathering Klines... Price: {close_price} (Bars: {len(df)}/14)", flush=True)
+        print(f"⏳ [WS SCAN {formatted_symbol}] Gathering Data... Price: {current_price} ({len(df)}/14)")
+        sys.stdout.flush()
 
 def on_message(ws, message):
     try:
         data = json.loads(message)
         if 'data' in data:
-            kline = data['data']['k']
-            symbol = kline['s'].lower()
+            ticker = data['data']
+            symbol = ticker['s'].lower()
+            current_price = float(ticker['c'])
+            high_price = float(ticker['h'])
+            low_price = float(ticker['l'])
             
-            close_price = float(kline['c'])
-            high_price = float(kline['h'])
-            low_price = float(kline['l'])
-            open_price = float(kline['o'])
-            
-            if symbol not in klines_data:
-                klines_data[symbol] = []
-                
-            klines_data[symbol].append([0, open_price, high_price, low_price, close_price, 0])
-            if len(klines_data[symbol]) > 30:
-                klines_data[symbol].pop(0)
-                
-            # অন্তত ২টি ক্যান্ডেল পেলেই স্ক্যানিং আউটপুট প্রিন্ট করা শুরু করবে
-            if len(klines_data[symbol]) >= 2:
-                df = pd.DataFrame(klines_data[symbol], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                process_symbol_data(symbol, df)
+            process_ticker_data(symbol, current_price, high_price, low_price)
     except Exception as e:
-        print(f"Error parsing WS data: {e}", flush=True)
+        print(f"Error parsing WS message: {e}")
+        sys.stdout.flush()
 
 def on_open(ws):
-    print("✅ Binance WebSocket Connected Successfully!", flush=True)
+    print("✅ Binance Ticker WebSocket Connected Successfully!")
+    sys.stdout.flush()
 
 def start_websocket():
-    streams = "/".join([f"{sym}@kline_5m" for sym in symbols])
+    streams = "/".join([f"{sym}@ticker" for sym in symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     
     while True:
         try:
-            print("⏳ Connecting to Binance WebSocket Stream...", flush=True)
+            print("⏳ Connecting to Binance Ticker Stream...")
+            sys.stdout.flush()
             ws = websocket.WebSocketApp(
                 ws_url,
                 on_open=on_open,
                 on_message=on_message,
-                on_error=lambda ws, err: print(f"WS Error: {err}", flush=True),
-                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...", flush=True)
+                on_error=lambda ws, err: print(f"WS Error: {err}"),
+                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...")
             )
             ws.run_forever()
             time.sleep(3)
         except Exception as e:
-            print(f"WS Loop Exception: {e}", flush=True)
+            print(f"WS Exception: {e}")
+            sys.stdout.flush()
             time.sleep(3)
 
 # ==========================================
