@@ -1,20 +1,22 @@
 import time
 import os
+import json
 import sys
 import pandas as pd
 import ccxt
+import websocket
 from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. FLASK APP (FOR RENDER HEALTH CHECK)
+# 1. FLASK APP FOR RENDER HEALTH CHECK
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
-    return "Trading Bot is Active and Scanning!", 200
+    return "Trading Bot Active!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -24,12 +26,12 @@ def run_flask():
 # 2. CONFIGURATION & TARGET SYMBOLS
 # ==========================================
 target_symbols = [
-    'LISTA/USDT', 'FLOKI/USDT', 'BMT/USDT', 'BNB/USDT', 'THE/USDT', 
-    'BEL/USDT', 'CAKE/USDT', 'ONT/USDT', 'ZAMA/USDT', 'MEGA/USDT', 
-    'ENS/USDT', 'BICO/USDT', 'T/USDT', 'SSV/USDT', 'GLM/USDT', 
-    'ALT/USDT', 'AXL/USDT', 'IO/USDT', 'ZRO/USDT', 'HEI/USDT', 
-    'RED/USDT', 'ZK/USDT', 'QNT/USDT', 'THETA/USDT', 'TRB/USDT', 
-    'ZEN/USDT', 'IOTX/USDT', 'BERA/USDT'
+    'listausdt', 'flokiusdt', 'bmtusdt', 'bnbusdt', 'theusdt', 
+    'belusdt', 'cakeusdt', 'ontusdt', 'zamausdt', 'megausdt', 
+    'ensusdt', 'bicousdt', 'tusdt', 'ssvusdt', 'glmusdt', 
+    'altusdt', 'axlusdt', 'iousdt', 'zrousdt', 'heiusdt', 
+    'redusdt', 'zkusdt', 'qntusdt', 'thetausdt', 'trbusdt', 
+    'zenusdt', 'iotxusdt', 'berausdt'
 ]
 
 trade_amount_usdt = 6.0   
@@ -49,6 +51,7 @@ trade_exchange = ccxt.binance({
 prices_history = {sym: [] for sym in target_symbols}
 positions = {sym: False for sym in target_symbols}
 entry_prices = {sym: 0.0 for sym in target_symbols}
+last_print_time = {sym: 0 for sym in target_symbols}
 
 # ==========================================
 # 3. INDICATOR CALCULATIONS
@@ -86,81 +89,108 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. BOT CORE LOOP
+# 4. WEBSOCKET PROCESSOR WITH FLUSH
 # ==========================================
-def start_bot_loop():
-    print("🚀 BOT LOOP STARTED SUCCESSFULLY! FETCHING PRICES...", flush=True)
+def process_single_ticker(symbol, current_price, high_price, low_price):
+    formatted_symbol = symbol.upper().replace('USDT', '/USDT')
     
-    while True:
-        try:
-            # একবারে সব টোকেনের রেট ফেস করা
-            tickers = trade_exchange.fetch_tickers(target_symbols)
-            
-            for symbol in target_symbols:
-                if symbol in tickers:
-                    current_price = tickers[symbol]['close']
-                    high_price = tickers[symbol]['high']
-                    low_price = tickers[symbol]['low']
-                    
-                    prices_history[symbol].append({
-                        'close': current_price,
-                        'high': high_price,
-                        'low': low_price
-                    })
-                    
-                    if len(prices_history[symbol]) > 30:
-                        prices_history[symbol].pop(0)
+    prices_history[symbol].append({
+        'close': current_price,
+        'high': high_price,
+        'low': low_price
+    })
+    
+    if len(prices_history[symbol]) > 30:
+        prices_history[symbol].pop(0)
 
-                    df = pd.DataFrame(prices_history[symbol])
+    df = pd.DataFrame(prices_history[symbol])
+    current_time = time.time()
 
-                    if len(df) >= 14:
-                        df = calculate_indicators(df)
-                        last_row = df.iloc[-1]
-                        prev_row = df.iloc[-2]
+    if len(df) >= 14:
+        df = calculate_indicators(df)
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
 
-                        crsi = last_row.get('crsi', 0)
-                        stoch_k = last_row.get('stoch_k', 0)
+        crsi = last_row.get('crsi', 0)
+        stoch_k = last_row.get('stoch_k', 0)
 
-                        print(f"⚡ [SCAN {symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+        if current_time - last_print_time[symbol] >= 3:
+            print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
+            sys.stdout.flush()
+            last_print_time[symbol] = current_time
 
-                        buy_condition = (crsi < 20) and (stoch_k < 20)
-                        sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
+        buy_condition = (crsi < 20) and (stoch_k < 20)
+        sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
 
-                        if not positions[symbol] and buy_condition:
-                            crypto_quantity = trade_amount_usdt / current_price
-                            print(f"🔥 BUY SIGNAL: {symbol} at ${current_price}", flush=True)
-                            order = trade_exchange.create_market_buy_order(symbol, crypto_quantity)
-                            print(f"✅ EXECUTED BUY: {order}", flush=True)
-                            positions[symbol] = True
-                            entry_prices[symbol] = current_price
+        if not positions[formatted_symbol] and buy_condition:
+            crypto_quantity = trade_amount_usdt / current_price
+            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
+            sys.stdout.flush()
+            order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
+            print(f"✅ EXECUTED BUY: {order}")
+            sys.stdout.flush()
+            positions[formatted_symbol] = True
+            entry_prices[formatted_symbol] = current_price
 
-                        elif positions[symbol]:
-                            stop_price = entry_prices[symbol] * (1 - stop_loss_pct)
-                            if current_price <= stop_price or sell_condition:
-                                crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                                print(f"🛑 EXIT/STOP LOSS: {symbol} at ${current_price}", flush=True)
-                                order = trade_exchange.create_market_sell_order(symbol, crypto_quantity)
-                                print(f"✅ EXECUTED SELL: {order}", flush=True)
-                                positions[symbol] = False
-                                entry_prices[symbol] = 0.0
-                    else:
-                        print(f"⏳ [SCAN {symbol}] Gathering Data: Price {current_price} ({len(df)}/14)", flush=True)
+        elif positions[formatted_symbol]:
+            stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
+            if current_price <= stop_price or sell_condition:
+                crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
+                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
+                sys.stdout.flush()
+                order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
+                print(f"✅ EXECUTED SELL: {order}")
+                sys.stdout.flush()
+                positions[formatted_symbol] = False
+                entry_prices[formatted_symbol] = 0.0
+    else:
+        if current_time - last_print_time[symbol] >= 3:
+            print(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)")
+            sys.stdout.flush()
+            last_print_time[symbol] = current_time
 
-            # ৫ সেকেন্ড পর পর আবার চেক করবে
-            time.sleep(5)
-            
-        except Exception as e:
-            print(f"Loop Error: {e}", flush=True)
-            time.sleep(5)
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if isinstance(data, list):
+            for item in data:
+                sym = item.get('s', '').lower()
+                if sym in target_symbols:
+                    close_price = float(item['c'])
+                    high_price = float(item['h'])
+                    low_price = float(item['l'])
+                    process_single_ticker(sym, close_price, high_price, low_price)
+    except Exception as e:
+        pass
+
+def on_open(ws):
+    print("✅ GLOBAL WEBSOCKET CONNECTED! REAL-TIME SCAN ACTIVE...")
+    sys.stdout.flush()
 
 # ==========================================
 # 5. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
-    # ১. Flask চলবে ব্যাকগ্রাউন্ড থ্রেডে
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
-    # ২. ট্রেডিং লুপ চলবে মেইন প্রসেসে
-    start_bot_loop()
+    ws_url = "wss://stream.binance.com:9443/ws/!ticker@arr"
+    
+    while True:
+        try:
+            print("⏳ Connecting to Binance Global Stream...")
+            sys.stdout.flush()
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=lambda ws, err: print(f"WS Error: {err}"),
+                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...")
+            )
+            ws.run_forever()
+            time.sleep(3)
+        except Exception as e:
+            print(f"WS Exception: {e}")
+            sys.stdout.flush()
+            time.sleep(3)
