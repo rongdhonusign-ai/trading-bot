@@ -86,41 +86,46 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET PROCESSOR
+# 4. DATA PROCESSOR & SCAN LOGS
 # ==========================================
 def process_symbol_data(symbol_key, df):
     formatted_symbol = symbol_key.upper().replace('USDT', '/USDT')
-    df = calculate_indicators(df)
+    close_price = df.iloc[-1]['close']
 
-    last_row = df.iloc[-1]
-    prev_row = df.iloc[-2]
+    # যথেষ্ট ক্যান্ডেল ডাটা জমে গেলে ইন্ডিকেটর ক্যালকুলেশন করবে
+    if len(df) >= 14:
+        df = calculate_indicators(df)
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
 
-    crsi = last_row['crsi']
-    stoch_k = last_row['stoch_k']
-    close_price = last_row['close']
+        crsi = last_row.get('crsi', 0)
+        stoch_k = last_row.get('stoch_k', 0)
 
-    print(f"⚡ [WS {formatted_symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+        print(f"⚡ [WS SCAN {formatted_symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
 
-    buy_condition = (crsi < 20) and (stoch_k < 20)
-    sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
+        buy_condition = (crsi < 20) and (stoch_k < 20)
+        sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
 
-    if not positions[formatted_symbol] and buy_condition:
-        crypto_quantity = trade_amount_usdt / close_price
-        print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${close_price}", flush=True)
-        order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-        print(f"✅ EXECUTED BUY: {order}", flush=True)
-        positions[formatted_symbol] = True
-        entry_prices[formatted_symbol] = close_price
+        if not positions[formatted_symbol] and buy_condition:
+            crypto_quantity = trade_amount_usdt / close_price
+            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${close_price}", flush=True)
+            order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
+            print(f"✅ EXECUTED BUY: {order}", flush=True)
+            positions[formatted_symbol] = True
+            entry_prices[formatted_symbol] = close_price
 
-    elif positions[formatted_symbol]:
-        stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
-        if close_price <= stop_price or sell_condition:
-            crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
-            print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${close_price}", flush=True)
-            order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-            print(f"✅ EXECUTED SELL: {order}", flush=True)
-            positions[formatted_symbol] = False
-            entry_prices[formatted_symbol] = 0.0
+        elif positions[formatted_symbol]:
+            stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
+            if close_price <= stop_price or sell_condition:
+                crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
+                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${close_price}", flush=True)
+                order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
+                print(f"✅ EXECUTED SELL: {order}", flush=True)
+                positions[formatted_symbol] = False
+                entry_prices[formatted_symbol] = 0.0
+    else:
+        # ১৪টি ক্যান্ডেল না হওয়া পর্যন্ত ডাটা জমার আপডেট দেখাবে
+        print(f"⏳ [WS SCAN {formatted_symbol}] Gathering Klines... Price: {close_price} (Bars: {len(df)}/14)", flush=True)
 
 def on_message(ws, message):
     try:
@@ -141,7 +146,8 @@ def on_message(ws, message):
             if len(klines_data[symbol]) > 30:
                 klines_data[symbol].pop(0)
                 
-            if len(klines_data[symbol]) >= 15:
+            # অন্তত ২টি ক্যান্ডেল পেলেই স্ক্যানিং আউটপুট প্রিন্ট করা শুরু করবে
+            if len(klines_data[symbol]) >= 2:
                 df = pd.DataFrame(klines_data[symbol], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
                 process_symbol_data(symbol, df)
     except Exception as e:
