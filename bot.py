@@ -2,7 +2,6 @@ import time
 import os
 import json
 import pandas as pd
-import requests
 import ccxt
 import websocket
 from flask import Flask
@@ -16,21 +15,20 @@ app = Flask(__name__)
 @app.route('/')
 @app.route('/<path:path>')
 def home(path=""):
-    return "Trading Bot is Running Alive!", 200
+    return "Trading Bot is Running via WebSocket!", 200
 
 # ==========================================
 # 2. BOT CONFIGURATION & SYMBOL LIST
 # ==========================================
 symbols = [
-    'LISTA/USDT', 'FLOKI/USDT', 'BMT/USDT', 'BNB/USDT', 'THE/USDT', 
-    'BEL/USDT', 'CAKE/USDT', 'ONT/USDT', 'ZAMA/USDT', 'MEGA/USDT', 
-    'ENS/USDT', 'BICO/USDT', 'T/USDT', 'SSV/USDT', 'GLM/USDT', 
-    'ALT/USDT', 'AXL/USDT', 'IO/USDT', 'ZRO/USDT', 'HEI/USDT', 
-    'RED/USDT', 'ZK/USDT', 'QNT/USDT', 'THETA/USDT', 'TRB/USDT', 
-    'ZEN/USDT', 'IOTX/USDT', 'BERA/USDT'
+    'listaUsdt', 'flokiUsdt', 'bmtUsdt', 'bnbUsdt', 'theUsdt', 
+    'belUsdt', 'cakeUsdt', 'ontUsdt', 'zamaUsdt', 'megaUsdt', 
+    'ensUsdt', 'bicoUsdt', 'tUsdt', 'ssvUsdt', 'glmUsdt', 
+    'altUsdt', 'axlUsdt', 'ioUsdt', 'zroUsdt', 'heiUsdt', 
+    'redUsdt', 'zkUsdt', 'qntUsdt', 'thetaUsdt', 'trbUsdt', 
+    'zenUsdt', 'iotxUsdt', 'beraUsdt'
 ]
 
-timeframe = '5m'          
 trade_amount_usdt = 6.0   
 stop_loss_pct = 0.02      
 
@@ -48,22 +46,13 @@ trade_exchange = ccxt.binance({
 trade_exchange.has['fetchMarkets'] = False
 trade_exchange.has['fetchCurrencies'] = False
 
+# ডাটা স্টোরেজ
+klines_data = {sym: [] for sym in symbols}
 positions = {sym: False for sym in symbols}
 entry_prices = {sym: 0.0 for sym in symbols}
 
 # ==========================================
-# 3. PUBLIC KLINE FETCH (REST fallback)
-# ==========================================
-def fetch_binance_ohlcv(symbol, interval='5m', limit=100):
-    clean_symbol = symbol.replace('/', '').lower()
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_symbol.upper()}&interval={interval}&limit={limit}"
-    response = requests.get(url, timeout=10)
-    if response.status_code == 200:
-        return [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in response.json()]
-    return []
-
-# ==========================================
-# 4. INDICATOR CALCULATIONS
+# 3. INDICATOR CALCULATIONS
 # ==========================================
 def calculate_rsi(series, period):
     delta = series.diff()
@@ -98,77 +87,90 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 5. MAIN TRADING LOOP WITH DELAY
+# 4. WEBSOCKET HANDLERS
 # ==========================================
-def run_bot():
-    print(f"🚀 Trading Bot started for {len(symbols)} coins", flush=True)
+def process_symbol_data(symbol_key, df):
+    formatted_symbol = symbol_key.upper().replace('USDT', '/USDT')
+    df = calculate_indicators(df)
 
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
+
+    crsi = last_row['crsi']
+    stoch_k = last_row['stoch_k']
+    close_price = last_row['close']
+
+    print(f"⚡ [WS {formatted_symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+
+    buy_condition = (crsi < 20) and (stoch_k < 20)
+    sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
+
+    if not positions[formatted_symbol] and buy_condition:
+        crypto_quantity = trade_amount_usdt / close_price
+        print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${close_price}", flush=True)
+        order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
+        print(f"✅ EXECUTED BUY: {order}", flush=True)
+        positions[formatted_symbol] = True
+        entry_prices[formatted_symbol] = close_price
+
+    elif positions[formatted_symbol]:
+        stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
+        if close_price <= stop_price or sell_condition:
+            crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
+            print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${close_price}", flush=True)
+            order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
+            print(f"✅ EXECUTED SELL: {order}", flush=True)
+            positions[formatted_symbol] = False
+            entry_prices[formatted_symbol] = 0.0
+
+def on_message(ws, message):
+    data = json.loads(message)
+    if 'data' in data:
+        kline = data['data']['k']
+        symbol = kline['s'].lower()
+        
+        # ক্যান্ডেল ক্লোজ হলে বা নতুন ডাটা আসলে প্রসেস করবে
+        close_price = float(kline['c'])
+        high_price = float(kline['h'])
+        low_price = float(kline['l'])
+        open_price = float(kline['o'])
+        
+        if symbol not in klines_data:
+            klines_data[symbol] = []
+            
+        klines_data[symbol].append([0, open_price, high_price, low_price, close_price, 0])
+        if len(klines_data[symbol]) > 50:
+            klines_data[symbol].pop(0)
+            
+        if len(klines_data[symbol]) >= 20:
+            df = pd.DataFrame(klines_data[symbol], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+            process_symbol_data(symbol, df)
+
+def start_websocket():
+    streams = "/".join([f"{sym}@kline_5m" for sym in symbols])
+    ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=lambda ws, err: print(f"WS Error: {err}"),
+        on_close=lambda ws, status, msg: print("WS Closed. Reconnecting...")
+    )
+    
     while True:
-        print("\n--- Starting New Market Scan Loop ---", flush=True)
-        for symbol in symbols:
-            try:
-                # প্রতিটি কইন স্ক্যানের মাঝে ৮ সেকেন্ড ডিলে যাতে API ব্যান না হয়
-                time.sleep(8.0)
-                
-                bars = fetch_binance_ohlcv(symbol, interval=timeframe, limit=100)
-                if not bars:
-                    continue
-                    
-                df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                df = calculate_indicators(df)
-
-                last_row = df.iloc[-1]
-                prev_row = df.iloc[-2]
-
-                crsi = last_row['crsi']
-                stoch_k = last_row['stoch_k']
-                close_price = last_row['close']
-
-                print(f"🔍 [{symbol}] Price: {close_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
-
-                buy_condition = (crsi < 20) and (stoch_k < 20)
-                sell_condition = (prev_row['crsi'] <= 80 and crsi > 80) and (prev_row['stoch_k'] <= 80 and stoch_k > 80)
-
-                if not positions[symbol]:
-                    if buy_condition:
-                        crypto_quantity = trade_amount_usdt / close_price
-                        print(f"🔥 BUY SIGNAL: {symbol} at ${close_price}", flush=True)
-                        order = trade_exchange.create_market_buy_order(symbol, crypto_quantity)
-                        print(f"✅ EXECUTED BUY: {order}", flush=True)
-                        positions[symbol] = True
-                        entry_prices[symbol] = close_price
-
-                elif positions[symbol]:
-                    stop_price = entry_prices[symbol] * (1 - stop_loss_pct)
-
-                    if close_price <= stop_price:
-                        crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                        print(f"🛑 STOP LOSS: {symbol} at ${close_price}", flush=True)
-                        order = trade_exchange.create_market_sell_order(symbol, crypto_quantity)
-                        print(f"✅ EXECUTED STOP LOSS: {order}", flush=True)
-                        positions[symbol] = False
-                        entry_prices[symbol] = 0.0
-
-                    elif sell_condition:
-                        crypto_quantity = trade_amount_usdt / entry_prices[symbol]
-                        print(f"🎯 EXIT SIGNAL: {symbol} at ${close_price}", flush=True)
-                        order = trade_exchange.create_market_sell_order(symbol, crypto_quantity)
-                        print(f"✅ EXECUTED EXIT: {order}", flush=True)
-                        positions[symbol] = False
-                        entry_prices[symbol] = 0.0
-
-            except Exception as e:
-                print(f"⚠️ Error processing {symbol}: {e}", flush=True)
-
-        print("--- Scan Loop Completed. Waiting 120s ---\n", flush=True)
-        time.sleep(120)
+        try:
+            ws.run_forever()
+            time.sleep(5)
+        except Exception as e:
+            print(f"WS Exception: {e}")
+            time.sleep(5)
 
 # ==========================================
-# 6. BACKGROUND THREAD LAUNCH
+# 5. BACKGROUND THREAD LAUNCH
 # ==========================================
-bot_thread = Thread(target=run_bot)
-bot_thread.daemon = True
-bot_thread.start()
+ws_thread = Thread(target=start_websocket)
+ws_thread.daemon = True
+ws_thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
