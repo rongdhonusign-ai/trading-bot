@@ -1,7 +1,6 @@
 import time
 import os
 import json
-import sys
 import pandas as pd
 import ccxt
 import websocket
@@ -9,11 +8,10 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. FLASK APP FOR HEALTH CHECK & LIVE STATUS
+# 1. FLASK APP FOR LIVE STATUS PAGE
 # ==========================================
 app = Flask(__name__)
 
-# গ্লোবাল স্ট্যাটাস স্টোর করার জন্য
 bot_logs = []
 last_prices = {}
 
@@ -38,7 +36,7 @@ def status():
     if bot_logs:
         html += "\n".join(bot_logs[-25:])
     else:
-        html += "Waiting for data updates..."
+        html += "Waiting for WebSocket data stream..."
     html += "</pre>"
     
     return html, 200
@@ -148,7 +146,7 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
         crsi = last_row.get('crsi', 0)
         stoch_k = last_row.get('stoch_k', 0)
 
-        if current_time - last_print_time[symbol] >= 5:
+        if current_time - last_print_time[symbol] >= 10:
             add_log(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
             last_print_time[symbol] = current_time
 
@@ -158,22 +156,28 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
         if not positions[formatted_symbol] and buy_condition:
             crypto_quantity = trade_amount_usdt / current_price
             add_log(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
-            order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-            add_log(f"✅ EXECUTED BUY: {order}")
-            positions[formatted_symbol] = True
-            entry_prices[formatted_symbol] = current_price
+            try:
+                order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
+                add_log(f"✅ EXECUTED BUY: {order}")
+                positions[formatted_symbol] = True
+                entry_prices[formatted_symbol] = current_price
+            except Exception as e:
+                add_log(f"❌ BUY ERROR: {e}")
 
         elif positions[formatted_symbol]:
             stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
             if current_price <= stop_price or sell_condition:
                 crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
                 add_log(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
-                order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-                add_log(f"✅ EXECUTED SELL: {order}")
-                positions[formatted_symbol] = False
-                entry_prices[formatted_symbol] = 0.0
+                try:
+                    order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
+                    add_log(f"✅ EXECUTED SELL: {order}")
+                    positions[formatted_symbol] = False
+                    entry_prices[formatted_symbol] = 0.0
+                except Exception as e:
+                    add_log(f"❌ SELL ERROR: {e}")
     else:
-        if current_time - last_print_time[symbol] >= 5:
+        if current_time - last_print_time[symbol] >= 10:
             add_log(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)")
             last_print_time[symbol] = current_time
 
@@ -200,16 +204,8 @@ def on_close(ws, close_status_code, close_msg):
 def on_open(ws):
     add_log("✅ GLOBAL WEBSOCKET CONNECTED! REAL-TIME SCAN RUNNING...")
 
-# ==========================================
-# 5. MAIN EXECUTION
-# ==========================================
-if __name__ == '__main__':
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
+def start_websocket():
     ws_url = "wss://stream.binance.com:9443/ws/!ticker@arr"
-    
     while True:
         try:
             add_log("⏳ Connecting to Binance Stream...")
@@ -225,3 +221,16 @@ if __name__ == '__main__':
         except Exception as e:
             add_log(f"❌ Main Exception: {e}")
             time.sleep(3)
+
+# ==========================================
+# 5. MAIN EXECUTION
+# ==========================================
+if __name__ == '__main__':
+    # Background Thread for WebSocket
+    ws_thread = Thread(target=start_websocket)
+    ws_thread.daemon = True
+    ws_thread.start()
+    
+    # Run Flask in Main Thread
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
