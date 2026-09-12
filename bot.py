@@ -9,18 +9,51 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. FLASK APP FOR RENDER HEALTH CHECK
+# 1. FLASK APP FOR HEALTH CHECK & LIVE STATUS
 # ==========================================
 app = Flask(__name__)
 
+# গ্লোবাল স্ট্যাটাস স্টোর করার জন্য
+bot_logs = []
+last_prices = {}
+
 @app.route('/')
-@app.route('/<path:path>')
-def home(path=""):
+def home():
     return "Trading Bot Active!", 200
+
+@app.route('/status')
+def status():
+    html = "<h2>🚀 Binance 24/7 Bot Live Status</h2>"
+    html += "<p><b>System:</b> Active & Scanning via Global WebSocket</p><hr>"
+    
+    html += "<h3>📊 Live Coin Buffer & Prices:</h3><ul>"
+    for sym in sorted(target_symbols):
+        hist_len = len(prices_history.get(sym, []))
+        price = last_prices.get(sym, 'N/A')
+        formatted = sym.upper().replace('USDT', '/USDT')
+        html += f"<li><b>{formatted}:</b> ${price} | Buffer Data: {hist_len}/14</li>"
+    html += "</ul><hr>"
+
+    html += "<h3>📜 Recent Activity Logs:</h3><pre style='background:#f4f4f4; padding:10px; border-radius:5px;'>"
+    if bot_logs:
+        html += "\n".join(bot_logs[-25:])
+    else:
+        html += "Waiting for data updates..."
+    html += "</pre>"
+    
+    return html, 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+def add_log(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    print(log_entry, flush=True)
+    bot_logs.append(log_entry)
+    if len(bot_logs) > 100:
+        bot_logs.pop(0)
 
 # ==========================================
 # 2. CONFIGURATION & TARGET SYMBOLS
@@ -89,10 +122,11 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET CALLBACKS
+# 4. WEBSOCKET PROCESSOR
 # ==========================================
 def process_single_ticker(symbol, current_price, high_price, low_price):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
+    last_prices[symbol] = current_price
     
     prices_history[symbol].append({
         'close': current_price,
@@ -114,8 +148,8 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
         crsi = last_row.get('crsi', 0)
         stoch_k = last_row.get('stoch_k', 0)
 
-        if current_time - last_print_time[symbol] >= 3:
-            print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
+        if current_time - last_print_time[symbol] >= 5:
+            add_log(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
             last_print_time[symbol] = current_time
 
         buy_condition = (crsi < 20) and (stoch_k < 20)
@@ -123,9 +157,9 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
 
         if not positions[formatted_symbol] and buy_condition:
             crypto_quantity = trade_amount_usdt / current_price
-            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}", flush=True)
+            add_log(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
             order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-            print(f"✅ EXECUTED BUY: {order}", flush=True)
+            add_log(f"✅ EXECUTED BUY: {order}")
             positions[formatted_symbol] = True
             entry_prices[formatted_symbol] = current_price
 
@@ -133,14 +167,14 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
             stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
             if current_price <= stop_price or sell_condition:
                 crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
-                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}", flush=True)
+                add_log(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
                 order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-                print(f"✅ EXECUTED SELL: {order}", flush=True)
+                add_log(f"✅ EXECUTED SELL: {order}")
                 positions[formatted_symbol] = False
                 entry_prices[formatted_symbol] = 0.0
     else:
-        if current_time - last_print_time[symbol] >= 3:
-            print(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)", flush=True)
+        if current_time - last_print_time[symbol] >= 5:
+            add_log(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)")
             last_print_time[symbol] = current_time
 
 def on_message(ws, message):
@@ -155,16 +189,16 @@ def on_message(ws, message):
                     low_price = float(item['l'])
                     process_single_ticker(sym, close_price, high_price, low_price)
     except Exception as e:
-        print(f"Parsing error: {e}", flush=True)
+        pass
 
 def on_error(ws, error):
-    print(f"❌ WS ERROR DETECTED: {error}", flush=True)
+    add_log(f"❌ WS ERROR: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print(f"⚠️ WS CLOSED: Code={close_status_code}, Msg={close_msg}", flush=True)
+    add_log(f"⚠️ WS CLOSED: Code={close_status_code}")
 
 def on_open(ws):
-    print("✅ GLOBAL WEBSOCKET CONNECTED! STARTING SCANNER...", flush=True)
+    add_log("✅ GLOBAL WEBSOCKET CONNECTED! REAL-TIME SCAN RUNNING...")
 
 # ==========================================
 # 5. MAIN EXECUTION
@@ -178,7 +212,7 @@ if __name__ == '__main__':
     
     while True:
         try:
-            print("⏳ Connecting to Binance Global Stream...", flush=True)
+            add_log("⏳ Connecting to Binance Stream...")
             ws = websocket.WebSocketApp(
                 ws_url,
                 on_open=on_open,
@@ -186,10 +220,8 @@ if __name__ == '__main__':
                 on_error=on_error,
                 on_close=on_close
             )
-            # ping_interval দেওয়া হলো যেন কানেকশন ড্রপ না করে
             ws.run_forever(ping_interval=20, ping_timeout=10)
-            print("🔄 Loop ended, reconnecting in 3 seconds...", flush=True)
             time.sleep(3)
         except Exception as e:
-            print(f"❌ Main Loop Exception: {e}", flush=True)
+            add_log(f"❌ Main Exception: {e}")
             time.sleep(3)
