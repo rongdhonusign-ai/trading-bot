@@ -89,7 +89,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET PROCESSOR WITH FLUSH
+# 4. WEBSOCKET CALLBACKS
 # ==========================================
 def process_single_ticker(symbol, current_price, high_price, low_price):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
@@ -115,8 +115,7 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
         stoch_k = last_row.get('stoch_k', 0)
 
         if current_time - last_print_time[symbol] >= 3:
-            print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
-            sys.stdout.flush()
+            print(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}", flush=True)
             last_print_time[symbol] = current_time
 
         buy_condition = (crsi < 20) and (stoch_k < 20)
@@ -124,11 +123,9 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
 
         if not positions[formatted_symbol] and buy_condition:
             crypto_quantity = trade_amount_usdt / current_price
-            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
-            sys.stdout.flush()
+            print(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}", flush=True)
             order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-            print(f"✅ EXECUTED BUY: {order}")
-            sys.stdout.flush()
+            print(f"✅ EXECUTED BUY: {order}", flush=True)
             positions[formatted_symbol] = True
             entry_prices[formatted_symbol] = current_price
 
@@ -136,17 +133,14 @@ def process_single_ticker(symbol, current_price, high_price, low_price):
             stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
             if current_price <= stop_price or sell_condition:
                 crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
-                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
-                sys.stdout.flush()
+                print(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}", flush=True)
                 order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-                print(f"✅ EXECUTED SELL: {order}")
-                sys.stdout.flush()
+                print(f"✅ EXECUTED SELL: {order}", flush=True)
                 positions[formatted_symbol] = False
                 entry_prices[formatted_symbol] = 0.0
     else:
         if current_time - last_print_time[symbol] >= 3:
-            print(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)")
-            sys.stdout.flush()
+            print(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)", flush=True)
             last_print_time[symbol] = current_time
 
 def on_message(ws, message):
@@ -161,11 +155,16 @@ def on_message(ws, message):
                     low_price = float(item['l'])
                     process_single_ticker(sym, close_price, high_price, low_price)
     except Exception as e:
-        pass
+        print(f"Parsing error: {e}", flush=True)
+
+def on_error(ws, error):
+    print(f"❌ WS ERROR DETECTED: {error}", flush=True)
+
+def on_close(ws, close_status_code, close_msg):
+    print(f"⚠️ WS CLOSED: Code={close_status_code}, Msg={close_msg}", flush=True)
 
 def on_open(ws):
-    print("✅ GLOBAL WEBSOCKET CONNECTED! REAL-TIME SCAN ACTIVE...")
-    sys.stdout.flush()
+    print("✅ GLOBAL WEBSOCKET CONNECTED! STARTING SCANNER...", flush=True)
 
 # ==========================================
 # 5. MAIN EXECUTION
@@ -179,18 +178,18 @@ if __name__ == '__main__':
     
     while True:
         try:
-            print("⏳ Connecting to Binance Global Stream...")
-            sys.stdout.flush()
+            print("⏳ Connecting to Binance Global Stream...", flush=True)
             ws = websocket.WebSocketApp(
                 ws_url,
                 on_open=on_open,
                 on_message=on_message,
-                on_error=lambda ws, err: print(f"WS Error: {err}"),
-                on_close=lambda ws, c, m: print("WS Closed. Reconnecting...")
+                on_error=on_error,
+                on_close=on_close
             )
-            ws.run_forever()
+            # ping_interval দেওয়া হলো যেন কানেকশন ড্রপ না করে
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            print("🔄 Loop ended, reconnecting in 3 seconds...", flush=True)
             time.sleep(3)
         except Exception as e:
-            print(f"WS Exception: {e}")
-            sys.stdout.flush()
+            print(f"❌ Main Loop Exception: {e}", flush=True)
             time.sleep(3)
