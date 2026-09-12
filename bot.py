@@ -1,7 +1,9 @@
 import time
 import os
+import json
 import pandas as pd
 import ccxt
+import websocket
 from flask import Flask
 from threading import Thread
 
@@ -20,7 +22,7 @@ def home():
 @app.route('/status')
 def status():
     html = "<h2>🚀 Binance 24/7 Bot Live Status</h2>"
-    html += "<p><b>System:</b> Active & Scanning via Direct REST API</p><hr>"
+    html += "<p><b>System:</b> Active & Scanning via Global MiniTicker Stream</p><hr>"
     
     html += "<h3>📊 Live Coin Buffer & Prices:</h3><ul>"
     for sym in sorted(target_symbols):
@@ -34,7 +36,7 @@ def status():
     if bot_logs:
         html += "\n".join(bot_logs[-25:])
     else:
-        html += "Initializing scanner engine..."
+        html += "Waiting for data stream..."
     html += "</pre>"
     
     return html, 200
@@ -114,90 +116,116 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. REST API SCANNER ENGINE
+# 4. WEBSOCKET PROCESSOR
 # ==========================================
-def run_scanner():
-    add_log("✅ DIRECT SCANNER ENGINE STARTED!")
+def process_single_ticker(symbol, current_price, high_price, low_price):
+    formatted_symbol = symbol.upper().replace('USDT', '/USDT')
+    last_prices[symbol] = current_price
+    
+    prices_history[symbol].append({
+        'close': current_price,
+        'high': high_price,
+        'low': low_price
+    })
+    
+    if len(prices_history[symbol]) > 30:
+        prices_history[symbol].pop(0)
+
+    df = pd.DataFrame(prices_history[symbol])
+    current_time = time.time()
+
+    if len(df) >= 14:
+        df = calculate_indicators(df)
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
+
+        crsi = last_row.get('crsi', 0)
+        stoch_k = last_row.get('stoch_k', 0)
+
+        if current_time - last_print_time[symbol] >= 15:
+            add_log(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
+            last_print_time[symbol] = current_time
+
+        buy_condition = (crsi < 20) and (stoch_k < 20)
+        sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
+
+        if not positions[formatted_symbol] and buy_condition:
+            crypto_quantity = trade_amount_usdt / current_price
+            add_log(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
+            try:
+                order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
+                add_log(f"✅ EXECUTED BUY: {order}")
+                positions[formatted_symbol] = True
+                entry_prices[formatted_symbol] = current_price
+            except Exception as e:
+                add_log(f"❌ BUY ERROR: {e}")
+
+        elif positions[formatted_symbol]:
+            stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
+            if current_price <= stop_price or sell_condition:
+                crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
+                add_log(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
+                try:
+                    order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
+                    add_log(f"✅ EXECUTED SELL: {order}")
+                    positions[formatted_symbol] = False
+                    entry_prices[formatted_symbol] = 0.0
+                except Exception as e:
+                    add_log(f"❌ SELL ERROR: {e}")
+    else:
+        if current_time - last_print_time[symbol] >= 15:
+            add_log(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)")
+            last_print_time[symbol] = current_time
+
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if isinstance(data, list):
+            for item in data:
+                sym = item.get('s', '').lower()
+                if sym in target_symbols:
+                    close_price = float(item['c'])
+                    high_price = float(item['h'])
+                    low_price = float(item['l'])
+                    process_single_ticker(sym, close_price, high_price, low_price)
+    except Exception:
+        pass
+
+def on_error(ws, error):
+    add_log(f"❌ WS ERROR: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    add_log(f"⚠️ WS CLOSED. Reconnecting in 5 seconds...")
+
+def on_open(ws):
+    add_log("✅ CONNECTED TO BINANCE MINITICKER STREAM!")
+
+def start_websocket():
+    # MiniTicker stream uses significantly less bandwidth and handles all tickers cleanly
+    ws_url = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
     while True:
         try:
-            tickers = trade_exchange.fetch_tickers()
-            for sym in target_symbols:
-                formatted_symbol = sym.upper().replace('USDT', '/USDT')
-                if formatted_symbol in tickers:
-                    ticker = tickers[formatted_symbol]
-                    current_price = float(ticker['last'])
-                    high_price = float(ticker['high']) if ticker['high'] else current_price
-                    low_price = float(ticker['low']) if ticker['low'] else current_price
-
-                    last_prices[sym] = current_price
-
-                    prices_history[sym].append({
-                        'close': current_price,
-                        'high': high_price,
-                        'low': low_price
-                    })
-
-                    if len(prices_history[sym]) > 30:
-                        prices_history[sym].pop(0)
-
-                    df = pd.DataFrame(prices_history[sym])
-                    current_time = time.time()
-
-                    if len(df) >= 14:
-                        df = calculate_indicators(df)
-                        last_row = df.iloc[-1]
-                        prev_row = df.iloc[-2]
-
-                        crsi = last_row.get('crsi', 0)
-                        stoch_k = last_row.get('stoch_k', 0)
-
-                        if current_time - last_print_time[sym] >= 15:
-                            add_log(f"⚡ [SCAN {formatted_symbol}] Price: {current_price} | CRSI: {crsi:.1f} | Stoch: {stoch_k:.1f}")
-                            last_print_time[sym] = current_time
-
-                        buy_condition = (crsi < 20) and (stoch_k < 20)
-                        sell_condition = (prev_row.get('crsi', 0) <= 80 and crsi > 80) and (prev_row.get('stoch_k', 0) <= 80 and stoch_k > 80)
-
-                        if not positions[formatted_symbol] and buy_condition:
-                            crypto_quantity = trade_amount_usdt / current_price
-                            add_log(f"🔥 BUY SIGNAL: {formatted_symbol} at ${current_price}")
-                            try:
-                                order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-                                add_log(f"✅ EXECUTED BUY: {order}")
-                                positions[formatted_symbol] = True
-                                entry_prices[formatted_symbol] = current_price
-                            except Exception as e:
-                                add_log(f"❌ BUY ERROR: {e}")
-
-                        elif positions[formatted_symbol]:
-                            stop_price = entry_prices[formatted_symbol] * (1 - stop_loss_pct)
-                            if current_price <= stop_price or sell_condition:
-                                crypto_quantity = trade_amount_usdt / entry_prices[formatted_symbol]
-                                add_log(f"🛑 EXIT/STOP LOSS: {formatted_symbol} at ${current_price}")
-                                try:
-                                    order = trade_exchange.create_market_sell_order(formatted_symbol, crypto_quantity)
-                                    add_log(f"✅ EXECUTED SELL: {order}")
-                                    positions[formatted_symbol] = False
-                                    entry_prices[formatted_symbol] = 0.0
-                                except Exception as e:
-                                    add_log(f"❌ SELL ERROR: {e}")
-                    else:
-                        if current_time - last_print_time[sym] >= 15:
-                            add_log(f"⏳ [SCAN {formatted_symbol}] Data Gathering: Price {current_price} ({len(df)}/14)")
-                            last_print_time[sym] = current_time
-
-            time.sleep(3)
+            add_log("⏳ Connecting to Binance WebSocket Stream...")
+            ws = websocket.WebSocketApp(
+                ws_url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+            time.sleep(5)
         except Exception as e:
-            add_log(f"❌ Scanner Error: {e}")
+            add_log(f"❌ Connection Exception: {e}")
             time.sleep(5)
 
 # ==========================================
 # 5. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
-    scanner_thread = Thread(target=run_scanner)
-    scanner_thread.daemon = True
-    scanner_thread.start()
+    ws_thread = Thread(target=start_websocket)
+    ws_thread.daemon = True
+    ws_thread.start()
     
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
