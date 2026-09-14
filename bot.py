@@ -56,12 +56,11 @@ trade_exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {
         'defaultType': 'spot',
-        'adjustForTimeDifference': False,
+        'adjustForTimeDifference': True,
         'recvWindow': 10000
     }
 })
 
-# Dynamically exclude stables and BTC/BTTC to scan high quality Binance Altcoins
 excluded_coins = {'USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'USDE', 'BTC', 'BTTC', 'WBTC'}
 
 def get_target_altcoins():
@@ -72,17 +71,17 @@ def get_target_altcoins():
         for symbol, market in markets.items():
             if market['spot'] and market['active'] and market['quote'] == 'USDT':
                 base = market['base'].upper()
-                if base not in excluded_coins and not base.startswith('LD'): # Exclude earn leverage tokens
+                if base not in excluded_coins and not base.startswith('LD'):
                     ws_sym = symbol.replace('/', '').lower()
                     usdt_pairs.append(ws_sym)
         add_log(f"✅ Found {len(usdt_pairs)} valid Altcoins. Selecting top active pairs...")
-        return usdt_pairs[:60] # Top 60 pairs for smooth execution & IP safety
+        return usdt_pairs[:60]
     except Exception as e:
         add_log(f"⚠️ Error loading markets dynamically: {e}. Falling back to default list.")
         return [
             'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt', 'adausdt', 'dogeusdt', 'avaxusdt', 
             'shibusdt', 'dotusdt', 'linkusdt', 'nearusdt', 'suiusdt', 'fetusdt', 'icpusdt',
-            'aptusdt', 'ltcusdt', 'unicusdt', 'nearusdt', 'rndrusdt', 'pepeusdt', 'injusdt',
+            'aptusdt', 'ltcusdt', 'unicusdt', 'rndrusdt', 'pepeusdt', 'injusdt',
             'renderusdt', 'tiausdt', 'seiusdt', 'arbusdt', 'opusdt', 'wifusdt', 'flokiusdt'
         ]
 
@@ -94,13 +93,17 @@ entry_prices = {sym: 0.0 for sym in target_symbols}
 position_amounts = {sym: 0.0 for sym in target_symbols}
 
 # ==========================================
-# 3. INDICATOR CALCULATIONS (RSI 50 & RSI 2)
+# 3. INDICATOR CALCULATIONS (WILDER'S RSI - TRADINGVIEW MATCHED)
 # ==========================================
 def calculate_rsi(series, period):
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(window=period).mean().fillna(0.0)
-    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean().fillna(0.0)
-    rs = gain / loss.replace(0, 1e-9)
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, 1e-9)
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return rsi.fillna(50.0)
 
@@ -116,7 +119,6 @@ def process_kline_data(symbol, close_price, high_price, low_price, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
     last_prices[symbol] = close_price
     
-    # Process when 5m candle closes
     if is_closed:
         prices_history[symbol].append({
             'close': close_price,
@@ -124,7 +126,7 @@ def process_kline_data(symbol, close_price, high_price, low_price, is_closed):
             'low': low_price
         })
         
-        if len(prices_history[symbol]) > 60: # Maintain buffer of 60 for RSI 50 calculation
+        if len(prices_history[symbol]) > 60:
             prices_history[symbol].pop(0)
 
         df = pd.DataFrame(prices_history[symbol])
@@ -141,40 +143,42 @@ def process_kline_data(symbol, close_price, high_price, low_price, is_closed):
 
             add_log(f"📊 [5M CLOSED {formatted_symbol}] Price: ${close_price} | RSI(50): {rsi_50:.1f} | RSI(2): {rsi_2:.1f}")
 
-            # STRATEGY CONDITIONS:
-            # BUY: RSI(50) > 50 and RSI(2) < 5
+            # STRATEGY CONDITIONS
             buy_condition = (rsi_50 > 50.0) and (rsi_2 < 5.0)
             
-            # SELL: RSI(2) crossing above 85 OR RSI(50) crossing below 48
             sell_rsi_2_cross = (prev_rsi_2 <= 85.0 and rsi_2 > 85.0)
             sell_rsi_50_cross = (prev_rsi_50 >= 48.0 and rsi_50 < 48.0)
             sell_condition = sell_rsi_2_cross or sell_rsi_50_cross
 
-            # ENTRY EXECUTION
+            # ENTRY EXECUTION WITH PRECISION HANDLING
             if not positions[formatted_symbol] and buy_condition:
-                crypto_quantity = trade_amount_usdt / close_price
-                add_log(f"🔥 BUY SIGNAL (5m): {formatted_symbol} at ${close_price} (RSI50: {rsi_50:.1f}, RSI2: {rsi_2:.1f})")
+                add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${close_price} (RSI50: {rsi_50:.1f}, RSI2: {rsi_2:.1f})")
                 try:
-                    order = trade_exchange.create_market_buy_order(formatted_symbol, crypto_quantity)
-                    add_log(f"✅ EXECUTED MARKET BUY: {formatted_symbol} | Order: {order['id']}")
+                    raw_qty = trade_amount_usdt / close_price
+                    formatted_qty = float(trade_exchange.amount_to_precision(formatted_symbol, raw_qty))
+                    
+                    order = trade_exchange.create_market_buy_order(formatted_symbol, formatted_qty)
+                    add_log(f"✅ EXECUTED MARKET BUY: {formatted_symbol} | Qty: {formatted_qty} | Order ID: {order['id']}")
                     positions[formatted_symbol] = True
                     entry_prices[formatted_symbol] = close_price
-                    position_amounts[formatted_symbol] = crypto_quantity
+                    position_amounts[formatted_symbol] = formatted_qty
                 except Exception as e:
                     add_log(f"❌ BUY ERROR for {formatted_symbol}: {e}")
 
-            # EXIT EXECUTION (MARKET ORDER & STOP LOSS)
+            # EXIT EXECUTION
             elif positions[formatted_symbol]:
                 stop_price = entry_prices[formatted_symbol] * (1.0 - stop_loss_pct)
                 is_stop_loss = close_price <= stop_price
 
                 if is_stop_loss or sell_condition:
                     reason = "STOP LOSS 2%" if is_stop_loss else ("RSI(2) > 85 CROSS" if sell_rsi_2_cross else "RSI(50) < 48 CROSS")
-                    qty = position_amounts[formatted_symbol] if position_amounts[formatted_symbol] > 0 else (trade_amount_usdt / entry_prices[formatted_symbol])
                     add_log(f"🛑 EXIT SIGNAL [{reason}]: {formatted_symbol} at ${close_price}")
                     try:
-                        order = trade_exchange.create_market_sell_order(formatted_symbol, qty)
-                        add_log(f"✅ EXECUTED MARKET SELL: {formatted_symbol} | Order: {order['id']}")
+                        qty = position_amounts[formatted_symbol]
+                        formatted_qty = float(trade_exchange.amount_to_precision(formatted_symbol, qty))
+                        
+                        order = trade_exchange.create_market_sell_order(formatted_symbol, formatted_qty)
+                        add_log(f"✅ EXECUTED MARKET SELL: {formatted_symbol} | Order ID: {order['id']}")
                         positions[formatted_symbol] = False
                         entry_prices[formatted_symbol] = 0.0
                         position_amounts[formatted_symbol] = 0.0
@@ -193,7 +197,7 @@ def on_message(ws, message):
                 close_price = float(kline['c'])
                 high_price = float(kline['h'])
                 low_price = float(kline['l'])
-                is_closed = kline['x']  # True when 5m candle finishes
+                is_closed = kline['x']
                 process_kline_data(sym, close_price, high_price, low_price, is_closed)
     except Exception:
         pass
