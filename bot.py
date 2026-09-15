@@ -22,7 +22,7 @@ def home():
 @app.route('/status')
 def status():
     html = "<h2>🚀 Binance Custom Strategy Bot Status</h2>"
-    html += "<p><b>Strategy:</b> BUY when Green Candle Closes < EMA(5) & RSI(14) < 30 | SELL when Candle Closes > Upper BB(20,2) OR Stop Loss 2%</p><hr>"
+    html += "<p><b>Strategy:</b> BUY when Green Candle Closes < EMA(5) & RSI(14) was < 30 in last 3 candles | SELL when Candle Closes > Upper BB(20,2) OR Stop Loss 2%</p><hr>"
     html += "<h3>📜 Recent Activity Logs:</h3><pre style='background:#f4f4f4; padding:10px; border-radius:5px; max-height:400px; overflow-y:auto;'>"
     if bot_logs:
         html += "\n".join(bot_logs[-30:])
@@ -65,7 +65,7 @@ def get_target_altcoins():
         'opusdt', 'wifusdt', 'flokiusdt', 'atomusdt', 'trxusdt', 'xlmusdt', 'ftmusdt', 
         'sandusdt', 'manausdt', 'galausdt', 'algousdt', 'ldousdt', 'qntusdt', 'aaveusdt', 
         'egldusdt', 'flowusdt', 'chzusdt', 'axsusdt', 'crvusdt', 'grtusdt', 'snxusdt', 
-        'stxusdt', 'mknusdt', 'kavausdt', 'compusdt', 'imxusdt'
+        'stxusdt', 'mkrusdt', 'kavausdt', 'compusdt', 'imxusdt'
     ]
 
 target_symbols = get_target_altcoins()
@@ -76,7 +76,32 @@ entry_prices = {sym: 0.0 for sym in target_symbols}
 position_amounts = {sym: 0.0 for sym in target_symbols}
 
 # ==========================================
-# 3. TECHNICAL INDICATORS (EMA, RSI, BB)
+# 3. PRE-LOAD HISTORICAL CANDLES (INSTANT SCAN ENABLE)
+# ==========================================
+def preload_past_candles():
+    add_log("⏳ Pre-loading last 25 candles via CCXT (Safe Mode)...")
+    for sym in target_symbols:
+        formatted_symbol = sym.upper().replace('USDT', '/USDT')
+        try:
+            # বিগত ২৫টি 5M ক্যান্ডেল লোড
+            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=25)
+            
+            prices_history[sym] = []
+            for candle in ohlcv:
+                prices_history[sym].append({
+                    'open': float(candle[1]),
+                    'high': float(candle[2]),
+                    'low': float(candle[3]),
+                    'close': float(candle[4])
+                })
+            time.sleep(0.05)  # Rate limit safe-এর জন্য ছোট ব্রেক
+        except Exception as e:
+            add_log(f"⚠️ Preload warning for {formatted_symbol}: {e}")
+            
+    add_log("✅ Pre-loading complete! Bot is ready to scan immediately on first candle close.")
+
+# ==========================================
+# 4. TECHNICAL INDICATORS (EMA, RSI, BB)
 # ==========================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -103,7 +128,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET DATA PROCESSOR (WITH SCANNING LOGS)
+# 5. WEBSOCKET DATA PROCESSOR
 # ==========================================
 def process_kline_data(symbol, open_price, close_price, high_price, low_price, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
@@ -122,7 +147,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
-        # ২৫টি ক্যান্ডেল জমলে ইন্ডিকেটর হিসেব ও স্ক্যান রিপোর্ট দেখাবে
+        # ২৫টি বা তার বেশি ক্যান্ডেল থাকলে স্ক্যানিং শুরু হবে
         if len(df) >= 25:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
@@ -133,19 +158,22 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
             rsi_14 = float(last_row['rsi_14'])
             bb_upper = float(last_row['bb_upper'])
 
+            # 🟢 RSI লজিক: গত ৩টি ক্যান্ডেলের মধ্যে অন্তত ১টিতে RSI < 30 ছিল কিনা
+            recent_rsi = df['rsi_14'].tail(3)
+            was_rsi_oversold = (recent_rsi < 30.0).any()
+
             is_green_candle = c_close > c_open
             is_below_ema5 = c_close < ema_5
-            is_rsi_low = rsi_14 < 30.0
 
-            buy_condition = is_green_candle and is_below_ema5 and is_rsi_low
+            buy_condition = is_green_candle and is_below_ema5 and was_rsi_oversold
             sell_condition = c_close > bb_upper
 
-            # 🔍 লাইভ স্ক্যানিং লগ (কনসোল ও Status পেজে দেখার জন্য)
-            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Upper BB: {bb_upper:.4f}")
+            # 🔍 লাইভ স্ক্যানিং লগ
+            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Oversold(3 Candles): {was_rsi_oversold} | Upper BB: {bb_upper:.4f}")
 
             # 🛒 BUY EXECUTION
             if not positions[formatted_symbol] and buy_condition:
-                add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${c_close}")
+                add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${c_close} (RSI was < 30 in last 3 candles)")
                 try:
                     raw_qty = trade_amount_usdt / c_close
                     formatted_qty = float(trade_exchange.amount_to_precision(formatted_symbol, raw_qty))
@@ -180,7 +208,6 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                     except Exception as e:
                         add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
         else:
-            # ⏳ ডেটা জমাকালীন স্ট্যাটাস
             add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(df)}/25)")
 
 def on_message(ws, message):
@@ -209,6 +236,9 @@ def on_open(ws):
     add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM (Safe from IP Ban)")
 
 def start_websocket():
+    # ওয়েব সকেটের আগে হিস্টোরিক্যাল ক্যান্ডেল প্রিলোড হবে
+    preload_past_candles()
+    
     streams = "/".join([f"{sym}@kline_5m" for sym in target_symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     while True:
@@ -227,7 +257,7 @@ def start_websocket():
             time.sleep(5)
 
 # ==========================================
-# 5. MAIN EXECUTION
+# 6. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
     ws_thread = Thread(target=start_websocket)
