@@ -23,7 +23,7 @@ def home():
 def status():
     html = "<h2>🚀 Binance Custom Strategy Bot Status</h2>"
     html += "<p><b>Strategy:</b> BUY when Green Candle Closes < EMA(5) & RSI(14) < 30 | SELL when Candle Closes > Upper BB(20,2) OR Stop Loss 2%</p><hr>"
-    html += "<h3>📜 Recent Logs:</h3><pre style='background:#f4f4f4; padding:10px; border-radius:5px; max-height:400px; overflow-y:auto;'>"
+    html += "<h3>📜 Recent Activity Logs:</h3><pre style='background:#f4f4f4; padding:10px; border-radius:5px; max-height:400px; overflow-y:auto;'>"
     if bot_logs:
         html += "\n".join(bot_logs[-30:])
     else:
@@ -56,7 +56,6 @@ trade_exchange = ccxt.binance({
     }
 })
 
-# static list দিয়ে রিকোয়েস্ট পাঠানো বাদ দেওয়া হলো যাতে IP Ban না হয়
 def get_target_altcoins():
     add_log("✅ Loading static top Altcoins list (Safe from IP Ban)...")
     return [
@@ -104,7 +103,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET DATA PROCESSOR
+# 4. WEBSOCKET DATA PROCESSOR (WITH SCANNING LOGS)
 # ==========================================
 def process_kline_data(symbol, open_price, close_price, high_price, low_price, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
@@ -123,6 +122,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
+        # ২৫টি ক্যান্ডেল জমলে ইন্ডিকেটর হিসেব ও স্ক্যান রিপোর্ট দেখাবে
         if len(df) >= 25:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
@@ -140,7 +140,8 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
             buy_condition = is_green_candle and is_below_ema5 and is_rsi_low
             sell_condition = c_close > bb_upper
 
-            add_log(f"📊 [{formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | BB Upper: {bb_upper:.4f}")
+            # 🔍 লাইভ স্ক্যানিং লগ (কনসোল ও Status পেজে দেখার জন্য)
+            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Upper BB: {bb_upper:.4f}")
 
             # 🛒 BUY EXECUTION
             if not positions[formatted_symbol] and buy_condition:
@@ -178,6 +179,9 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                         position_amounts[formatted_symbol] = 0.0
                     except Exception as e:
                         add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
+        else:
+            # ⏳ ডেটা জমাকালীন স্ট্যাটাস
+            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(df)}/25)")
 
 def on_message(ws, message):
     try:
