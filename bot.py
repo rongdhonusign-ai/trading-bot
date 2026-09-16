@@ -57,7 +57,7 @@ trade_exchange = ccxt.binance({
 })
 
 def get_target_altcoins():
-    add_log("✅ Loading static top Altcoins list (WebSocket Only - Safe from IP Ban)...")
+    add_log("✅ Loading static top Altcoins list (WebSocket Only - Safe Mode)...")
     return [
         'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt', 'adausdt', 'dogeusdt', 'avaxusdt', 
         'dotusdt', 'linkusdt', 'nearusdt', 'suiusdt', 'fetusdt', 'aptusdt', 'ltcusdt',
@@ -91,6 +91,7 @@ def calculate_rsi(series, period=14):
 def calculate_indicators(df):
     df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
     df['rsi_14'] = calculate_rsi(df['close'], period=14)
+    # Bollinger Bands (20, std=2) - ২০টি ক্যান্ডেল দরকার
     df['sma_20'] = df['close'].rolling(window=20).mean()
     df['std_20'] = df['close'].rolling(window=20).std()
     df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2)
@@ -116,8 +117,8 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
-        # ১৫টি ক্যান্ডেল জমলেই স্ক্যানিং শুরু করবে (অপেক্ষা কমাতে ২৫ এর জায়গায় ১৫ দেওয়া হয়েছে)
-        if len(df) >= 15:
+        # ⚡ ২৫টি ক্যান্ডেল জমলেই কেবল ইন্ডিকেটর হিসাব হবে (Upper BB 'nan' আসবে না)
+        if len(df) >= 25:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
 
@@ -134,9 +135,10 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
             buy_condition = is_green_candle and is_below_ema5 and is_rsi_low
             sell_condition = c_close > bb_upper
 
+            # 🔍 লাইভ স্ক্যানিং লগ
             add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Upper BB: {bb_upper:.4f}")
 
-            # BUY EXECUTION
+            # 🛒 BUY EXECUTION
             if not positions[formatted_symbol] and buy_condition:
                 add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${c_close}")
                 try:
@@ -152,7 +154,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                 except Exception as e:
                     add_log(f"❌ BUY ERROR for {formatted_symbol}: {e}")
 
-            # SELL EXECUTION
+            # 💰 SELL EXECUTION
             elif positions[formatted_symbol]:
                 stop_price = entry_prices[formatted_symbol] * (1.0 - stop_loss_pct)
                 is_stop_loss = c_close <= stop_price
@@ -173,7 +175,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                     except Exception as e:
                         add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
         else:
-            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(df)}/15)")
+            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(df)}/25)")
 
 def on_message(ws, message):
     try:
