@@ -40,7 +40,7 @@ def add_log(message):
         bot_logs.pop(0)
 
 # ==========================================
-# 2. CONFIGURATION & STATIC TOP ALTCOINS (SAFE FROM IP BAN)
+# 2. CONFIGURATION & STATIC TOP ALTCOINS
 # ==========================================
 trade_amount_usdt = 6.0   
 stop_loss_pct = 0.02  # ২% ইমার্জেন্সি স্টপ লস
@@ -65,7 +65,7 @@ def get_target_altcoins():
         'opusdt', 'wifusdt', 'flokiusdt', 'atomusdt', 'trxusdt', 'xlmusdt', 'ftmusdt', 
         'sandusdt', 'manausdt', 'galausdt', 'algousdt', 'ldousdt', 'qntusdt', 'aaveusdt', 
         'egldusdt', 'flowusdt', 'chzusdt', 'axsusdt', 'crvusdt', 'grtusdt', 'snxusdt', 
-        'stxusdt', 'mknusdt', 'kavausdt', 'compusdt', 'imxusdt'
+        'stxusdt', 'mkrusdt', 'kavausdt', 'compusdt', 'imxusdt' # MKN এর পরিবর্তে MKR
     ]
 
 target_symbols = get_target_altcoins()
@@ -76,17 +76,16 @@ entry_prices = {sym: 0.0 for sym in target_symbols}
 position_amounts = {sym: 0.0 for sym in target_symbols}
 
 # ==========================================
-# 3. HISTORICAL DATA PRELOADER (২ ঘণ্টা অপেক্ষা দূর করার জন্য)
+# 3. HISTORICAL DATA PRELOADER (SAFE RATE LIMITING)
 # ==========================================
 def preload_historical_candles():
-    add_log("⏳ Preloading initial 30 candles for all pairs from Binance REST API...")
+    add_log("⏳ Safe Preloading initial 30 candles for pairs...")
     for sym in target_symbols:
         formatted_symbol = sym.upper().replace('USDT', '/USDT')
         try:
-            # গত ৩০টি ৫-মিনিটের ক্যান্ডেল সরাসরি বাইন্যান্স থেকে ইনস্ট্যান্ট নিয়ে আসবে
+            # ৩০টি ক্যান্ডেল ইনস্ট্যান্ট ফেচ
             ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=30)
             
-            # রানিং অনগোয়িং ক্যান্ডেল বাদ দিয়ে শুধু ক্লোজ হওয়া ক্যান্ডেলগুলো সংরক্ষণ
             prices_history[sym] = [
                 {
                     'open': float(candle[1]),
@@ -96,14 +95,15 @@ def preload_historical_candles():
                 }
                 for candle in ohlcv[:-1]
             ]
-            time.sleep(0.05) # API Rate limit safe রাখার জন্য ছোট ডিলে
+            # IP Ban এড়ানোর জন্য ০.৪ সেকেন্ড সেফ পজ
+            time.sleep(0.4) 
         except Exception as e:
-            add_log(f"⚠️ History fetch failed for {formatted_symbol}: {e}")
+            add_log(f"⚠️ Fetch skipped for {formatted_symbol}: {e}")
             
-    add_log("🚀 Initial candles preloaded! Bot is now READY for instant scanning.")
+    add_log("🚀 Initial setup complete! Bot listening to WebSocket stream.")
 
 # ==========================================
-# 4. TECHNICAL INDICATORS (EMA, RSI, BB)
+# 4. TECHNICAL INDICATORS
 # ==========================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -116,17 +116,11 @@ def calculate_rsi(series, period=14):
     return rsi.fillna(50.0)
 
 def calculate_indicators(df):
-    # EMA 5
     df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
-    
-    # RSI 14
     df['rsi_14'] = calculate_rsi(df['close'], period=14)
-    
-    # Bollinger Bands (20, std=2)
     df['sma_20'] = df['close'].rolling(window=20).mean()
     df['std_20'] = df['close'].rolling(window=20).std()
     df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2)
-    
     return df
 
 # ==========================================
@@ -149,7 +143,6 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
-        # ২৫টি ক্যান্ডেল থাকলে ইন্ডিকেটর হিসেব ও স্ক্যান রিপোর্ট দেখাবে
         if len(df) >= 25:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
@@ -167,10 +160,9 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
             buy_condition = is_green_candle and is_below_ema5 and is_rsi_low
             sell_condition = c_close > bb_upper
 
-            # 🔍 লাইভ স্ক্যানিং লগ
             add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Upper BB: {bb_upper:.4f}")
 
-            # 🛒 BUY EXECUTION
+            # BUY EXECUTION
             if not positions[formatted_symbol] and buy_condition:
                 add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${c_close}")
                 try:
@@ -186,7 +178,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                 except Exception as e:
                     add_log(f"❌ BUY ERROR for {formatted_symbol}: {e}")
 
-            # 💰 SELL EXECUTION
+            # SELL EXECUTION
             elif positions[formatted_symbol]:
                 stop_price = entry_prices[formatted_symbol] * (1.0 - stop_loss_pct)
                 is_stop_loss = c_close <= stop_price
@@ -235,7 +227,6 @@ def on_open(ws):
     add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM")
 
 def start_websocket():
-    # ⚡ ওয়েবসকেট কানেক্ট করার আগে হিস্টোরিক্যাল ক্যান্ডেলগুলো টেনে আনবে
     preload_historical_candles()
 
     streams = "/".join([f"{sym}@kline_5m" for sym in target_symbols])
