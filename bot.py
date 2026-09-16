@@ -22,7 +22,7 @@ def home():
 @app.route('/status')
 def status():
     html = "<h2>🚀 Binance Custom Strategy Bot Status</h2>"
-    html += "<p><b>Strategy:</b> BUY when Green Candle Closes < EMA(5) & RSI(14) was < 30 in last 3 candles | SELL when Candle Closes > Upper BB(20,2) OR Stop Loss 2%</p><hr>"
+    html += "<p><b>Strategy:</b> BUY when Green Candle Closes < EMA(5) & RSI(14) < 30 | SELL when Candle Closes > Upper BB(20,2) OR Stop Loss 2%</p><hr>"
     html += "<h3>📜 Recent Activity Logs:</h3><pre style='background:#f4f4f4; padding:10px; border-radius:5px; max-height:400px; overflow-y:auto;'>"
     if bot_logs:
         html += "\n".join(bot_logs[-30:])
@@ -57,7 +57,7 @@ trade_exchange = ccxt.binance({
 })
 
 def get_target_altcoins():
-    add_log("✅ Loading static top Altcoins list (Safe from IP Ban)...")
+    add_log("✅ Loading static top Altcoins list...")
     return [
         'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt', 'adausdt', 'dogeusdt', 'avaxusdt', 
         'dotusdt', 'linkusdt', 'nearusdt', 'suiusdt', 'fetusdt', 'aptusdt', 'ltcusdt',
@@ -65,7 +65,7 @@ def get_target_altcoins():
         'opusdt', 'wifusdt', 'flokiusdt', 'atomusdt', 'trxusdt', 'xlmusdt', 'ftmusdt', 
         'sandusdt', 'manausdt', 'galausdt', 'algousdt', 'ldousdt', 'qntusdt', 'aaveusdt', 
         'egldusdt', 'flowusdt', 'chzusdt', 'axsusdt', 'crvusdt', 'grtusdt', 'snxusdt', 
-        'stxusdt', 'mkrusdt', 'kavausdt', 'compusdt', 'imxusdt'
+        'stxusdt', 'mknusdt', 'kavausdt', 'compusdt', 'imxusdt'
     ]
 
 target_symbols = get_target_altcoins()
@@ -76,29 +76,31 @@ entry_prices = {sym: 0.0 for sym in target_symbols}
 position_amounts = {sym: 0.0 for sym in target_symbols}
 
 # ==========================================
-# 3. PRE-LOAD HISTORICAL CANDLES (INSTANT SCAN ENABLE)
+# 3. HISTORICAL DATA PRELOADER (২ ঘণ্টা অপেক্ষা দূর করার জন্য)
 # ==========================================
-def preload_past_candles():
-    add_log("⏳ Pre-loading last 25 candles via CCXT (Safe Mode)...")
+def preload_historical_candles():
+    add_log("⏳ Preloading initial 30 candles for all pairs from Binance REST API...")
     for sym in target_symbols:
         formatted_symbol = sym.upper().replace('USDT', '/USDT')
         try:
-            # বিগত ২৫টি 5M ক্যান্ডেল লোড
-            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=25)
+            # গত ৩০টি ৫-মিনিটের ক্যান্ডেল সরাসরি বাইন্যান্স থেকে ইনস্ট্যান্ট নিয়ে আসবে
+            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=30)
             
-            prices_history[sym] = []
-            for candle in ohlcv:
-                prices_history[sym].append({
+            # রানিং অনগোয়িং ক্যান্ডেল বাদ দিয়ে শুধু ক্লোজ হওয়া ক্যান্ডেলগুলো সংরক্ষণ
+            prices_history[sym] = [
+                {
                     'open': float(candle[1]),
                     'high': float(candle[2]),
                     'low': float(candle[3]),
                     'close': float(candle[4])
-                })
-            time.sleep(0.05)  # Rate limit safe-এর জন্য ছোট ব্রেক
+                }
+                for candle in ohlcv[:-1]
+            ]
+            time.sleep(0.05) # API Rate limit safe রাখার জন্য ছোট ডিলে
         except Exception as e:
-            add_log(f"⚠️ Preload warning for {formatted_symbol}: {e}")
+            add_log(f"⚠️ History fetch failed for {formatted_symbol}: {e}")
             
-    add_log("✅ Pre-loading complete! Bot is ready to scan immediately on first candle close.")
+    add_log("🚀 Initial candles preloaded! Bot is now READY for instant scanning.")
 
 # ==========================================
 # 4. TECHNICAL INDICATORS (EMA, RSI, BB)
@@ -147,7 +149,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
-        # ২৫টি বা তার বেশি ক্যান্ডেল থাকলে স্ক্যানিং শুরু হবে
+        # ২৫টি ক্যান্ডেল থাকলে ইন্ডিকেটর হিসেব ও স্ক্যান রিপোর্ট দেখাবে
         if len(df) >= 25:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
@@ -158,22 +160,19 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
             rsi_14 = float(last_row['rsi_14'])
             bb_upper = float(last_row['bb_upper'])
 
-            # 🟢 RSI লজিক: গত ৩টি ক্যান্ডেলের মধ্যে অন্তত ১টিতে RSI < 30 ছিল কিনা
-            recent_rsi = df['rsi_14'].tail(3)
-            was_rsi_oversold = (recent_rsi < 30.0).any()
-
             is_green_candle = c_close > c_open
             is_below_ema5 = c_close < ema_5
+            is_rsi_low = rsi_14 < 30.0
 
-            buy_condition = is_green_candle and is_below_ema5 and was_rsi_oversold
+            buy_condition = is_green_candle and is_below_ema5 and is_rsi_low
             sell_condition = c_close > bb_upper
 
             # 🔍 লাইভ স্ক্যানিং লগ
-            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Oversold(3 Candles): {was_rsi_oversold} | Upper BB: {bb_upper:.4f}")
+            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Green: {is_green_candle} | EMA5: {ema_5:.4f} | RSI14: {rsi_14:.1f} | Upper BB: {bb_upper:.4f}")
 
             # 🛒 BUY EXECUTION
             if not positions[formatted_symbol] and buy_condition:
-                add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${c_close} (RSI was < 30 in last 3 candles)")
+                add_log(f"🔥 BUY SIGNAL MATCHED: {formatted_symbol} at ${c_close}")
                 try:
                     raw_qty = trade_amount_usdt / c_close
                     formatted_qty = float(trade_exchange.amount_to_precision(formatted_symbol, raw_qty))
@@ -233,12 +232,12 @@ def on_close(ws, close_status_code, close_msg):
     add_log("⚠️ WS Connection Closed. Reconnecting in 5 seconds...")
 
 def on_open(ws):
-    add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM (Safe from IP Ban)")
+    add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM")
 
 def start_websocket():
-    # ওয়েব সকেটের আগে হিস্টোরিক্যাল ক্যান্ডেল প্রিলোড হবে
-    preload_past_candles()
-    
+    # ⚡ ওয়েবসকেট কানেক্ট করার আগে হিস্টোরিক্যাল ক্যান্ডেলগুলো টেনে আনবে
+    preload_historical_candles()
+
     streams = "/".join([f"{sym}@kline_5m" for sym in target_symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     while True:
