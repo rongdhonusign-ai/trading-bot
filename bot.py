@@ -57,7 +57,7 @@ trade_exchange = ccxt.binance({
 })
 
 def get_target_altcoins():
-    add_log("✅ Loading static top Altcoins list...")
+    add_log("✅ Loading static top Altcoins list (WebSocket Only - Safe from IP Ban)...")
     return [
         'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt', 'adausdt', 'dogeusdt', 'avaxusdt', 
         'dotusdt', 'linkusdt', 'nearusdt', 'suiusdt', 'fetusdt', 'aptusdt', 'ltcusdt',
@@ -65,7 +65,7 @@ def get_target_altcoins():
         'opusdt', 'wifusdt', 'flokiusdt', 'atomusdt', 'trxusdt', 'xlmusdt', 'ftmusdt', 
         'sandusdt', 'manausdt', 'galausdt', 'algousdt', 'ldousdt', 'qntusdt', 'aaveusdt', 
         'egldusdt', 'flowusdt', 'chzusdt', 'axsusdt', 'crvusdt', 'grtusdt', 'snxusdt', 
-        'stxusdt', 'mkrusdt', 'kavausdt', 'compusdt', 'imxusdt' # MKN এর পরিবর্তে MKR
+        'stxusdt', 'mkrusdt', 'kavausdt', 'compusdt', 'imxusdt'
     ]
 
 target_symbols = get_target_altcoins()
@@ -76,34 +76,7 @@ entry_prices = {sym: 0.0 for sym in target_symbols}
 position_amounts = {sym: 0.0 for sym in target_symbols}
 
 # ==========================================
-# 3. HISTORICAL DATA PRELOADER (SAFE RATE LIMITING)
-# ==========================================
-def preload_historical_candles():
-    add_log("⏳ Safe Preloading initial 30 candles for pairs...")
-    for sym in target_symbols:
-        formatted_symbol = sym.upper().replace('USDT', '/USDT')
-        try:
-            # ৩০টি ক্যান্ডেল ইনস্ট্যান্ট ফেচ
-            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=30)
-            
-            prices_history[sym] = [
-                {
-                    'open': float(candle[1]),
-                    'high': float(candle[2]),
-                    'low': float(candle[3]),
-                    'close': float(candle[4])
-                }
-                for candle in ohlcv[:-1]
-            ]
-            # IP Ban এড়ানোর জন্য ০.৪ সেকেন্ড সেফ পজ
-            time.sleep(0.4) 
-        except Exception as e:
-            add_log(f"⚠️ Fetch skipped for {formatted_symbol}: {e}")
-            
-    add_log("🚀 Initial setup complete! Bot listening to WebSocket stream.")
-
-# ==========================================
-# 4. TECHNICAL INDICATORS
+# 3. TECHNICAL INDICATORS
 # ==========================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -124,7 +97,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 5. WEBSOCKET DATA PROCESSOR
+# 4. WEBSOCKET DATA PROCESSOR
 # ==========================================
 def process_kline_data(symbol, open_price, close_price, high_price, low_price, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
@@ -143,7 +116,8 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
-        if len(df) >= 25:
+        # ১৫টি ক্যান্ডেল জমলেই স্ক্যানিং শুরু করবে (অপেক্ষা কমাতে ২৫ এর জায়গায় ১৫ দেওয়া হয়েছে)
+        if len(df) >= 15:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
 
@@ -199,7 +173,7 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                     except Exception as e:
                         add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
         else:
-            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(df)}/25)")
+            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(df)}/15)")
 
 def on_message(ws, message):
     try:
@@ -224,11 +198,9 @@ def on_close(ws, close_status_code, close_msg):
     add_log("⚠️ WS Connection Closed. Reconnecting in 5 seconds...")
 
 def on_open(ws):
-    add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM")
+    add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM (Safe Mode)")
 
 def start_websocket():
-    preload_historical_candles()
-
     streams = "/".join([f"{sym}@kline_5m" for sym in target_symbols])
     ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     while True:
@@ -247,7 +219,7 @@ def start_websocket():
             time.sleep(5)
 
 # ==========================================
-# 6. MAIN EXECUTION
+# 5. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
     ws_thread = Thread(target=start_websocket)
