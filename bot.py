@@ -50,7 +50,7 @@ def get_target_altcoins():
 
 target_symbols = get_target_altcoins()
 
-# 🛠️ ঠিক করা অংশ: বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
+# 🛠️ বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
 formatted_symbols = [sym.upper().replace('USDT', '/USDT') for sym in target_symbols]
 
 prices_history = {sym: [] for sym in target_symbols}
@@ -75,15 +75,19 @@ def preload_history():
         try:
             ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=25)
             history = []
-            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ২৫টি ক্লোজড ক্যান্ডেল
+            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ক্লোজড ক্যান্ডেল
                 history.append({
                     'open': candle[1],
                     'high': candle[2],
                     'low': candle[3],
                     'close': candle[4]
                 })
-            prices_history[sym] = history[-20:]  # লেটেস্ট ২০টি ক্যান্ডেল স্টোর
+            prices_history[sym] = history[-20:]  # ২০টি ক্যান্ডেল স্টোর
             add_log(f"✅ Loaded history for {formatted_symbol}")
+            
+            # 🛠️ API রেট লিমিট এড়াতে ০.৩ সেকেন্ডের বিরতি
+            time.sleep(0.3)
+            
         except Exception as e:
             add_log(f"⚠️ History preload failed for {formatted_symbol}: {e}")
 
@@ -199,7 +203,6 @@ def home():
 
 @app.route('/status')
 def status():
-    # লগের সাইজ বাড়িয়ে ৬০টি রাখা হলো যাতে ৪৭টি টোকেন দেখা যায়
     logs_display = "<br>".join(bot_logs[-60:]) if bot_logs else "No logs yet."
     html = f"""
     <html>
