@@ -18,7 +18,7 @@ def add_log(message):
     log_line = f"{timestamp} {message}"
     print(log_line)
     bot_logs.append(log_line)
-    if len(bot_logs) > 100:  # লগের সাইজ বাড়িয়ে ১০০ রাখা হলো
+    if len(bot_logs) > 100:  # লগের সাইজ ১০০ রাখা হলো
         bot_logs.pop(0)
 
 # ==========================================
@@ -50,7 +50,7 @@ def get_target_altcoins():
 
 target_symbols = get_target_altcoins()
 
-# 🛠️ বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
+# 🛠️ বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
 formatted_symbols = [sym.upper().replace('USDT', '/USDT') for sym in target_symbols]
 
 prices_history = {sym: [] for sym in target_symbols}
@@ -75,7 +75,7 @@ def preload_history():
         try:
             ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=25)
             history = []
-            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ক্লোজড ক্যান্ডেল
+            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ক্লোজড ক্যান্ডেল
                 history.append({
                     'open': candle[1],
                     'high': candle[2],
@@ -85,17 +85,18 @@ def preload_history():
             prices_history[sym] = history[-20:]  # ২০টি ক্যান্ডেল স্টোর
             add_log(f"✅ Loaded history for {formatted_symbol}")
             
-            # 🛠️ API রেট লিমিট এড়াতে ০.৩ সেকেন্ডের বিরতি
+            # 🛠️ API রেট লিমিট এড়াতে ০.৩ সেকেন্ডের বিরতি
             time.sleep(0.3)
             
         except Exception as e:
             add_log(f"⚠️ History preload failed for {formatted_symbol}: {e}")
 
 # ==========================================
-# 4. WEBSOCKET & TRADE LOGIC
+# 4. WEBSOCKET & TRADE LOGIC (FIXED)
 # ==========================================
 def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
+    base_currency = formatted_symbol.split('/')[0]  # যেমন: ETH, SOL, KAVA
     
     if is_closed:
         prices_history[symbol].append({
@@ -126,28 +127,43 @@ def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
         if is_closed:
             add_log(f"📊 [5M SCAN {formatted_symbol}] Open: ${open_p} | Close: ${c_close} | Lower BB: {bb_lower:.4f} | Upper BB: {bb_upper:.4f}")
 
-            # BUY STRATEGY
-            if not positions[formatted_symbol] and c_close <= bb_lower:
+            # 🛠️ সমাধান ১: Render রিস্টার্ট হলেও সরাসরি বাইন্যান্স ওয়ালেট ব্যালেন্স চেক করা
+            actual_balance = 0.0
+            has_position = False
+            try:
+                balance = trade_exchange.fetch_balance()
+                actual_balance = float(balance['free'].get(base_currency, 0.0))
+                
+                # ওয়ালেটে যদি এই কয়েন $5.0 USDT-এর বেশি থাকে, ধরে নেওয়া হবে পজিশন কেনা আছে
+                if (actual_balance * c_close) >= 5.0:
+                    has_position = True
+            except Exception as e:
+                add_log(f"⚠️ Balance Check Failed for {formatted_symbol}: {e}")
+                has_position = positions.get(formatted_symbol, False)
+
+            # 🟢 BUY STRATEGY
+            if not has_position and c_close <= bb_lower:
                 add_log(f"🎯 BUY SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} <= Lower BB: ${bb_lower:.4f}")
                 try:
-                    amount_to_buy = trade_amount_usdt / c_close
+                    raw_amount = trade_amount_usdt / c_close
+                    # 🛠️ সমাধান ২: Precision সেট করা যাতে বাইন্যান্স দশমিক ঘরের সমস্যার কারণে রিজেক্ট না করে
+                    amount_to_buy = float(trade_exchange.amount_to_precision(formatted_symbol, raw_amount))
+                    
                     order = trade_exchange.create_market_buy_order(formatted_symbol, amount_to_buy)
                     positions[formatted_symbol] = True
-                    entry_prices[formatted_symbol] = c_close
-                    position_amounts[formatted_symbol] = amount_to_buy
                     add_log(f"✅ BUY EXECUTED for {formatted_symbol} | Order ID: {order['id']}")
                 except Exception as e:
                     add_log(f"❌ BUY ERROR for {formatted_symbol}: {e}")
 
-            # SELL STRATEGY
-            elif positions[formatted_symbol] and c_close >= bb_upper:
+            # 🔴 SELL STRATEGY
+            elif has_position and c_close >= bb_upper:
                 add_log(f"🎯 SELL SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} >= Upper BB: ${bb_upper:.4f}")
                 try:
-                    amount_to_sell = position_amounts[formatted_symbol]
+                    # 🛠️ সমাধান ৩: ফি কাটার পর ওয়ালেটে ঠিক যতটুকু কয়েন জমা আছে, হুবহু সেটি সেল করা
+                    amount_to_sell = float(trade_exchange.amount_to_precision(formatted_symbol, actual_balance))
+                    
                     order = trade_exchange.create_market_sell_order(formatted_symbol, amount_to_sell)
                     positions[formatted_symbol] = False
-                    entry_prices[formatted_symbol] = 0.0
-                    position_amounts[formatted_symbol] = 0.0
                     add_log(f"✅ SELL EXECUTED for {formatted_symbol} | Order ID: {order['id']}")
                 except Exception as e:
                     add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
