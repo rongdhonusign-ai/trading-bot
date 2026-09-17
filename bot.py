@@ -8,7 +8,7 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# 1. FLASK APP (Render Web Service Active রাখার জন্য)
+# 1. FLASK APP (Render Web Service + Health Check)
 # ==========================================
 app = Flask(__name__)
 
@@ -22,12 +22,12 @@ def home():
 @app.route('/status')
 def status():
     html = "<h2>🚀 Binance Custom Strategy Bot Status</h2>"
-    html += "<p><b>Strategy:</b> BUY when Open < Lower BB & Close > Lower BB | SELL when Close > Upper BB (No Stop Loss)</p><hr>"
+    html += "<p><b>Strategy:</b> BUY when Close <= Lower BB | SELL when Close >= Upper BB (Amount: $11 USDT)</p><hr>"
     html += "<h3>📜 Recent Activity Logs:</h3><pre style='background:#f4f4f4; padding:10px; border-radius:5px; max-height:400px; overflow-y:auto;'>"
     if bot_logs:
         html += "\n".join(bot_logs[-30:])
     else:
-        html += "Waiting for WebSocket data..."
+        html += "Waiting for data..."
     html += "</pre>"
     return html, 200
 
@@ -40,9 +40,10 @@ def add_log(message):
         bot_logs.pop(0)
 
 # ==========================================
-# 2. CONFIGURATION & STATIC TOP ALTCOINS
+# 2. CONFIGURATION & TARGET ALTCOINS
 # ==========================================
-trade_amount_usdt = 6.0    
+# Binance Min Notional Filter (মিনিমাম ১০ USDT) অতিক্রম করার জন্য $11 USDT সেট করা হয়েছে
+trade_amount_usdt = 11.0    
 
 trade_exchange = ccxt.binance({
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
@@ -56,7 +57,7 @@ trade_exchange = ccxt.binance({
 })
 
 def get_target_altcoins():
-    add_log("✅ Loading static top Altcoins list (WebSocket Only - Safe Mode)...")
+    add_log("✅ Loading target Altcoins list...")
     return [
         'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt', 'adausdt', 'dogeusdt', 'avaxusdt', 
         'dotusdt', 'linkusdt', 'nearusdt', 'suiusdt', 'fetusdt', 'aptusdt', 'ltcusdt',
@@ -75,10 +76,34 @@ entry_prices = {sym: 0.0 for sym in target_symbols}
 position_amounts = {sym: 0.0 for sym in target_symbols}
 
 # ==========================================
-# 3. TECHNICAL INDICATORS (BOLLINGER BANDS 20, 2)
+# 3. HISTORICAL CANDLE PRELOADER
+# ==========================================
+def preload_history():
+    """বট চালুর সাথে সাথে বাইন্যান্স API থেকে ২০টি ক্যান্ডেল ফেচ করবে যাতে ১০০ মিনিট অপেক্ষা না করতে হয়"""
+    add_log("⏳ Preloading historical 5m candle data for all symbols...")
+    for sym in target_symbols:
+        try:
+            formatted_symbol = sym.upper().replace('USDT', '/USDT')
+            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=25)
+            # শেষ আনক্লোজড রানিং ক্যান্ডেল বাদ দিয়ে বাকি ২০+ টি ক্যান্ডেল সেভ হবে
+            prices_history[sym] = [
+                {
+                    'open': float(candle[1]),
+                    'high': float(candle[2]),
+                    'low': float(candle[3]),
+                    'close': float(candle[4])
+                }
+                for candle in ohlcv[:-1]
+            ]
+        except Exception as e:
+            add_log(f"⚠️ Preload failed for {sym}: {e}")
+        time.sleep(0.05)
+    add_log("✅ Candle history preloaded successfully! Bot is ready for signals.")
+
+# ==========================================
+# 4. TECHNICAL INDICATORS (BOLLINGER BANDS 20, 2)
 # ==========================================
 def calculate_indicators(df):
-    # Bollinger Bands (20, std=2)
     df['sma_20'] = df['close'].rolling(window=20).mean()
     df['std_20'] = df['close'].rolling(window=20).std()
     df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2)
@@ -86,7 +111,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 4. WEBSOCKET DATA PROCESSOR
+# 5. WEBSOCKET DATA PROCESSOR
 # ==========================================
 def process_kline_data(symbol, open_price, close_price, high_price, low_price, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
@@ -105,7 +130,6 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
 
         df = pd.DataFrame(prices_history[symbol])
 
-        # ⚡ ২০টির বেশি ক্যান্ডেল জমলেই Bollinger Bands হিসাব হবে
         if len(df) >= 20:
             df = calculate_indicators(df)
             last_row = df.iloc[-1]
@@ -115,16 +139,16 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
             bb_upper = float(last_row['bb_upper'])
             bb_lower = float(last_row['bb_lower'])
 
-            # 🎯 কৌশল শর্তাবলী
-            buy_condition = (c_open < bb_lower) and (c_close > bb_lower)
-            sell_condition = c_close > bb_upper
+            # 🎯 অপটিমাইজড সহজ ট্রেডিং কন্ডিশন
+            buy_condition = c_close <= bb_lower
+            sell_condition = c_close >= bb_upper
 
             # 🔍 লাইভ স্ক্যানিং লগ
             add_log(f"📊 [5M SCAN {formatted_symbol}] Open: ${c_open} | Close: ${c_close} | Lower BB: {bb_lower:.4f} | Upper BB: {bb_upper:.4f}")
 
-            # 🛒 BUY EXECUTION (MARKET ORDER $6 USDT)
+            # 🛒 BUY EXECUTION (MARKET ORDER $11 USDT)
             if not positions[formatted_symbol] and buy_condition:
-                add_log(f"🔥 BUY SIGNAL MATCHED (Open < Lower BB & Close > Lower BB): {formatted_symbol} at ${c_close}")
+                add_log(f"🔥 BUY SIGNAL MATCHED (Close <= Lower BB): {formatted_symbol} at ${c_close}")
                 try:
                     raw_qty = trade_amount_usdt / c_close
                     formatted_qty = float(trade_exchange.amount_to_precision(formatted_symbol, raw_qty))
@@ -138,9 +162,9 @@ def process_kline_data(symbol, open_price, close_price, high_price, low_price, i
                 except Exception as e:
                     add_log(f"❌ BUY ERROR for {formatted_symbol}: {e}")
 
-            # 💰 SELL EXECUTION (MARKET ORDER - ONLY AT UPPER BB)
+            # 💰 SELL EXECUTION (MARKET ORDER AT UPPER BB)
             elif positions[formatted_symbol] and sell_condition:
-                add_log(f"🛑 EXIT SIGNAL [UPPER BB CROSS]: {formatted_symbol} at ${c_close}")
+                add_log(f"🛑 EXIT SIGNAL MATCHED (Close >= Upper BB): {formatted_symbol} at ${c_close}")
                 try:
                     qty = position_amounts[formatted_symbol]
                     formatted_qty = float(trade_exchange.amount_to_precision(formatted_symbol, qty))
@@ -179,7 +203,7 @@ def on_close(ws, close_status_code, close_msg):
     add_log("⚠️ WS Connection Closed. Reconnecting in 5 seconds...")
 
 def on_open(ws):
-    add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM (Safe Mode)")
+    add_log("✅ CONNECTED TO BINANCE 5M KLINE STREAM")
 
 def start_websocket():
     streams = "/".join([f"{sym}@kline_5m" for sym in target_symbols])
@@ -200,12 +224,17 @@ def start_websocket():
             time.sleep(5)
 
 # ==========================================
-# 5. MAIN EXECUTION
+# 6. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
+    # 1. আগে ২০টি ক্যান্ডেল ফেচ করে হিস্ট্রি রেডি করবে
+    preload_history()
+    
+    # 2. এরপর ব্যাকগ্রাউন্ডে WebSocket স্ট্রিম চালু করবে
     ws_thread = Thread(target=start_websocket)
     ws_thread.daemon = True
     ws_thread.start()
     
+    # 3. Flask Server চালু হবে
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
