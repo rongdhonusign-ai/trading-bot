@@ -15,8 +15,7 @@ import logging
 # ==========================================
 # 0. TRADE CONFIGURATION & STRATEGY SETTINGS
 # ==========================================
-# স্ট্যাবলকয়েন ছাড়া ট্রেড করতে ট্রেড পরিমাণ কোট অ্যাসেটে সেট করতে হবে (যেমন: BTC বা ETH)
-TRADE_AMOUNT_QUOTE = 0.0005  # উদাহরণ: প্রতি ট্রেডে ০.০০০৫ BTC দিয়ে বাই হবে
+TRADE_AMOUNT_USDT = 40.0   # প্রতি ট্রেডে ৪০ ডলারের মার্কেট বাই
 
 # RSI Parameters
 RSI_LONG_PERIOD = 50       # ট্রেন্ড ফিল্টার (RSI 50)
@@ -46,7 +45,7 @@ def status():
     return f"""
     <html>
         <head>
-            <title>Crypto-Only Fast RSI Trading Bot</title>
+            <title>Fast RSI Execution Bot ($40 Spot USDT)</title>
             <meta http-equiv="refresh" content="5">
             <style>
                 body {{ background-color: #0d1117; color: #3fb950; font-family: monospace; padding: 20px; }}
@@ -55,8 +54,8 @@ def status():
             </style>
         </head>
         <body>
-            <h2>🤖 Non-Stablecoin RSI Trading Bot (Crypto Pairs Only)</h2>
-            <p>Strategy: Market Buy when RSI(50) > 50 & RSI(3) < 5 | Market Sell when RSI(3) > 85</p>
+            <h2>🤖 Fast RSI Execution Trading Bot (100 USDT Altcoins)</h2>
+            <p>Strategy: Market Buy ($40 USDT) when RSI(50) > 50 & RSI(3) < 5 | Market Sell when RSI(3) > 85</p>
             <hr>
             <div class="log-box">{logs_html if logs_html else "Initializing scanner and preloading data..."}</div>
         </body>
@@ -64,49 +63,51 @@ def status():
     """, 200
 
 # ==========================================
-# 2. BINANCE CLIENT SETUP & STABLECOIN-FREE PAIRS
+# 2. BINANCE CLIENT SETUP & TOP 100 USDT ALTCOINS
 # ==========================================
 API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
 client = Client(API_KEY, API_SECRET)
 
 def get_target_altcoins():
-    # সম্পূর্ণ স্ট্যাবলকয়েন মুক্ত Crypto-to-Crypto (BTC & ETH Base) পেয়ারসমূহ
-    raw_symbols = [
-        # Major Altcoins vs BTC (40)
-        "ETHBTC", "SOLBTC", "BNBBTC", "XRPBTC", "ADABTC", "AVAXBTC", "DOTBTC", "NEARBTC",
-        "SUIBTC", "APTBTC", "LTCBTC", "ICPBTC", "INJBTC", "TIABTC", "SEIBTC", "ARBBTC",
-        "OPBTC", "ATOMBTC", "FTMBTC", "ALGOBTC", "STXBTC", "IMXBTC", "BCHBTC", "ETCBTC",
-        "FILBTC", "HBARBTC", "VETBTC", "POLBTC", "ROSEBTC", "MINABTC", "DOGEBTC", "SHIBBTC",
-        "PEPEBTC", "WIFBTC", "FETBTC", "RENDERBTC", "TAOBTC", "LINKBTC", "UNIBTC", "AAVEBTC",
+    return [
+        # Major & Layer 1 / Layer 2 (35)
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
+        "ADAUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "SUIUSDT", 
+        "APTUSDT", "LTCUSDT", "ICPUSDT", "INJUSDT", "TIAUSDT", 
+        "SEIUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "TRXUSDT", 
+        "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "FLOWUSDT", "STXUSDT", 
+        "KAVAUSDT", "IMXUSDT", "BCHUSDT", "ETCUSDT", "FILUSDT",
+        "HBARUSDT", "VETUSDT", "POLUSDT", "ROSEUSDT", "MINAUSDT",
+        
+        # Meme Coins (10)
+        "DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "FLOKIUSDT", 
+        "BONKUSDT", "MEMEUSDT", "1000SATSUSDT", "BOMEUSDT", "PEOPLEUSDT",
 
-        # Layer 1 / Layer 2 / DeFi vs ETH (30)
-        "SOLETH", "BNBETH", "XRPETH", "ADAETH", "AVAXETH", "DOTETH", "NEARETH", "SUIETH",
-        "APTETH", "LTCETH", "INJETH", "TIAETH", "SEIETH", "ARBETH", "OPETH", "ATOMETH",
-        "STXETH", "IMXETH", "BCHETH", "ETCETH", "FILETH", "LINKETH", "UNIETH", "AAVEETH",
-        "MKRETH", "CRVETH", "LDOETH", "PENDLEETH", "JUPETH", "RUNETH",
+        # AI & Big Data (10)
+        "FETUSDT", "RENDERUSDT", "TAOUSDT", "RNDRUSDT", "AGIXUSDT", 
+        "OCEANUSDT", "AKTUSDT", "WLDUSDT", "ARKMUSDT", "AIUSDT",
 
-        # High Volatility Altcoins vs BTC (30)
-        "MKRBTC", "CRVBTC", "SNXBTC", "COMPBTC", "LDOBTC", "QNTBTC", "DYDXBTC", "PENDLEBTC",
-        "JUPBTC", "RAYBTC", "ENABTC", "RUNEBTC", "CAKEBTC", "1INCHBTC", "SUSHIBTC", "JTOBTC",
-        "ORDIBTC", "BLURBTC", "ARBTC", "ONDOBTC", "SANDBTC", "MANABTC", "GALABTC", "AXSBTC",
-        "BEAMXBTC", "ILVBTC", "ENJBTC", "THETABTC", "JASMYBTC", "XLMBTC"
+        # DeFi & Infrastructure (25)
+        "LINKUSDT", "UNIUSDT", "AAVEUSDT", "MKRUSDT", "CRVUSDT", 
+        "SNXUSDT", "COMPUSDT", "LDOUSDT", "QNTUSDT", "DYDXUSDT", 
+        "PENDLEUSDT", "JUPUSDT", "RAYUSDT", "ENAUSDT", "RUNEUSDT", 
+        "CAKEUSDT", "1INCHUSDT", "SUSHIUSDT", "RDNTUSDT", "JTOUSDT", 
+        "ORDIUSDT", "BLURUSDT", "ARUSDT", "ANKRUSDT", "ONDOUSDT",
+
+        # Gaming & Metaverse & Storage (20)
+        "SANDUSDT", "MANAUSDT", "GALAUSDT", "AXSUSDT", "CHZUSDT", 
+        "BEAMXUSDT", "ILVUSDT", "ENJUSDT", "PIXELUSDT", "GMXUSDT",
+        "THETAUSDT", "JASMYUSDT", "CKBUSDT", "XLMUSDT", "STXUSDT",
+        "KSMUSDT", "GLMRUSDT", "ZILUSDT", "IOTAUSDT", "GMTUSDT"
     ]
-    
-    # সুরক্ষা বলয়: কোডের ভেতর দিয়েও যেন কোনো Stablecoin ভুলবশত না ঢোকে
-    banned_keywords = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDE", "FDUSD"]
-    filtered_symbols = [
-        sym for sym in raw_symbols 
-        if not any(stable in sym for stable in banned_keywords)
-    ]
-    return list(set(filtered_symbols))
 
 # Global Trackers
 candle_data = {}
 positions = {}      # {symbol: True/False}
 buy_prices = {}     # {symbol: entry_price}
 
-symbols = get_target_altcoins()
+symbols = list(set(get_target_altcoins()))  # Duplicate clean-up
 for sym in symbols:
     candle_data[sym] = []
     positions[sym] = False
@@ -124,14 +125,14 @@ def fetch_single_symbol(sym):
         log_print(f"⚠️ Preload error for {sym}: {e}")
 
 def preload_history():
-    log_print("⚡ Preloading Historical 5M Data for 100 Crypto Pairs (No Stablecoins)...")
+    log_print("⚡ Preloading Historical 5M Data for 100 USDT Tokens in Parallel...")
     start_time = time.time()
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         executor.map(fetch_single_symbol, symbols)
         
     elapsed = time.time() - start_time
-    log_print(f"✅ Preload Complete in {elapsed:.2f} Seconds! Live Scanning Active.")
+    log_print(f"✅ Preload Complete in {elapsed:.2f} Seconds! Live WebSocket Scanning Active.")
 
 # ==========================================
 # 4. RSI INDICATOR CALCULATION
@@ -153,7 +154,7 @@ def calculate_rsi(closes, period):
     return 50.0 if np.isnan(val) else val
 
 # ==========================================
-# 5. STRATEGY EXECUTION LOGIC
+# 5. INSTANT EXECUTION STRATEGY LOGIC
 # ==========================================
 def process_tick(symbol, current_price):
     if len(candle_data[symbol]) < 55:
@@ -165,12 +166,12 @@ def process_tick(symbol, current_price):
     
     has_pos = positions[symbol]
 
-    # 🛒 ১. মার্কেট বাই: RSI(50) > 50 এবং RSI(3) < 5
+    # 🛒 ১. ইনস্ট্যান্ট মার্কেট বাই: RSI(50) > 50 এবং RSI(3) < 5
     if not has_pos and rsi_50 > BUY_RSI_LONG_MIN and rsi_3 < BUY_RSI_SHORT_MAX:
-        log_print(f"⚡ [BUY SIGNAL] {symbol} | Price: {current_price:.8f} | RSI(50): {rsi_50:.2f} | RSI(3): {rsi_3:.2f}")
+        log_print(f"⚡ [BUY SIGNAL] {symbol} | Price: ${current_price} | RSI(50): {rsi_50:.2f} > 50 | RSI(3): {rsi_3:.2f} < 5")
         try:
-            # স্ট্যাবলকয়েন ছাড়া বাই অর্ডার দেওয়ার নিয়ম (quoteOrderQty দিয়ে কোট অ্যাসেটের পরিমাণ সেট করা হয়)
-            order = client.order_market_buy(symbol=symbol, quoteOrderQty=TRADE_AMOUNT_QUOTE)
+            # $40 USDT দিয়ে মার্কেট বাই অর্ডার
+            order = client.order_market_buy(symbol=symbol, quoteOrderQty=TRADE_AMOUNT_USDT)
             
             executed_price = current_price
             if 'fills' in order and len(order['fills']) > 0:
@@ -178,34 +179,31 @@ def process_tick(symbol, current_price):
 
             positions[symbol] = True
             buy_prices[symbol] = executed_price
-            log_print(f"✅ [MARKET BOUGHT] {symbol} @ {executed_price:.8f} | Order ID: {order['orderId']}")
+            log_print(f"✅ [MARKET BOUGHT] {symbol} @ ${executed_price:.4f} | Order ID: {order['orderId']}")
 
         except BinanceAPIException as e:
             log_print(f"❌ [BUY ERROR] {symbol}: {e.message}")
         except Exception as e:
             log_print(f"❌ [BUY EXCEPTION] {symbol}: {e}")
 
-    # 💰 ২. মার্কেট সেল: RSI(3) > 85
+    # 💰 ২. ইনস্ট্যান্ট মার্কেট সেল: RSI(3) > 85
     elif has_pos and rsi_3 > SELL_RSI_SHORT_TARGET:
         entry_price = buy_prices[symbol]
         pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
-        log_print(f"🎯 [SELL SIGNAL] {symbol} | Price: {current_price:.8f} | RSI(3): {rsi_3:.2f} | Est PnL: {pnl_pct:+.2f}%")
+        log_print(f"🎯 [SELL SIGNAL] {symbol} | Price: ${current_price} | RSI(3): {rsi_3:.2f} > 85 | Est PnL: {pnl_pct:+.2f}%")
         execute_market_sell(symbol)
 
 def execute_market_sell(symbol):
     try:
-        # পেয়ার থেকে বেস অ্যাসেট আলাদা করা (যেমন: ETHBTC থেকে base asset হল ETH)
-        # সাধারণত Binance-এ BTC বা ETH ৩ অক্ষরের হয়
-        base_asset = symbol[:-3] if symbol.endswith("BTC") or symbol.endswith("ETH") else symbol.replace("BTC", "").replace("ETH", "")
-        
-        balance_info = client.get_asset_balance(asset=base_asset)
+        asset = symbol.replace("USDT", "")
+        balance_info = client.get_asset_balance(asset=asset)
         free_qty = float(balance_info['free']) if balance_info else 0.0
 
         if free_qty > 0:
             order = client.order_market_sell(symbol=symbol, quantity=free_qty)
             log_print(f"✅ [MARKET SOLD] {symbol} | Order ID: {order['orderId']}")
         else:
-            log_print(f"⚠️ [SELL SKIPPED] {symbol}: No balance found for {base_asset}.")
+            log_print(f"⚠️ [SELL SKIPPED] {symbol}: No free balance available.")
 
         positions[symbol] = False
         buy_prices[symbol] = 0.0
@@ -216,7 +214,7 @@ def execute_market_sell(symbol):
         log_print(f"❌ [SELL EXCEPTION] {symbol}: {e}")
 
 # ==========================================
-# 6. WEBSOCKET LISTENER
+# 6. WEBSOCKET REAL-TIME TICK LISTENER
 # ==========================================
 def on_message(ws, message):
     data = json.loads(message)
@@ -248,12 +246,12 @@ def start_websocket():
 
 def start_bot():
     preload_history()
-    log_print("🤖 Bot Active! Scanning 100 Crypto-only pairs constantly...")
+    log_print("🤖 Real-Time Execution Bot Running! Scanning 100 USDT tokens constantly...")
     while True:
         try:
             start_websocket()
         except Exception as e:
-            log_print(f"⚠️ WS Disconnected: {e}. Reconnecting in 5s...")
+            log_print(f"⚠️ WebSocket connection lost: {e}. Retrying in 5 seconds...")
             time.sleep(5)
 
 # ==========================================
