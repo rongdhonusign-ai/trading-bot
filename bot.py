@@ -46,7 +46,7 @@ def status():
             </style>
         </head>
         <body>
-            <h2>🤖 Real-Time RSI Strategy Trading Bot (Active Scanning)</h2>
+            <h2>🤖 Real-Time RSI Strategy Trading Bot (Clean Logs)</h2>
             <p>Strategy: Market Buy (RSI50 > 50 AND RSI3 < 5) | Market Sell (RSI3 > 85 OR 3% Stop Loss)</p>
             <hr>
             <div class="log-box">{logs_html if logs_html else "Initializing scanner and preloading data..."}</div>
@@ -182,11 +182,7 @@ def process_tick(symbol, current_price):
         log_print(f"🚨 [STOP LOSS TRIGGERED] {symbol} | Price: ${current_price} ({loss_pct:.2f}% drop)")
         execute_market_sell(symbol)
 
-    # 📉 বাই কন্ডিশনের কাছাকাছি গেলে অ্যালার্ট দেবে
-    elif not has_pos and rsi3 < 15:
-        log_print(f"📉 [NEAR BUY SIGNAL] {symbol} | Price: ${current_price} | RSI(50): {rsi50:.1f} | RSI(3): {rsi3:.1f}")
-
-    # 🔍 ১ মিনিট পর পর দুটি RSI-এর মানই লগে প্রিন্ট করবে
+    # 🔍 ১ মিনিট পর পর শুধু ১টি স্ক্যানিং কনফার্মেশন প্রিন্ট করবে
     if time.time() - last_scan_log > 60:
         last_scan_log = time.time()
         log_print(f"🔍 [ACTIVE SCANNING] {symbol} | Price: ${current_price} | RSI(50): {rsi50:.1f} | RSI(3): {rsi3:.1f}")
