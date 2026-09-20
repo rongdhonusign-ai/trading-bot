@@ -1,6 +1,6 @@
-ccxt
-pandas
 flask
-gunicorn
-requests
+python-binance
+pandas
+numpy
 websocket-client
+requests
