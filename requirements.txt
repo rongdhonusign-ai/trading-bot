@@ -1,6 +1,6 @@
-flask
+Flask
 python-binance
+websocket-client
 pandas
 numpy
-websocket-client
-requests
+gunicorn
