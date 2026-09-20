@@ -62,7 +62,6 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1
 client = Client(API_KEY, API_SECRET)
 
 def get_target_altcoins():
-    # সক্রিয় ও ভ্যালিড অল্টকয়েনের তালিকা
     return [
         # Major & Layer 1 / Layer 2
         "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
@@ -107,7 +106,7 @@ for sym in symbols:
     buy_prices[sym] = 0.0
 
 # ==========================================
-# 3. ULTRA-FAST HISTORICAL PRELOADER (IP SAFE)
+# 3. ULTRA-FAST HISTORICAL PRELOADER
 # ==========================================
 def preload_history():
     log_print("🔄 Fast Preloading Historical Data (IP Safe & Ultra Fast)...")
@@ -116,7 +115,7 @@ def preload_history():
             klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=60)
             closes = [float(k[4]) for k in klines]
             candle_data[sym] = closes
-            time.sleep(0.01)  # IP Ban এড়াতে সেফ ডিলে
+            time.sleep(0.01)
         except Exception as e:
             log_print(f"⚠️ Preload error for {sym}: {e}")
     log_print("✅ Preload Complete! Live WebSocket Scanning Started.")
@@ -153,7 +152,7 @@ def process_tick(symbol, current_price):
     has_pos = positions[symbol]
     entry_price = buy_prices[symbol]
 
-    # 🛒 ১. শর্ত: RSI(50) > 50 এবং RSI(3) < 5 হলে সাথে সাথে মার্কেট বাই
+    # 🛒 ১. শর্ত: RSI(50) > 50 এবং RSI(3) < 5 হলে মার্কেট বাই
     if not has_pos and rsi50 > 50 and rsi3 < 5:
         log_print(f"⚡ [BUY SIGNAL] {symbol} | Price: ${current_price} | RSI(50): {rsi50:.2f} | RSI(3): {rsi3:.2f}")
         try:
@@ -172,21 +171,25 @@ def process_tick(symbol, current_price):
         except Exception as e:
             log_print(f"❌ [BUY EXCEPTION] {symbol}: {e}")
 
-    # 💰 ২. শর্ত: RSI(3) > 85 হলে সাথে সাথে মার্কেট সেল
+    # 💰 ২. শর্ত: RSI(3) > 85 হলে মার্কেট সেল
     elif has_pos and rsi3 > 85:
         log_print(f"🎯 [PROFIT SELL SIGNAL] {symbol} | Price: ${current_price} | RSI(3): {rsi3:.2f} > 85")
         execute_market_sell(symbol)
 
-    # 🚨 ৩. ৩% স্টপ লস সেল (ব্যাকআপ সেফটি)
+    # 🚨 ৩. ৩% স্টপ লস সেল
     elif has_pos and entry_price > 0 and current_price <= (entry_price * (1 - STOP_LOSS_PERCENT)):
         loss_pct = ((current_price - entry_price) / entry_price) * 100
         log_print(f"🚨 [STOP LOSS TRIGGERED] {symbol} | Price: ${current_price} ({loss_pct:.2f}% drop)")
         execute_market_sell(symbol)
 
-    # স্ক্যানিং কনফার্মেশন লগ (প্রতি ১ মিনিট পর পর লগে আসবে)
+    # 📉 বাই কন্ডিশনের কাছাকাছি গেলে অ্যালার্ট দেবে
+    elif not has_pos and rsi3 < 15:
+        log_print(f"📉 [NEAR BUY SIGNAL] {symbol} | Price: ${current_price} | RSI(50): {rsi50:.1f} | RSI(3): {rsi3:.1f}")
+
+    # 🔍 ১ মিনিট পর পর দুটি RSI-এর মানই লগে প্রিন্ট করবে
     if time.time() - last_scan_log > 60:
         last_scan_log = time.time()
-        log_print(f"🔍 [ACTIVE SCANNING] Monitoring live ticks for {len(symbols)} altcoins. Last checked: {symbol} (${current_price}) | RSI(3): {rsi3:.1f}")
+        log_print(f"🔍 [ACTIVE SCANNING] {symbol} | Price: ${current_price} | RSI(50): {rsi50:.1f} | RSI(3): {rsi3:.1f}")
 
 def execute_market_sell(symbol):
     try:
