@@ -24,7 +24,7 @@ def add_log(message):
 # ==========================================
 # 2. CONFIGURATION & TARGET ALTCOINS
 # ==========================================
-trade_amount_usdt = 11.0    
+trade_amount_usdt = 40.0  # 🛠️ বাই অ্যামাউন্ট ৪০ ডলার করা হলো    
 
 trade_exchange = ccxt.binance({
     'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
@@ -50,7 +50,7 @@ def get_target_altcoins():
 
 target_symbols = get_target_altcoins()
 
-# 🛠️ বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
+# 🛠️ বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
 formatted_symbols = [sym.upper().replace('USDT', '/USDT') for sym in target_symbols]
 
 prices_history = {sym: [] for sym in target_symbols}
@@ -62,37 +62,43 @@ position_amounts = {sym: 0.0 for sym in formatted_symbols}
 # 3. TECHNICAL INDICATORS & PRELOAD HISTORY
 # ==========================================
 def calculate_indicators(df):
+    # Bollinger Bands (20 Period)
     df['sma_20'] = df['close'].rolling(window=20).mean()
     df['std_20'] = df['close'].rolling(window=20).std()
     df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2.0)
     df['bb_lower'] = df['sma_20'] - (df['std_20'] * 2.0)
+    
+    # 🎯 TREND FILTER: EMA 200
+    df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+    
     return df
 
 def preload_history():
-    add_log("⏳ Preloading 5M Candle History for all symbols...")
+    add_log("⏳ Preloading 5M Candle History (250 candles) for EMA 200...")
     for sym in target_symbols:
         formatted_symbol = sym.upper().replace('USDT', '/USDT')
         try:
-            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=25)
+            # EMA 200 সঠিকভাবে হিসাব করতে ২৫০টি ক্যান্ডেল লোড করা হচ্ছে
+            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=250)
             history = []
-            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ক্লোজড ক্যান্ডেল
+            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ক্লোজড ক্যান্ডেল
                 history.append({
                     'open': candle[1],
                     'high': candle[2],
                     'low': candle[3],
                     'close': candle[4]
                 })
-            prices_history[sym] = history[-20:]  # ২০টি ক্যান্ডেল স্টোর
+            prices_history[sym] = history  # ২৫০টি ক্যান্ডেল স্টোর
             add_log(f"✅ Loaded history for {formatted_symbol}")
             
-            # 🛠️ API রেট লিমিট এড়াতে ০.৩ সেকেন্ডের বিরতি
+            # 🛠️ API রেট লিমিট এড়াতে ০.৩ সেকেন্ডের বিরতি
             time.sleep(0.3)
             
         except Exception as e:
             add_log(f"⚠️ History preload failed for {formatted_symbol}: {e}")
 
 # ==========================================
-# 4. WEBSOCKET & TRADE LOGIC (FIXED)
+# 4. WEBSOCKET & TRADE LOGIC (UPDATED WITH EMA 200)
 # ==========================================
 def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
     formatted_symbol = symbol.upper().replace('USDT', '/USDT')
@@ -105,10 +111,11 @@ def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
             'low': low_p,
             'close': close_p
         })
-        if len(prices_history[symbol]) > 50:
+        if len(prices_history[symbol]) > 300:
             prices_history[symbol].pop(0)
 
-    if len(prices_history[symbol]) >= 20:
+    # EMA 200 হিসাবের জন্য কমপক্ষে ২০০টি ক্যান্ডেল প্রয়োজন
+    if len(prices_history[symbol]) >= 200:
         df = pd.DataFrame(prices_history[symbol])
         
         # রানিং ক্যান্ডেলের লাইভ প্রাইস আপডেট
@@ -123,11 +130,12 @@ def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
         c_close = float(last_row['close'])
         bb_lower = float(last_row['bb_lower'])
         bb_upper = float(last_row['bb_upper'])
+        ema_200 = float(last_row['ema_200'])
 
         if is_closed:
-            add_log(f"📊 [5M SCAN {formatted_symbol}] Open: ${open_p} | Close: ${c_close} | Lower BB: {bb_lower:.4f} | Upper BB: {bb_upper:.4f}")
+            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Lower BB: ${bb_lower:.4f} | Upper BB: ${bb_upper:.4f} | EMA 200: ${ema_200:.4f}")
 
-            # 🛠️ সমাধান ১: Render রিস্টার্ট হলেও সরাসরি বাইন্যান্স ওয়ালেট ব্যালেন্স চেক করা
+            # 🛠️ বাইন্যান্স ওয়ালেট ব্যালেন্স চেক করা
             actual_balance = 0.0
             has_position = False
             try:
@@ -141,12 +149,14 @@ def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
                 add_log(f"⚠️ Balance Check Failed for {formatted_symbol}: {e}")
                 has_position = positions.get(formatted_symbol, False)
 
-            # 🟢 BUY STRATEGY
-            if not has_position and c_close <= bb_lower:
-                add_log(f"🎯 BUY SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} <= Lower BB: ${bb_lower:.4f}")
+            # 🟢 BUY STRATEGY (WITH TREND FILTER)
+            # কন্ডিশন: ১. কোনো খোলা পজিশন থাকা যাবে না
+            #          ২. দাম Lower BB এর নিচে বা সমান হতে হবে
+            #          ৩. দাম অবশ্যই EMA 200 এর উপরে থাকতে হবে (Uptrend Filter)
+            if not has_position and c_close <= bb_lower and c_close > ema_200:
+                add_log(f"🎯 BUY SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} <= Lower BB: ${bb_lower:.4f} AND Price > EMA 200: ${ema_200:.4f}")
                 try:
                     raw_amount = trade_amount_usdt / c_close
-                    # 🛠️ সমাধান ২: Precision সেট করা যাতে বাইন্যান্স দশমিক ঘরের সমস্যার কারণে রিজেক্ট না করে
                     amount_to_buy = float(trade_exchange.amount_to_precision(formatted_symbol, raw_amount))
                     
                     order = trade_exchange.create_market_buy_order(formatted_symbol, amount_to_buy)
@@ -159,7 +169,6 @@ def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
             elif has_position and c_close >= bb_upper:
                 add_log(f"🎯 SELL SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} >= Upper BB: ${bb_upper:.4f}")
                 try:
-                    # 🛠️ সমাধান ৩: ফি কাটার পর ওয়ালেটে ঠিক যতটুকু কয়েন জমা আছে, হুবহু সেটি সেল করা
                     amount_to_sell = float(trade_exchange.amount_to_precision(formatted_symbol, actual_balance))
                     
                     order = trade_exchange.create_market_sell_order(formatted_symbol, amount_to_sell)
@@ -169,7 +178,7 @@ def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
                     add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
     else:
         if is_closed:
-            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History: ({len(prices_history[symbol])}/20)")
+            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History for EMA 200: ({len(prices_history[symbol])}/200)")
 
 def on_message(ws, message):
     try:
