@@ -10,6 +10,7 @@ from flask import Flask
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
 # 0. TRADE CONFIGURATION
@@ -37,7 +38,7 @@ def status():
     return f"""
     <html>
         <head>
-            <title>Instant Execution Trading Bot ($40 Spot)</title>
+            <title>RSI Fast Execution Trading Bot ($40 Spot)</title>
             <meta http-equiv="refresh" content="5">
             <style>
                 body {{ background-color: #0d1117; color: #3fb950; font-family: monospace; padding: 20px; }}
@@ -46,8 +47,8 @@ def status():
             </style>
         </head>
         <body>
-            <h2>🤖 Real-Time Execution Spot Trading Bot (100 Tokens)</h2>
-            <p>Strategy: Instant Market Buy (Lower BB & > EMA100) | Instant Market Sell (Upper BB OR 3% Stop Loss)</p>
+            <h2>🤖 Real-Time RSI Execution Spot Bot (100 Tokens)</h2>
+            <p>Strategy: Market Buy (RSI-50 > 48 AND RSI-3 < 10) | Market Sell (RSI-3 > 85 OR 3% Stop Loss)</p>
             <hr>
             <div class="log-box">{logs_html if logs_html else "Initializing scanner and preloading data..."}</div>
         </body>
@@ -90,8 +91,8 @@ def get_target_altcoins():
         # Gaming & Metaverse & Storage (20)
         "SANDUSDT", "MANAUSDT", "GALAUSDT", "AXSUSDT", "CHZUSDT", 
         "BEAMXUSDT", "ILVUSDT", "ENJUSDT", "PIXELUSDT", "GMXUSDT",
-        "THETAUSDT", "JASMYUSDT", "CKBUSDT", "XLMUSDT", "STXUSDT",
-        "KSMUSDT", "GLMRUSDT", "ZILUSDT", "IOTAUSDT", "GMTUSDT"
+        "THETAUSDT", "JASMYUSDT", "CKBUSDT", "XLMUSDT", "KSMUSDT", 
+        "GLMRUSDT", "ZILUSDT", "IOTAUSDT", "GMTUSDT", "LUNAUSDT"
     ]
 
 # Global Trackers
@@ -106,55 +107,65 @@ for sym in symbols:
     buy_prices[sym] = 0.0
 
 # ==========================================
-# 3. FAST HISTORICAL CANDLE PRELOADER (IP SAFE)
+# 3. FAST PARALLEL HISTORICAL PRELOADER (IP SAFE)
 # ==========================================
+def fetch_single_symbol(sym):
+    try:
+        # RSI(50) হিসাবের জন্য অন্তত ৬০+ টি ক্যান্ডেল প্রয়োজন, আমরা safe limit হিসেবে ১০০ নিলাম
+        klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=100)
+        closes = [float(k[4]) for k in klines]
+        candle_data[sym] = closes
+    except Exception as e:
+        log_print(f"⚠️ Preload error for {sym}: {e}")
+
 def preload_history():
-    log_print("🔄 Fast Preloading 5M Historical Candles for 100 Tokens (IP Safe)...")
-    for sym in symbols:
-        try:
-            klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=120)
-            closes = [float(k[4]) for k in klines]
-            candle_data[sym] = closes
-            time.sleep(0.02)  # Render IP Ban ও Rate Limit রোদ করতে নিরাপদ ডিলে
-        except Exception as e:
-            log_print(f"⚠️ Preload error for {sym}: {e}")
+    log_print("⚡ Fast Parallel Preloading 5M Candles for 100 Tokens...")
+    # ১০টি থ্রেড ব্যবহার করে ৩-৫ সেকেন্ডের মধ্যে ১০০টি ক্যান্ডেল ডাটা লোড সম্পন্ন করবে
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(fetch_single_symbol, symbols)
     log_print("✅ Preload Complete! Live WebSocket Scanning Started.")
 
 # ==========================================
-# 4. INDICATOR CALCULATION
+# 4. INDICATOR CALCULATION (RSI 3 & RSI 50)
 # ==========================================
+def calculate_rsi(series, period):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
 def calculate_indicators(closes):
     df = pd.DataFrame({'close': closes})
-    df['SMA20'] = df['close'].rolling(window=20).mean()
-    df['STD20'] = df['close'].rolling(window=20).std()
-    df['Upper_BB'] = df['SMA20'] + (df['STD20'] * 2)
-    df['Lower_BB'] = df['SMA20'] - (df['STD20'] * 2)
-    df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
+    df['RSI_3'] = calculate_rsi(df['close'], 3)
+    df['RSI_50'] = calculate_rsi(df['close'], 50)
     
     latest = df.iloc[-1]
-    return latest['Lower_BB'], latest['Upper_BB'], latest['EMA100']
+    return latest['RSI_3'], latest['RSI_50']
 
 # ==========================================
 # 5. INSTANT EXECUTION STRATEGY LOGIC
 # ==========================================
 def process_tick(symbol, current_price):
-    if len(candle_data[symbol]) < 100:
+    if len(candle_data[symbol]) < 60:
         return
 
-    # লাইভ টিক প্রাইসকে ক্যান্ডেলের সাথে যুক্ত করে ইন্ডিকেটর হিসেব
+    # লাইভ টিক প্রাইসকে যুক্ত করে ইন্ডিকেটর ক্যালকুলেশন
     temp_closes = candle_data[symbol] + [current_price]
-    lower_bb, upper_bb, ema100 = calculate_indicators(temp_closes)
+    rsi_3, rsi_50 = calculate_indicators(temp_closes)
     
     has_pos = positions[symbol]
     entry_price = buy_prices[symbol]
 
-    # 🛒১. সাথে সাথে মার্কেট বাই (Lower BB-এর নিচে নামলে এবং > EMA100 হলে)
-    if not has_pos and current_price < lower_bb and current_price > ema100:
-        log_print(f"⚡ [INSTANT BUY TRIGGER] {symbol} | Price: ${current_price} < Lower BB: ${lower_bb:.4f} | EMA100: ${ema100:.4f}")
+    # 🛒 ১. মার্কেট বাই শর্ত: RSI(50) > 48 এবং RSI(3) < 10
+    if not has_pos and rsi_50 > 48 and rsi_3 < 10:
+        log_print(f"⚡ [BUY SIGNAL] {symbol} | Price: ${current_price} | RSI(50): {rsi_50:.2f} (>48) | RSI(3): {rsi_3:.2f} (<10)")
         try:
             order = client.order_market_buy(symbol=symbol, quoteOrderQty=TRADE_AMOUNT_USDT)
             
-            # নিখুঁত কেনা দাম (Entry Price) ট্র্যাকিং
+            # সঠিক এন্ট্রি প্রাইস নির্ধারণ
             executed_price = current_price
             if 'fills' in order and len(order['fills']) > 0:
                 executed_price = float(order['fills'][0]['price'])
@@ -168,15 +179,15 @@ def process_tick(symbol, current_price):
         except Exception as e:
             log_print(f"❌ [BUY EXCEPTION] {symbol}: {e}")
 
-    # 🚨 ২. সাথে সাথে ৩% স্টপ লস সেল (কেনা দাম থেকে ৩% নিচে নামলে)
+    # 🚨 ২. স্টপ লস সেল (কেনা দাম থেকে ৩% নিচে নামলে)
     elif has_pos and entry_price > 0 and current_price <= (entry_price * (1 - STOP_LOSS_PERCENT)):
         loss_pct = ((current_price - entry_price) / entry_price) * 100
         log_print(f"🚨 [STOP LOSS TRIGGERED] {symbol} | Price: ${current_price} ({loss_pct:.2f}% drop from ${entry_price})")
         execute_market_sell(symbol)
 
-    # 💰 ৩. সাথে সাথে প্রফিট টেক সেল (Upper BB-এর উপরে গেলে)
-    elif has_pos and current_price > upper_bb:
-        log_print(f"🎯 [PROFIT SELL TRIGGER] {symbol} | Price: ${current_price} > Upper BB: ${upper_bb:.4f}")
+    # 💰 ৩. প্রফিট সেল শর্ত: RSI(3) > 85 (Crosses Above 85)
+    elif has_pos and rsi_3 > 85:
+        log_print(f"🎯 [PROFIT SELL SIGNAL] {symbol} | Price: ${current_price} | RSI(3): {rsi_3:.2f} (>85)")
         execute_market_sell(symbol)
 
 def execute_market_sell(symbol):
@@ -217,7 +228,7 @@ def on_message(ws, message):
         # ২. ৫-মিনিটের ক্যান্ডেল ক্লোজ হলে মেমোরি আপডেট
         if is_closed and symbol in candle_data:
             candle_data[symbol].append(current_price)
-            if len(candle_data[symbol]) > 120:
+            if len(candle_data[symbol]) > 100:
                 candle_data[symbol].pop(0)
 
 def start_websocket():
@@ -234,7 +245,7 @@ def start_websocket():
 
 def start_bot():
     preload_history()
-    log_print("🤖 Real-Time Execution Bot Started! Scanning 100 tokens continuously...")
+    log_print("🤖 Real-Time RSI Strategy Bot Started! Scanning 100 tokens continuously...")
     while True:
         try:
             start_websocket()
