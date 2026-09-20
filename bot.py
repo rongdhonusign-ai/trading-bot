@@ -15,7 +15,7 @@ import logging
 # 0. TRADE CONFIGURATION
 # ==========================================
 TRADE_AMOUNT_USDT = 40.0   # প্রতি ট্রেডে ৪০ ডলারের মার্কেট বাই
-STOP_LOSS_PERCENT = 0.03    # ৩% স্টপ লস (0.03 = 3%) - ব্যাকআপ সেফটি
+STOP_LOSS_PERCENT = 0.03    # ৩% স্টপ লস (0.03 = 3%)
 
 # ==========================================
 # 1. LIVE LOG BUFFER & FLASK WEB SERVER
@@ -62,10 +62,10 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1
 client = Client(API_KEY, API_SECRET)
 
 def get_target_altcoins():
-    # সক্রিয় ও ভ্যালিড পেয়ারের তালিকা (অবৈধ পেয়ারগুলো বাদ দেওয়া হয়েছে)
+    # সক্রিয় ও ভ্যালিড অল্টকয়েনের তালিকা
     return [
         # Major & Layer 1 / Layer 2
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
+        "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
         "ADAUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "SUIUSDT", 
         "APTUSDT", "LTCUSDT", "ICPUSDT", "INJUSDT", "TIAUSDT", 
         "SEIUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "TRXUSDT", 
@@ -98,7 +98,7 @@ def get_target_altcoins():
 candle_data = {}
 positions = {}      # {symbol: True/False}
 buy_prices = {}     # {symbol: entry_price}
-last_scan_log = 0   # স্ক্যান লগ দেখানোর জন্য টাইমার
+last_scan_log = 0   
 
 symbols = list(set(get_target_altcoins()))
 for sym in symbols:
@@ -107,7 +107,7 @@ for sym in symbols:
     buy_prices[sym] = 0.0
 
 # ==========================================
-# 3. ULTRA-FAST HISTORICAL PRELOADER
+# 3. ULTRA-FAST HISTORICAL PRELOADER (IP SAFE)
 # ==========================================
 def preload_history():
     log_print("🔄 Fast Preloading Historical Data (IP Safe & Ultra Fast)...")
@@ -116,7 +116,7 @@ def preload_history():
             klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=60)
             closes = [float(k[4]) for k in klines]
             candle_data[sym] = closes
-            time.sleep(0.01)  # IP Ban এড়াতে সিকিউর ডিলে
+            time.sleep(0.01)  # IP Ban এড়াতে সেফ ডিলে
         except Exception as e:
             log_print(f"⚠️ Preload error for {sym}: {e}")
     log_print("✅ Preload Complete! Live WebSocket Scanning Started.")
@@ -177,16 +177,16 @@ def process_tick(symbol, current_price):
         log_print(f"🎯 [PROFIT SELL SIGNAL] {symbol} | Price: ${current_price} | RSI(3): {rsi3:.2f} > 85")
         execute_market_sell(symbol)
 
-    # 🚨 ৩. ৩% স্টপ লস সেল
+    # 🚨 ৩. ৩% স্টপ লস সেল (ব্যাকআপ সেফটি)
     elif has_pos and entry_price > 0 and current_price <= (entry_price * (1 - STOP_LOSS_PERCENT)):
         loss_pct = ((current_price - entry_price) / entry_price) * 100
         log_print(f"🚨 [STOP LOSS TRIGGERED] {symbol} | Price: ${current_price} ({loss_pct:.2f}% drop)")
         execute_market_sell(symbol)
 
-    # 🔍 স্ক্যানিং কনফার্মেশন মেসেজ (প্রতি ১ মিনিট পর পর লগে প্রিন্ট হবে)
+    # স্ক্যানিং কনফার্মেশন লগ (প্রতি ১ মিনিট পর পর লগে আসবে)
     if time.time() - last_scan_log > 60:
         last_scan_log = time.time()
-        log_print(f"🔍 [ACTIVE SCANNING] Currently monitoring live ticks for {len(symbols)} coins. Last checked: {symbol} (${current_price}) | RSI(3): {rsi3:.1f}")
+        log_print(f"🔍 [ACTIVE SCANNING] Monitoring live ticks for {len(symbols)} altcoins. Last checked: {symbol} (${current_price}) | RSI(3): {rsi3:.1f}")
 
 def execute_market_sell(symbol):
     try:
