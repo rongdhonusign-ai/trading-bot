@@ -8,12 +8,18 @@ import numpy as np
 import websocket
 from flask import Flask
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 import logging
+
+# ==========================================
+# 0. TRADE CONFIGURATION
+# ==========================================
+# 💸 প্রতি বাই সিগন্যালে ঠিক ৪০ ডলারের (USDT) মার্কেট অর্ডার এক্সিকিউট হবে
+TRADE_AMOUNT_USDT = 40  
 
 # ==========================================
 # 1. LIVE LOG BUFFER & FLASK WEB SERVER
 # ==========================================
-# সাম্প্রতিক ১০০টি লগ মেমরিতে জমা রাখার জন্য তৈরি
 log_buffer = collections.deque(maxlen=100)
 
 def log_print(message):
@@ -23,20 +29,18 @@ def log_print(message):
 
 app = Flask(__name__)
 
-# Flask-এর অতিরিক্ত সার্ভিস লগ (GET /status 200) হাইড রাখা হলো
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 @app.route('/')
 @app.route('/status')
 def status():
-    # ব্রাউজারে টার্মিনালের মতো লাইভ লগ দেখার এইচটিএমএল ডিজাইন
     logs_html = "<br>".join(log_buffer)
     return f"""
     <html>
         <head>
-            <title>Trading Bot Dashboard</title>
-            <meta http-equiv="refresh" content="10"> <!-- প্রতি ১০ সেকেন্ডে পেজ অটো রিফ্রেশ হবে -->
+            <title>Live Trading Bot Dashboard ($40 Market Order)</title>
+            <meta http-equiv="refresh" content="10">
             <style>
                 body {{ 
                     background-color: #0d1117; 
@@ -59,8 +63,8 @@ def status():
             </style>
         </head>
         <body>
-            <h2>🤖 Trading Bot Live Dashboard (EMA 100)</h2>
-            <p>Status: Active & Scanning 47 Altcoins | Auto-refreshes every 10s</p>
+            <h2>🤖 Real Spot Market Trading Bot ($40 USDT)</h2>
+            <p>Trade Order: Market Buy/Sell | Trade Amount: ${TRADE_AMOUNT_USDT} USDT</p>
             <hr>
             <div class="log-box">
                 {logs_html if logs_html else "Waiting for initial scanning logs..."}
@@ -102,7 +106,7 @@ for sym in symbols:
     positions[sym] = False
 
 # ==========================================
-# 3. HISTORICAL CANDLE PRELOADER (EMA 100)
+# 3. HISTORICAL CANDLE PRELOADER
 # ==========================================
 def preload_history():
     log_print("🔄 Preloading historical candle data for EMA 100...")
@@ -111,13 +115,13 @@ def preload_history():
             klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=150)
             closes = [float(k[4]) for k in klines]
             candle_data[sym] = closes
-            log_print(f"✅ [{sym}] History Loaded: ({len(closes)} candles)")
-            time.sleep(0.1)
+            time.sleep(0.05)
         except Exception as e:
             log_print(f"⚠️ Error loading history for {sym}: {e}")
+    log_print("✅ Preload Complete!")
 
 # ==========================================
-# 4. INDICATOR & STRATEGY LOGIC (EMA 100)
+# 4. INDICATOR & MARKET ORDER LOGIC
 # ==========================================
 def calculate_indicators(closes):
     df = pd.DataFrame({'close': closes})
@@ -137,15 +141,48 @@ def calculate_indicators(closes):
 def evaluate_strategy(symbol, close, lower_bb, upper_bb, ema100):
     has_pos = positions[symbol]
     
-    # 🛒 BUY CONDITION
+    # 🛒 REAL MARKET BUY CONDITION ($40 USDT)
     if not has_pos and close <= lower_bb and close > ema100:
-        log_print(f"🚀 [BUY SIGNAL TRIGGERED] {symbol} | Price: ${close} | Lower BB: ${lower_bb:.4f} | EMA 100: ${ema100:.4f}")
-        positions[symbol] = True
+        log_print(f"🚀 [BUY SIGNAL] {symbol} | Price: ${close} | Executing $40 Market Buy...")
+        try:
+            # 🟢 বাইন্যান্স স্পট মার্কেট বাই অর্ডার ($40 USDT)
+            order = client.order_market_buy(
+                symbol=symbol,
+                quoteOrderQty=TRADE_AMOUNT_USDT
+            )
+            log_print(f"✅ [MARKET BUY SUCCESS] {symbol} | Order ID: {order['orderId']}")
+            positions[symbol] = True
 
-    # 💰 SELL CONDITION
+        except BinanceAPIException as e:
+            log_print(f"❌ [BINANCE BUY ERROR] {symbol}: {e.message}")
+        except Exception as e:
+            log_print(f"❌ [BUY EXCEPTION] {symbol}: {e}")
+
+    # 💰 REAL MARKET SELL CONDITION (সম্পূর্ণ ব্যালেন্স সেল হবে)
     elif has_pos and close >= upper_bb:
-        log_print(f"🎯 [SELL SIGNAL TRIGGERED] {symbol} | Price: ${close} | Upper BB: ${upper_bb:.4f}")
-        positions[symbol] = False
+        log_print(f"🎯 [SELL SIGNAL] {symbol} | Price: ${close} | Executing Market Sell...")
+        try:
+            # 🔴 অ্যাকাউন্টে ফ্রি থাকা নির্দিষ্ট কয়েনটির পরিমাণ জেনে নেওয়া
+            asset = symbol.replace("USDT", "")
+            balance_info = client.get_asset_balance(asset=asset)
+            free_qty = float(balance_info['free']) if balance_info else 0.0
+
+            if free_qty > 0:
+                # 🔴 বাইন্যান্স স্পট মার্কেট সেল অর্ডার
+                order = client.order_market_sell(
+                    symbol=symbol,
+                    quantity=free_qty
+                )
+                log_print(f"✅ [MARKET SELL SUCCESS] {symbol} | Order ID: {order['orderId']}")
+                positions[symbol] = False
+            else:
+                log_print(f"⚠️ [SELL SKIPPED] {symbol}: Balance is 0.")
+                positions[symbol] = False
+
+        except BinanceAPIException as e:
+            log_print(f"❌ [BINANCE SELL ERROR] {symbol}: {e.message}")
+        except Exception as e:
+            log_print(f"❌ [SELL EXCEPTION] {symbol}: {e}")
 
 # ==========================================
 # 5. WEBSOCKET LISTENER FOR 5M CANDLES
@@ -159,22 +196,16 @@ def on_message(ws, message):
         symbol = data['s']
         close_price = float(k['c'])
         
-        if is_closed:
-            if symbol in candle_data:
-                candle_data[symbol].append(close_price)
-                
-                if len(candle_data[symbol]) > 150:
-                    candle_data[symbol].pop(0)
-                
-                if len(candle_data[symbol]) >= 100:
-                    close, lower_bb, upper_bb, ema100 = calculate_indicators(candle_data[symbol])
-                    
-                    # লাইভ লগ তৈরি
-                    log_print(f"📊 [5M SCAN {symbol}] Close: ${close:.4f} | Lower BB: ${lower_bb:.4f} | Upper BB: ${upper_bb:.4f} | EMA 100: ${ema100:.4f}")
-                    
-                    evaluate_strategy(symbol, close, lower_bb, upper_bb, ema100)
-                else:
-                    log_print(f"⏳ [{symbol}] Gathering Candle History for EMA 100: ({len(candle_data[symbol])}/100)")
+        if is_closed and symbol in candle_data:
+            candle_data[symbol].append(close_price)
+            
+            if len(candle_data[symbol]) > 150:
+                candle_data[symbol].pop(0)
+            
+            if len(candle_data[symbol]) >= 100:
+                close, lower_bb, upper_bb, ema100 = calculate_indicators(candle_data[symbol])
+                log_print(f"📊 [5M SCAN {symbol}] Close: ${close:.4f} | Lower BB: ${lower_bb:.4f} | Upper BB: ${upper_bb:.4f} | EMA 100: ${ema100:.4f}")
+                evaluate_strategy(symbol, close, lower_bb, upper_bb, ema100)
 
 def start_websocket():
     streams = [f"{sym.lower()}@kline_5m" for sym in symbols]
@@ -190,7 +221,7 @@ def start_websocket():
 
 def start_bot():
     preload_history()
-    log_print("🤖 Bot Trading Logic (EMA 100) Started Successfully...")
+    log_print("🤖 Real Trading Engine Active ($40 USDT Spot Market Buy/Sell)...")
     start_websocket()
 
 # ==========================================
