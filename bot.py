@@ -46,7 +46,7 @@ def status():
             </style>
         </head>
         <body>
-            <h2>🤖 Real-Time RSI Strategy Trading Bot (100 Tokens)</h2>
+            <h2>🤖 Real-Time RSI Strategy Trading Bot (Active Scanning)</h2>
             <p>Strategy: Market Buy (RSI50 > 50 AND RSI3 < 5) | Market Sell (RSI3 > 85 OR 3% Stop Loss)</p>
             <hr>
             <div class="log-box">{logs_html if logs_html else "Initializing scanner and preloading data..."}</div>
@@ -55,51 +55,52 @@ def status():
     """, 200
 
 # ==========================================
-# 2. BINANCE CLIENT SETUP & 100 TARGET ALTCOINS
+# 2. BINANCE CLIENT SETUP & VALID ALTCOINS
 # ==========================================
 API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
 client = Client(API_KEY, API_SECRET)
 
 def get_target_altcoins():
+    # সক্রিয় ও ভ্যালিড পেয়ারের তালিকা (অবৈধ পেয়ারগুলো বাদ দেওয়া হয়েছে)
     return [
-        # Major & Layer 1 / Layer 2 (35)
+        # Major & Layer 1 / Layer 2
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
         "ADAUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "SUIUSDT", 
         "APTUSDT", "LTCUSDT", "ICPUSDT", "INJUSDT", "TIAUSDT", 
         "SEIUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "TRXUSDT", 
         "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "FLOWUSDT", "STXUSDT", 
         "KAVAUSDT", "IMXUSDT", "BCHUSDT", "ETCUSDT", "FILUSDT", 
-        "HBARUSDT", "VETUSDT", "POLUSDT", "ROSEUSDT", "MINAUSDT", 
+        "HBARUSDT", "VETUSDT", "ROSEUSDT", "MINAUSDT", 
         
-        # Meme Coins (10)
+        # Meme Coins
         "DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "FLOKIUSDT", 
         "BONKUSDT", "MEMEUSDT", "1000SATSUSDT", "BOMEUSDT", "PEOPLEUSDT",
 
-        # AI & Big Data (10)
-        "FETUSDT", "RENDERUSDT", "TAOUSDT", "RNDRUSDT", "AGIXUSDT", 
-        "OCEANUSDT", "AKTUSDT", "WLDUSDT", "ARKMUSDT", "AIUSDT",
+        # AI & Big Data
+        "FETUSDT", "RENDERUSDT", "TAOUSDT", "WLDUSDT", "ARKMUSDT", "AIUSDT",
 
-        # DeFi & Infrastructure (25)
+        # DeFi & Infrastructure
         "LINKUSDT", "UNIUSDT", "AAVEUSDT", "MKRUSDT", "CRVUSDT", 
         "SNXUSDT", "COMPUSDT", "LDOUSDT", "QNTUSDT", "DYDXUSDT", 
         "PENDLEUSDT", "JUPUSDT", "RAYUSDT", "ENAUSDT", "RUNEUSDT", 
         "CAKEUSDT", "1INCHUSDT", "SUSHIUSDT", "RDNTUSDT", "JTOUSDT", 
         "ORDIUSDT", "BLURUSDT", "ARUSDT", "ANKRUSDT", "ONDOUSDT",
 
-        # Gaming & Metaverse & Storage (20)
+        # Gaming & Metaverse & Storage
         "SANDUSDT", "MANAUSDT", "GALAUSDT", "AXSUSDT", "CHZUSDT", 
         "BEAMXUSDT", "ILVUSDT", "ENJUSDT", "PIXELUSDT", "GMXUSDT", 
         "THETAUSDT", "JASMYUSDT", "CKBUSDT", "XLMUSDT", "KSMUSDT", 
-        "GLMRUSDT", "ZILUSDT", "IOTAUSDT", "GMTUSDT", "SYSUSDT"
+        "GLMRUSDT", "ZILUSDT", "IOTAUSDT", "GMTUSDT"
     ]
 
 # Global Trackers
 candle_data = {}
 positions = {}      # {symbol: True/False}
 buy_prices = {}     # {symbol: entry_price}
+last_scan_log = 0   # স্ক্যান লগ দেখানোর জন্য টাইমার
 
-symbols = list(set(get_target_altcoins()))  # Duplicate সরাতে set ব্যবহার
+symbols = list(set(get_target_altcoins()))
 for sym in symbols:
     candle_data[sym] = []
     positions[sym] = False
@@ -112,21 +113,20 @@ def preload_history():
     log_print("🔄 Fast Preloading Historical Data (IP Safe & Ultra Fast)...")
     for sym in symbols:
         try:
-            # RSI(50) হিসাবের জন্য ৬০টি ক্যান্ডেলই যথেষ্ট, যা প্রিলোড টাইম কমিয়ে আনবে
             klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=60)
             closes = [float(k[4]) for k in klines]
             candle_data[sym] = closes
-            time.sleep(0.01)  # IP Ban এড়াতে খুব ছোট সিকিউর ডিলে
+            time.sleep(0.01)  # IP Ban এড়াতে সিকিউর ডিলে
         except Exception as e:
             log_print(f"⚠️ Preload error for {sym}: {e}")
-    log_print("✅ Preload Complete! WebSocket Scanner active now.")
+    log_print("✅ Preload Complete! Live WebSocket Scanning Started.")
 
 # ==========================================
 # 4. RSI INDICATOR CALCULATION
 # ==========================================
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
-        return 50.0  # পর্যাপ্ত ডেটা না থাকলে নিউট্রাল মান ফেরত দেবে
+        return 50.0
     
     series = pd.Series(closes)
     delta = series.diff()
@@ -142,12 +142,11 @@ def calculate_rsi(closes, period=14):
 # 5. INSTANT EXECUTION STRATEGY LOGIC
 # ==========================================
 def process_tick(symbol, current_price):
+    global last_scan_log
     if len(candle_data[symbol]) < 52:
         return
 
-    # লাইভ টিক প্রাইজ যুক্ত করে ইন্ডিকেটর ক্যালকুলেশন
     temp_closes = candle_data[symbol] + [current_price]
-    
     rsi50 = calculate_rsi(temp_closes, period=50)
     rsi3 = calculate_rsi(temp_closes, period=3)
     
@@ -173,16 +172,21 @@ def process_tick(symbol, current_price):
         except Exception as e:
             log_print(f"❌ [BUY EXCEPTION] {symbol}: {e}")
 
-    # 💰 ২. শর্ত: RSI(3) > 85 হলে সাথে সাথে মার্কেট সেল (Take Profit)
+    # 💰 ২. শর্ত: RSI(3) > 85 হলে সাথে সাথে মার্কেট সেল
     elif has_pos and rsi3 > 85:
         log_print(f"🎯 [PROFIT SELL SIGNAL] {symbol} | Price: ${current_price} | RSI(3): {rsi3:.2f} > 85")
         execute_market_sell(symbol)
 
-    # 🚨 ৩. স্টপ লস ব্যাকআপ (৩% নিচে গেলে অটো সেল)
+    # 🚨 ৩. ৩% স্টপ লস সেল
     elif has_pos and entry_price > 0 and current_price <= (entry_price * (1 - STOP_LOSS_PERCENT)):
         loss_pct = ((current_price - entry_price) / entry_price) * 100
         log_print(f"🚨 [STOP LOSS TRIGGERED] {symbol} | Price: ${current_price} ({loss_pct:.2f}% drop)")
         execute_market_sell(symbol)
+
+    # 🔍 স্ক্যানিং কনফার্মেশন মেসেজ (প্রতি ১ মিনিট পর পর লগে প্রিন্ট হবে)
+    if time.time() - last_scan_log > 60:
+        last_scan_log = time.time()
+        log_print(f"🔍 [ACTIVE SCANNING] Currently monitoring live ticks for {len(symbols)} coins. Last checked: {symbol} (${current_price}) | RSI(3): {rsi3:.1f}")
 
 def execute_market_sell(symbol):
     try:
@@ -191,7 +195,6 @@ def execute_market_sell(symbol):
         free_qty = float(balance_info['free']) if balance_info else 0.0
 
         if free_qty > 0:
-            # Step Size অনুযায়ী Precision সামঞ্জস্য করা
             info = client.get_symbol_info(symbol)
             step_size = None
             for f in info['filters']:
@@ -227,11 +230,9 @@ def on_message(ws, message):
         current_price = float(k['c'])
         is_closed = k['x']
 
-        # ১. লাইভ টিকে রিয়েল-টাইম চেক
         if symbol in candle_data:
             process_tick(symbol, current_price)
 
-        # ২. ক্যান্ডেল ক্লোজ হলে মেমোরি ক্লিনআপ
         if is_closed and symbol in candle_data:
             candle_data[symbol].append(current_price)
             if len(candle_data[symbol]) > 80:
@@ -252,7 +253,7 @@ def start_websocket():
 
 def start_bot():
     preload_history()
-    log_print("🤖 Real-Time RSI Bot Active! Scanning 100 Altcoins continuous live stream...")
+    log_print("🤖 Real-Time RSI Bot Active! Scanning target coins continuously...")
     while True:
         try:
             start_websocket()
