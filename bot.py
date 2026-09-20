@@ -3,258 +3,170 @@ import time
 import json
 import threading
 import pandas as pd
-import ccxt
+import numpy as np
 import websocket
-from flask import Flask, render_template_string
+from flask import Flask
+from binance.client import Client
+import logging
 
 # ==========================================
-# 1. FLASK APP & LOGGING SETUP
+# 1. FLASK WEB SERVER & LOGGING SETUP
 # ==========================================
 app = Flask(__name__)
-bot_logs = []
 
-def add_log(message):
-    timestamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
-    log_line = f"{timestamp} {message}"
-    print(log_line)
-    bot_logs.append(log_line)
-    if len(bot_logs) > 100:  # লগের সাইজ ১০০ রাখা হলো
-        bot_logs.pop(0)
+# 🛠️ Flask-এর Werkzeug সার্ভার লগ (GET /status 200) স্থায়ীভাবে ডিজেবল করা হলো
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+@app.route('/')
+@app.route('/status')
+def status():
+    return "Trading Bot is Live and Operational!", 200
 
 # ==========================================
-# 2. CONFIGURATION & TARGET ALTCOINS
+# 2. BINANCE CLIENT SETUP & TARGET ALTCOINS
 # ==========================================
-trade_amount_usdt = 40.0  # 🛠️ বাই অ্যামাউন্ট ৪০ ডলার করা হলো    
+# আপনার প্রয়োজন অনুযায়ী API Key এবং Secret ব্যবহার করুন
+API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
 
-trade_exchange = ccxt.binance({
-    'apiKey': os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M'),
-    'secret': os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV'),
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'spot',
-        'adjustForTimeDifference': True,
-        'recvWindow': 10000
-    }
-})
+client = Client(API_KEY, API_SECRET)
 
 def get_target_altcoins():
+    """বট যে ৪৭টি টোকেন স্ক্যান করবে তার তালিকা"""
     return [
-        'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt', 'adausdt', 'dogeusdt', 'avaxusdt', 
-        'dotusdt', 'linkusdt', 'nearusdt', 'suiusdt', 'fetusdt', 'aptusdt', 'ltcusdt',
-        'uniusdt', 'icpusdt', 'injusdt', 'renderusdt', 'tiausdt', 'seiusdt', 'arbusdt',
-        'opusdt', 'wifusdt', 'flokiusdt', 'atomusdt', 'trxusdt', 'xlmusdt', 'ftmusdt', 
-        'sandusdt', 'manausdt', 'galausdt', 'algousdt', 'ldousdt', 'qntusdt', 'aaveusdt', 
-        'egldusdt', 'flowusdt', 'chzusdt', 'axsusdt', 'crvusdt', 'grtusdt', 'snxusdt', 
-        'stxusdt', 'mkrusdt', 'kavausdt', 'compusdt', 'imxusdt'
+        "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", 
+        "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "NEARUSDT", 
+        "SUIUSDT", "FETUSDT", "APTUSDT", "LTCUSDT", "UNIUSDT", 
+        "ICPUSDT", "INJUSDT", "RENDERUSDT", "TIAUSDT", "SEIUSDT", 
+        "ARBUSDT", "OPUSDT", "WIFUSDT", "FLOKIUSDT", "ATOMUSDT", 
+        "TRXUSDT", "XLMUSDT", "FTMUSDT", "SANDUSDT", "MANAUSDT", 
+        "GALAUSDT", "ALGOUSDT", "LDOUSDT", "QNTUSDT", "AAVEUSDT", 
+        "EGLDUSDT", "FLOWUSDT", "CHZUSDT", "AXSUSDT", "CRVUSDT", 
+        "GRTUSDT", "SNXUSDT", "STXUSDT", "MKRUSDT", "KAVAUSDT", 
+        "COMPUSDT", "IMXUSDT"
     ]
 
-target_symbols = get_target_altcoins()
+# Global Data Store & State Tracking
+candle_data = {}
+positions = {}
 
-# 🛠️ বড় হাতের এবং স্ল্যাশ যুক্ত সিম্বল ('KAVA/USDT') দিয়ে ডিকশনারি সেটআপ
-formatted_symbols = [sym.upper().replace('USDT', '/USDT') for sym in target_symbols]
-
-prices_history = {sym: [] for sym in target_symbols}
-positions = {sym: False for sym in formatted_symbols}
-entry_prices = {sym: 0.0 for sym in formatted_symbols}
-position_amounts = {sym: 0.0 for sym in formatted_symbols}
+symbols = get_target_altcoins()
+for sym in symbols:
+    candle_data[sym] = []
+    positions[sym] = False  # শুরুতে কোনো পজিশন কেনা নেই
 
 # ==========================================
-# 3. TECHNICAL INDICATORS & PRELOAD HISTORY
+# 3. HISTORICAL CANDLE PRELOADER
 # ==========================================
-def calculate_indicators(df):
-    # Bollinger Bands (20 Period)
-    df['sma_20'] = df['close'].rolling(window=20).mean()
-    df['std_20'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['sma_20'] + (df['std_20'] * 2.0)
-    df['bb_lower'] = df['sma_20'] - (df['std_20'] * 2.0)
-    
-    # 🎯 TREND FILTER: EMA 200
-    df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
-    
-    return df
-
 def preload_history():
-    add_log("⏳ Preloading 5M Candle History (250 candles) for EMA 200...")
-    for sym in target_symbols:
-        formatted_symbol = sym.upper().replace('USDT', '/USDT')
+    """EMA 200 ক্যালকুলেশনের জন্য ২০০-২৫০টি ক্যান্ডেল প্রিলোড করা"""
+    print("🔄 Preloading historical candle data for all symbols...")
+    for sym in symbols:
         try:
-            # EMA 200 সঠিকভাবে হিসাব করতে ২৫০টি ক্যান্ডেল লোড করা হচ্ছে
-            ohlcv = trade_exchange.fetch_ohlcv(formatted_symbol, timeframe='5m', limit=250)
-            history = []
-            for candle in ohlcv[:-1]:  # রানিং ক্যান্ডেল বাদ দিয়ে ক্লোজড ক্যান্ডেল
-                history.append({
-                    'open': candle[1],
-                    'high': candle[2],
-                    'low': candle[3],
-                    'close': candle[4]
-                })
-            prices_history[sym] = history  # ২৫০টি ক্যান্ডেল স্টোর
-            add_log(f"✅ Loaded history for {formatted_symbol}")
-            
-            # 🛠️ API রেট লিমিট এড়াতে ০.৩ সেকেন্ডের বিরতি
-            time.sleep(0.3)
-            
+            klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=250)
+            closes = [float(k[4]) for k in klines]
+            candle_data[sym] = closes
+            print(f"✅ [{sym}] History Loaded: ({len(closes)} candles)")
+            time.sleep(0.1)  # Binance API Rate Limit এড়াতে বিরতি
         except Exception as e:
-            add_log(f"⚠️ History preload failed for {formatted_symbol}: {e}")
+            print(f"⚠️ Error loading history for {sym}: {e}")
 
 # ==========================================
-# 4. WEBSOCKET & TRADE LOGIC (UPDATED WITH EMA 200)
+# 4. INDICATOR & STRATEGY LOGIC
 # ==========================================
-def process_kline_data(symbol, open_p, close_p, high_p, low_p, is_closed):
-    formatted_symbol = symbol.upper().replace('USDT', '/USDT')
-    base_currency = formatted_symbol.split('/')[0]  # যেমন: ETH, SOL, KAVA
+def calculate_indicators(closes):
+    """Bollinger Bands (20, 2) এবং EMA 200 গণনা করা"""
+    df = pd.DataFrame({'close': closes})
     
-    if is_closed:
-        prices_history[symbol].append({
-            'open': open_p,
-            'high': high_p,
-            'low': low_p,
-            'close': close_p
-        })
-        if len(prices_history[symbol]) > 300:
-            prices_history[symbol].pop(0)
+    # Bollinger Bands
+    df['SMA20'] = df['close'].rolling(window=20).mean()
+    df['STD20'] = df['close'].rolling(window=20).std()
+    df['Upper_BB'] = df['SMA20'] + (df['STD20'] * 2)
+    df['Lower_BB'] = df['SMA20'] - (df['STD20'] * 2)
+    
+    # EMA 200
+    df['EMA200'] = df['close'].ewm(span=200, adjust=False).mean()
+    
+    latest = df.iloc[-1]
+    return latest['close'], latest['Lower_BB'], latest['Upper_BB'], latest['EMA200']
 
-    # EMA 200 হিসাবের জন্য কমপক্ষে ২০০টি ক্যান্ডেল প্রয়োজন
-    if len(prices_history[symbol]) >= 200:
-        df = pd.DataFrame(prices_history[symbol])
-        
-        # রানিং ক্যান্ডেলের লাইভ প্রাইস আপডেট
-        if not is_closed:
-            running_candle = pd.DataFrame([{
-                'open': open_p, 'high': high_p, 'low': low_p, 'close': close_p
-            }])
-            df = pd.concat([df, running_candle], ignore_index=True)
+def evaluate_strategy(symbol, close, lower_bb, upper_bb, ema200):
+    """বাই/সেল শর্ত যাচাই ও এক্সিকিউশন"""
+    has_pos = positions[symbol]
+    
+    # 🛒 BUY CONDITION: (Close <= Lower BB) AND (Close > EMA 200) AND (No Position)
+    if not has_pos and close <= lower_bb and close > ema200:
+        print(f"🚀 [BUY SIGNAL TRIGGERED] {symbol} | Price: ${close} | Lower BB: ${lower_bb:.4f} | EMA 200: ${ema200:.4f}")
+        # এখানে Binance Buy Order বসানোর ফাংশন থাকবে
+        positions[symbol] = True
 
-        df = calculate_indicators(df)
-        last_row = df.iloc[-1]
-        c_close = float(last_row['close'])
-        bb_lower = float(last_row['bb_lower'])
-        bb_upper = float(last_row['bb_upper'])
-        ema_200 = float(last_row['ema_200'])
+    # 💰 SELL CONDITION: (Close >= Upper BB) AND (Has Position)
+    elif has_pos and close >= upper_bb:
+        print(f"🎯 [SELL SIGNAL TRIGGERED] {symbol} | Price: ${close} | Upper BB: ${upper_bb:.4f}")
+        # এখানে Binance Sell Order বসানোর ফাংশন থাকবে
+        positions[symbol] = False
 
-        if is_closed:
-            add_log(f"📊 [5M SCAN {formatted_symbol}] Close: ${c_close} | Lower BB: ${bb_lower:.4f} | Upper BB: ${bb_upper:.4f} | EMA 200: ${ema_200:.4f}")
-
-            # 🛠️ বাইন্যান্স ওয়ালেট ব্যালেন্স চেক করা
-            actual_balance = 0.0
-            has_position = False
-            try:
-                balance = trade_exchange.fetch_balance()
-                actual_balance = float(balance['free'].get(base_currency, 0.0))
-                
-                # ওয়ালেটে যদি এই কয়েন $5.0 USDT-এর বেশি থাকে, ধরে নেওয়া হবে পজিশন কেনা আছে
-                if (actual_balance * c_close) >= 5.0:
-                    has_position = True
-            except Exception as e:
-                add_log(f"⚠️ Balance Check Failed for {formatted_symbol}: {e}")
-                has_position = positions.get(formatted_symbol, False)
-
-            # 🟢 BUY STRATEGY (WITH TREND FILTER)
-            # কন্ডিশন: ১. কোনো খোলা পজিশন থাকা যাবে না
-            #          ২. দাম Lower BB এর নিচে বা সমান হতে হবে
-            #          ৩. দাম অবশ্যই EMA 200 এর উপরে থাকতে হবে (Uptrend Filter)
-            if not has_position and c_close <= bb_lower and c_close > ema_200:
-                add_log(f"🎯 BUY SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} <= Lower BB: ${bb_lower:.4f} AND Price > EMA 200: ${ema_200:.4f}")
-                try:
-                    raw_amount = trade_amount_usdt / c_close
-                    amount_to_buy = float(trade_exchange.amount_to_precision(formatted_symbol, raw_amount))
-                    
-                    order = trade_exchange.create_market_buy_order(formatted_symbol, amount_to_buy)
-                    positions[formatted_symbol] = True
-                    add_log(f"✅ BUY EXECUTED for {formatted_symbol} | Order ID: {order['id']}")
-                except Exception as e:
-                    add_log(f"❌ BUY ERROR for {formatted_symbol}: {e}")
-
-            # 🔴 SELL STRATEGY
-            elif has_position and c_close >= bb_upper:
-                add_log(f"🎯 SELL SIGNAL MATCHED: {formatted_symbol} | Price: ${c_close} >= Upper BB: ${bb_upper:.4f}")
-                try:
-                    amount_to_sell = float(trade_exchange.amount_to_precision(formatted_symbol, actual_balance))
-                    
-                    order = trade_exchange.create_market_sell_order(formatted_symbol, amount_to_sell)
-                    positions[formatted_symbol] = False
-                    add_log(f"✅ SELL EXECUTED for {formatted_symbol} | Order ID: {order['id']}")
-                except Exception as e:
-                    add_log(f"❌ SELL ERROR for {formatted_symbol}: {e}")
-    else:
-        if is_closed:
-            add_log(f"⏳ [{formatted_symbol}] Gathering Candle History for EMA 200: ({len(prices_history[symbol])}/200)")
-
+# ==========================================
+# 5. WEBSOCKET LISTENER FOR 5M CANDLES
+# ==========================================
 def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        if 'data' in data:
-            kline = data['data']['k']
-            sym = kline['s'].lower()
-            if sym in target_symbols:
-                open_price = float(kline['o'])
-                close_price = float(kline['c'])
-                high_price = float(kline['h'])
-                low_price = float(kline['l'])
-                is_closed = kline['x']
-                process_kline_data(sym, open_price, close_price, high_price, low_price, is_closed)
-    except Exception as e:
-        add_log(f"⚠️ Message Processing Error: {e}")
+    data = json.loads(message)
+    
+    if 'k' in data:
+        k = data['k']
+        is_closed = k['x']
+        symbol = data['s']
+        close_price = float(k['c'])
+        
+        # কেবল ৫-মিনিটের ক্যান্ডেল ক্লোজ হলে প্রসেস করবে
+        if is_closed:
+            if symbol in candle_data:
+                candle_data[symbol].append(close_price)
+                
+                # হিস্ট্রি ক্যান্ডেল ২৫০টির মধ্যে সীমাবদ্ধ রাখা
+                if len(candle_data[symbol]) > 250:
+                    candle_data[symbol].pop(0)
+                
+                # যদি ক্যান্ডেল সংখ্যা ২০০ বা তার বেশি হয়
+                if len(candle_data[symbol]) >= 200:
+                    close, lower_bb, upper_bb, ema200 = calculate_indicators(candle_data[symbol])
+                    
+                    # পরিচ্ছন্ন ট্র্যাকিং প্রিন্ট
+                    print(f"📊 [5M SCAN {symbol}] Close: ${close:.4f} | Lower BB: ${lower_bb:.4f} | Upper BB: ${upper_bb:.4f} | EMA 200: ${ema200:.4f}")
+                    
+                    # স্ট্রাটেজি ইভালুয়েট
+                    evaluate_strategy(symbol, close, lower_bb, upper_bb, ema200)
+                else:
+                    print(f"⏳ [{symbol}] Gathering Candle History for EMA 200: ({len(candle_data[symbol])}/200)")
 
-def on_error(ws, error):
-    add_log(f"🚨 WebSocket Error: {error}")
-
-def on_close(ws, close_status_code, close_msg):
-    add_log("🔌 WebSocket Connection Closed. Reconnecting...")
-    time.sleep(5)
-    run_websocket()
-
-def run_websocket():
-    stream_names = "/".join([f"{sym}@kline_5m" for sym in target_symbols])
-    ws_url = f"wss://stream.binance.com:9443/stream?streams={stream_names}"
+def start_websocket():
+    # ৪৭টি টোকেনের ৫m kline স্ট্রিম URL তৈরি
+    streams = [f"{sym.lower()}@kline_5m" for sym in symbols]
+    socket_url = f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}"
+    
     ws = websocket.WebSocketApp(
-        ws_url,
+        socket_url,
         on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
+        on_error=lambda ws, err: print(f"❌ WS Error: {err}"),
+        on_close=lambda ws, code, msg: print("🔌 WS Connection Closed")
     )
     ws.run_forever()
 
 def start_bot():
     preload_history()
-    run_websocket()
-
-# ==========================================
-# 5. FLASK ROUTES
-# ==========================================
-@app.route('/')
-def home():
-    return "Binance Spot Trading Bot is Live & Running!"
-
-@app.route('/status')
-def status():
-    logs_display = "<br>".join(bot_logs[-60:]) if bot_logs else "No logs yet."
-    html = f"""
-    <html>
-        <head>
-            <title>Bot Status</title>
-            <meta http-equiv="refresh" content="10">
-            <style>
-                body {{ font-family: monospace; background-color: #121212; color: #00ff00; padding: 20px; }}
-                h2 {{ color: #ffffff; }}
-                .log-box {{ background-color: #000; border: 1px solid #333; padding: 15px; border-radius: 5px; }}
-            </style>
-        </head>
-        <body>
-            <h2>🤖 Binance Spot Bot Status Dashboard</h2>
-            <div class="log-box">{logs_display}</div>
-        </body>
-    </html>
-    """
-    return html, 200
+    print("🤖 Bot Trading Logic Started Successfully...")
+    start_websocket()
 
 # ==========================================
 # 6. MAIN EXECUTION
 # ==========================================
 if __name__ == '__main__':
+    # ব্যাকগ্রাউন্ড থ্রেডে ট্রেডিং বট চালু করা
     bot_thread = threading.Thread(target=start_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
+    # Render এর সাথে সামঞ্জস্য রেখে Flask Web Server চালনা
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
