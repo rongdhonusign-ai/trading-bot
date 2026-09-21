@@ -1,6 +1,5 @@
-binance-connector
 python-binance
 pandas
-pandas-ta
+git+https://github.com/twopirllc/pandas-ta.git@development
 flask
 gunicorn
