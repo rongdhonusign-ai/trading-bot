@@ -2,7 +2,6 @@ import os
 import time
 import threading
 import pandas as pd
-import pandas_ta as ta
 from flask import Flask
 from binance.client import Client
 from binance.enums import *
@@ -23,13 +22,40 @@ STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WB
 open_positions = {}
 
 # ---------------------------------------------------------
-# FLASK WEB SERVER (Render Port Binding এর জন্য)
+# FLASK SERVER (Render Port Binding)
 # ---------------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Trading Bot is Live and Running!", 200
+    return "Trading Bot is Active & Running!", 200
+
+# ---------------------------------------------------------
+# CUSTOM INDICATOR CALCULATIONS (NO PANDAS_TA NEEDED)
+# ---------------------------------------------------------
+def calculate_indicators(df):
+    """EMA200, RSI(3), এবং Stoch RSI(14,14,3,3) হিসাব করার কাস্টম ফাংশন"""
+    # 1. EMA 200
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+
+    # 2. RSI (Period = 3)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
+    rs = gain / loss
+    df['rsi3'] = 100 - (100 / (1 + rs))
+
+    # 3. RSI (Period = 14) for Stoch RSI
+    gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs14 = gain14 / loss14
+    rsi14 = 100 - (100 / (1 + rs14))
+
+    # Stoch RSI (14, 14, 3, 3) -> K line
+    stoch_rsi = (rsi14 - rsi14.rolling(14).min()) / (rsi14.rolling(14).max() - rsi14.rolling(14).min())
+    df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100
+
+    return df
 
 # ---------------------------------------------------------
 # STRATEGY FUNCTIONS
@@ -58,12 +84,9 @@ def get_klines_data(symbol):
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
         ])
         df['close'] = df['close'].astype(float)
-
-        df['ema200'] = ta.ema(df['close'], length=200)
-        df['rsi3'] = ta.rsi(df['close'], length=3)
-
-        stoch_rsi = ta.stochrsi(df['close'], length=14, rsi_length=14, k=3, d=3)
-        df['stoch_k'] = stoch_rsi['STOCHRSIk_14_14_3_3']
+        
+        # ইন্ডিকেটর হিসাব করা
+        df = calculate_indicators(df)
         return df
     except Exception as e:
         time.sleep(0.5)
@@ -80,14 +103,14 @@ def execute_buy(symbol):
         avg_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else 0
 
         open_positions[symbol] = {'buy_price': avg_price, 'qty': executed_qty}
-        print(f"SUCCESS: Bought {symbol} at {avg_price}")
+        print(f"SUCCESS: Bought {symbol} at avg price {avg_price}")
     except Exception as e:
         print(f"Error buying {symbol}: {e}")
 
 def execute_sell(symbol, reason):
     try:
         qty = open_positions[symbol]['qty']
-        print(f"--> [SELL SIGNAL: {reason}] Selling {symbol}")
+        print(f"--> [SELL SIGNAL: {reason}] Selling 100% of {symbol}")
         
         info = client.get_symbol_info(symbol)
         step_size = None
@@ -107,7 +130,7 @@ def execute_sell(symbol, reason):
         print(f"Error selling {symbol}: {e}")
 
 def strategy_loop():
-    print("Bot Scanner Started...")
+    print("Bot Scanner Thread Started...")
     time.sleep(2)
     while True:
         try:
@@ -141,6 +164,7 @@ def strategy_loop():
                     elif (prev_rsi3 <= 85) and (rsi3 > 85):
                         execute_sell(symbol, reason="RSI(3) Crossed Above 85")
 
+                # IP Ban প্রতিরোধের জন্য রেট লিমিট হ্যান্ডলিং
                 if index % 10 == 0:
                     time.sleep(1)
                 else:
@@ -155,11 +179,9 @@ def strategy_loop():
 # MAIN RUNNER
 # ---------------------------------------------------------
 if __name__ == '__main__':
-    # ব্যাকগ্রাউন্ডে বট স্ক্যানার চালু করা
     t = threading.Thread(target=strategy_loop)
     t.daemon = True
     t.start()
 
-    # Render Port Binding
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
