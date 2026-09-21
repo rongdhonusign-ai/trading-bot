@@ -1,6 +1,6 @@
-Flask
+binance-connector
 python-binance
-websocket-client
 pandas
-numpy
+pandas-ta
+flask
 gunicorn
