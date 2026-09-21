@@ -14,7 +14,7 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1
 
 client = Client(API_KEY, API_SECRET)
 
-TRADE_AMOUNT_USDT = 35.0   # $35 Market Order
+TRADE_AMOUNT_USDT = 35.0   # আপনার প্রয়োজনমত পরিবর্তন করতে পারেন (যেমন 15.0)
 STOP_LOSS_PCT = 0.03       # 3% Stop Loss
 TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
@@ -31,27 +31,22 @@ def home():
     return "Trading Bot is Active & Running!", 200
 
 # ---------------------------------------------------------
-# CUSTOM INDICATOR CALCULATIONS (NO PANDAS_TA NEEDED)
+# CUSTOM INDICATOR CALCULATIONS
 # ---------------------------------------------------------
 def calculate_indicators(df):
-    """EMA200, RSI(3), এবং Stoch RSI(14,14,3,3) হিসাব করার কাস্টম ফাংশন"""
-    # 1. EMA 200
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-    # 2. RSI (Period = 3)
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
     rs = gain / loss
     df['rsi3'] = 100 - (100 / (1 + rs))
 
-    # 3. RSI (Period = 14) for Stoch RSI
     gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs14 = gain14 / loss14
     rsi14 = 100 - (100 / (1 + rs14))
 
-    # Stoch RSI (14, 14, 3, 3) -> K line
     stoch_rsi = (rsi14 - rsi14.rolling(14).min()) / (rsi14.rolling(14).max() - rsi14.rolling(14).min())
     df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100
 
@@ -73,7 +68,7 @@ def get_top_100_usdt_pairs():
         sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
         return [p['symbol'] for p in sorted_pairs[:100]]
     except Exception as e:
-        print(f"Error fetching pairs: {e}")
+        print(f"Error fetching pairs: {e}", flush=True)
         return []
 
 def get_klines_data(symbol):
@@ -84,17 +79,14 @@ def get_klines_data(symbol):
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
         ])
         df['close'] = df['close'].astype(float)
-        
-        # ইন্ডিকেটর হিসাব করা
         df = calculate_indicators(df)
         return df
     except Exception as e:
-        time.sleep(0.5)
         return None
 
 def execute_buy(symbol):
     try:
-        print(f"--> [BUY SIGNAL] Buying {symbol} for ${TRADE_AMOUNT_USDT}")
+        print(f"--> [BUY SIGNAL] Buying {symbol} for ${TRADE_AMOUNT_USDT}", flush=True)
         order = client.create_order(
             symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quoteOrderQty=TRADE_AMOUNT_USDT
         )
@@ -103,14 +95,14 @@ def execute_buy(symbol):
         avg_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else 0
 
         open_positions[symbol] = {'buy_price': avg_price, 'qty': executed_qty}
-        print(f"SUCCESS: Bought {symbol} at avg price {avg_price}")
+        print(f"SUCCESS: Bought {symbol} at avg price {avg_price}", flush=True)
     except Exception as e:
-        print(f"Error buying {symbol}: {e}")
+        print(f"Error buying {symbol}: {e}", flush=True)
 
 def execute_sell(symbol, reason):
     try:
         qty = open_positions[symbol]['qty']
-        print(f"--> [SELL SIGNAL: {reason}] Selling 100% of {symbol}")
+        print(f"--> [SELL SIGNAL: {reason}] Selling 100% of {symbol}", flush=True)
         
         info = client.get_symbol_info(symbol)
         step_size = None
@@ -124,19 +116,31 @@ def execute_sell(symbol, reason):
             qty = round(qty, precision)
 
         client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
-        print(f"SUCCESS: Sold {symbol}. Reason: {reason}")
+        print(f"SUCCESS: Sold {symbol}. Reason: {reason}", flush=True)
         del open_positions[symbol]
     except Exception as e:
-        print(f"Error selling {symbol}: {e}")
+        print(f"Error selling {symbol}: {e}", flush=True)
 
 def strategy_loop():
-    print("Bot Scanner Thread Started...")
-    time.sleep(2)
+    print("Bot Scanner Thread Started...", flush=True)
+    time.sleep(5)
+    
     while True:
         try:
             symbols = get_top_100_usdt_pairs()
+            if not symbols:
+                print("Could not fetch pairs or IP Banned. Waiting 1 minute...", flush=True)
+                time.sleep(60)
+                continue
+
+            print(f"\n================ Scanning {len(symbols)} Pairs ================", flush=True)
+            
             for index, symbol in enumerate(symbols):
                 df = get_klines_data(symbol)
+                
+                # IP Ban এড়াতে প্রতি রিকোয়েস্টের পর ১ সেকেন্ড বিরতি
+                time.sleep(1.0)
+
                 if df is None or len(df) < 200:
                     continue
                 
@@ -147,7 +151,7 @@ def strategy_loop():
                 ema200 = last_row['ema200']
                 rsi3 = last_row['rsi3']
                 stoch_k = last_row['stoch_k']
-                
+
                 # BUY CONDITION
                 if symbol not in open_positions:
                     if (rsi3 < 6) and (stoch_k < 20) and (current_price > ema200):
@@ -164,16 +168,12 @@ def strategy_loop():
                     elif (prev_rsi3 <= 85) and (rsi3 > 85):
                         execute_sell(symbol, reason="RSI(3) Crossed Above 85")
 
-                # IP Ban প্রতিরোধের জন্য রেট লিমিট হ্যান্ডলিং
-                if index % 10 == 0:
-                    time.sleep(1)
-                else:
-                    time.sleep(0.1)
-
-            time.sleep(3)
+            print("================ Scan Finished. Waiting 15s ================\n", flush=True)
+            time.sleep(15)
+            
         except Exception as e:
-            print(f"Loop error: {e}")
-            time.sleep(10)
+            print(f"Loop error: {e}", flush=True)
+            time.sleep(30)
 
 # ---------------------------------------------------------
 # MAIN RUNNER
