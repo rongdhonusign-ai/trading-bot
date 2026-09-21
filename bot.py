@@ -1,256 +1,232 @@
 import os
 import time
-import json
 import threading
-import collections
-from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
-import numpy as np
-import websocket
+import pandas_ta as ta
 from flask import Flask
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
-import logging
+from binance.enums import *
 
-# ==========================================
-# 0. TRADE CONFIGURATION & STRATEGY SETTINGS
-# ==========================================
-TRADE_AMOUNT_USDT = 40.0   # প্রতি ট্রেডে ৪০ ডলারের মার্কেট বাই
-
-# Bollinger Band & EMA Parameters
-BB_PERIOD = 20             # Bollinger Band window
-BB_STD_DEV = 2             # Standard Deviation multiplier
-EMA_PERIOD = 200           # Trend Filter EMA (200)
-
-# ==========================================
-# 1. LIVE LOG BUFFER & FLASK WEB SERVER
-# ==========================================
-log_buffer = collections.deque(maxlen=100)
-
-def log_print(message):
-    print(message)
-    log_buffer.append(message)
-
-app = Flask(__name__)
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-
-@app.route('/')
-@app.route('/status')
-def status():
-    logs_html = "<br>".join(log_buffer)
-    return f"""
-    <html>
-        <head>
-            <title>Bollinger + EMA200 Strategy Bot ($40 Spot)</title>
-            <meta http-equiv="refresh" content="5">
-            <style>
-                body {{ background-color: #0d1117; color: #3fb950; font-family: monospace; padding: 20px; }}
-                h2 {{ color: #58a6ff; }}
-                .log-box {{ background: #161b22; padding: 15px; border-radius: 6px; border: 1px solid #30363d; max-height: 80vh; overflow-y: auto; }}
-            </style>
-        </head>
-        <body>
-            <h2>🤖 Bollinger Band + EMA200 Trading Bot (40 Altcoins)</h2>
-            <p>Strategy: Buy ($40 USDT) when 5m Candle Closes < Lower BB & > EMA200 | Sell when Price > Upper BB</p>
-            <hr>
-            <div class="log-box">{logs_html if logs_html else "Initializing scanner and preloading data..."}</div>
-        </body>
-    </html>
-    """, 200
-
-# ==========================================
-# 2. BINANCE CLIENT SETUP & TOP 47 ALTCOINS
-# ==========================================
+# ---------------------------------------------------------
+# BINANCE API KEYS (Render Environment Variable থেকে নিবে)
+# ---------------------------------------------------------
 API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
+
 client = Client(API_KEY, API_SECRET)
 
-def get_target_altcoins():
-    # ৪৭টি সেরা টপ-ভলিউম অল্টকয়েন (কোনো স্ট্যাবলকয়েন পেয়ার নেই)
-    return [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
-        "ADAUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "SUIUSDT", 
-        "APTUSDT", "LTCUSDT", "ICPUSDT", "INJUSDT", "TIAUSDT", 
-        "SEIUSDT", "ARBUSDT", "OPUSDT", "ATOMUSDT", "TRXUSDT", 
-        "FTMUSDT", "LINKUSDT", "UNIUSDT", "AAVEUSDT", "FETUSDT", 
-        "RENDERUSDT", "TAOUSDT", "WLDUSDT", "ONDOUSDT", "DOGEUSDT", 
-        "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT", 
-        "SANDUSDT", "MANAUSDT", "GALAUSDT", "CHZUSDT", "JUPUSDT", 
-        "RAYUSDT", "ENAUSDT", "RUNEUSDT", "PENDLEUSDT", "ORDIUSDT", 
-        "FILUSDT", "STXUSDT"
-    ]
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+TRADE_AMOUNT_USDT = 35.0   # প্রতি অর্ডারে $35 usdt
+STOP_LOSS_PCT = 0.03       # 3% Stop Loss
+TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
-# Global Trackers
-candle_data = {}
-positions = {}      # {symbol: True/False}
-buy_prices = {}     # {symbol: entry_price}
+STABLECOINS = [
+    'USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 
+    'GBP', 'WBTC', 'WETH', 'AEUR', 'PAX'
+]
 
-symbols = list(set(get_target_altcoins()))  # Duplicate cleanup
-for sym in symbols:
-    candle_data[sym] = []
-    positions[sym] = False
-    buy_prices[sym] = 0.0
+# ট্রেড ট্র্যাকিং ডিকশনারি
+# Structure: { 'BTCUSDT': {'buy_price': 50000, 'qty': 0.001, 'prev_rsi': 82} }
+open_positions = {}
 
-# ==========================================
-# 3. FAST PARALLEL PRELOADER (IP SAFE)
-# ==========================================
-def fetch_single_symbol(sym):
+# ---------------------------------------------------------
+# FLASK APP (Render IP / Health Check Server)
+# ---------------------------------------------------------
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Binance Trading Bot is Running!", 200
+
+# ---------------------------------------------------------
+# HELPER FUNCTIONS
+# ---------------------------------------------------------
+def get_top_100_usdt_pairs():
+    """সবচেয়ে বেশি ভলিউম থাকা ১০০টি non-stablecoin USDT পেয়ার আনবে"""
     try:
-        # EMA(200) সঠিক পেতে অন্তত ২২০টি ঐতিহাসিক ক্যান্ডেল প্রয়োজন
-        klines = client.get_klines(symbol=sym, interval=Client.KLINE_INTERVAL_5MINUTE, limit=220)
-        closes = [float(k[4]) for k in klines]
-        candle_data[sym] = closes
+        tickers = client.get_ticker()
+        usdt_pairs = []
+        for t in tickers:
+            symbol = t['symbol']
+            if symbol.endswith('USDT'):
+                base_asset = symbol.replace('USDT', '')
+                if base_asset not in STABLECOINS:
+                    usdt_pairs.append({
+                        'symbol': symbol,
+                        'quoteVolume': float(t['quoteVolume'])
+                    })
+        # ভলিউম অনুযায়ী সর্ট করে টপ ১০০ বাছাই
+        sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
+        return [p['symbol'] for p in sorted_pairs[:100]]
     except Exception as e:
-        log_print(f"⚠️ Preload error for {sym}: {e}")
+        print(f"Error fetching top pairs: {e}")
+        return []
 
-def preload_history():
-    log_print("⚡ Preloading 220 Historical 5M Candles for 47 Altcoins in Parallel...")
-    start_time = time.time()
-    
-    # ১০টি সমান্তরাল থ্রেড ব্যবহার করে কয়েক সেকেন্ডে প্রিলোড শেষ করা হবে (IP Safe)
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        executor.map(fetch_single_symbol, symbols)
-        
-    elapsed = time.time() - start_time
-    log_print(f"✅ Preload Complete in {elapsed:.2f} Seconds! Live WebSocket Scanning Active.")
-
-# ==========================================
-# 4. INDICATOR CALCULATIONS (BB & EMA200)
-# ==========================================
-def calculate_indicators(closes):
-    if len(closes) < EMA_PERIOD:
-        return None, None, None
-
-    df = pd.DataFrame({'close': closes})
-    
-    # Bollinger Bands Calculation (20, 2)
-    df['SMA20'] = df['close'].rolling(window=BB_PERIOD).mean()
-    df['STD20'] = df['close'].rolling(window=BB_PERIOD).std()
-    df['Upper_BB'] = df['SMA20'] + (df['STD20'] * BB_STD_DEV)
-    df['Lower_BB'] = df['SMA20'] - (df['STD20'] * BB_STD_DEV)
-    
-    # Exponential Moving Average (EMA 200)
-    df['EMA200'] = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-    
-    latest = df.iloc[-1]
-    return latest['Lower_BB'], latest['Upper_BB'], latest['EMA200']
-
-# ==========================================
-# 5. STRATEGY EXECUTION LOGIC
-# ==========================================
-def process_tick(symbol, current_price, is_closed):
-    if len(candle_data[symbol]) < EMA_PERIOD:
-        return
-
-    has_pos = positions[symbol]
-
-    # 🛒 ১. মার্কেট বাই শর্ত: ক্যান্ডেল ক্লোজ হতে হবে + ক্লোজ প্রাইস < Lower BB + ক্লোজ প্রাইস > EMA200
-    if is_closed and not has_pos:
-        lower_bb, upper_bb, ema200 = calculate_indicators(candle_data[symbol])
-        
-        if lower_bb is not None and ema200 is not None:
-            last_close = candle_data[symbol][-1]
-            
-            if last_close < lower_bb and last_close > ema200:
-                log_print(f"⚡ [BUY SIGNAL] {symbol} | Closed Price: ${last_close} < Lower BB: ${lower_bb:.4f} | EMA200: ${ema200:.4f}")
-                try:
-                    order = client.order_market_buy(symbol=symbol, quoteOrderQty=TRADE_AMOUNT_USDT)
-                    
-                    executed_price = last_close
-                    if 'fills' in order and len(order['fills']) > 0:
-                        executed_price = float(order['fills'][0]['price'])
-
-                    positions[symbol] = True
-                    buy_prices[symbol] = executed_price
-                    log_print(f"✅ [MARKET BOUGHT] {symbol} @ ${executed_price:.4f} | Order ID: {order['orderId']}")
-
-                except BinanceAPIException as e:
-                    log_print(f"❌ [BUY ERROR] {symbol}: {e.message}")
-                except Exception as e:
-                    log_print(f"❌ [BUY EXCEPTION] {symbol}: {e}")
-
-    # 💰 ২. মার্কেট সেল শর্ত: ক্যান্ডেল চলাকালীন রিয়েল-টাইম প্রাইস Upper BB স্পর্শ বা পার হলে
-    elif has_pos:
-        temp_closes = candle_data[symbol] + [current_price]
-        _, upper_bb, _ = calculate_indicators(temp_closes)
-        
-        if upper_bb is not None and current_price >= upper_bb:
-            entry_price = buy_prices[symbol]
-            pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
-            log_print(f"🎯 [SELL SIGNAL] {symbol} | Live Price: ${current_price} >= Upper BB: ${upper_bb:.4f} | PnL: {pnl_pct:+.2f}%")
-            execute_market_sell(symbol)
-
-def execute_market_sell(symbol):
+def get_klines_data(symbol):
+    """ক্যান্ডেলস্টিক ডাটা টেনে ইন্ডকেটর ক্যালকুলেট করা"""
     try:
-        asset = symbol.replace("USDT", "")
-        balance_info = client.get_asset_balance(asset=asset)
-        free_qty = float(balance_info['free']) if balance_info else 0.0
+        # ৫০টি ক্যান্ডেল ডাটা (EMA 200 এর জন্য ১০০+ প্রয়োজন হতে পারে, নিরাপত্তার জন্য ১৫০ আনা হচ্ছে)
+        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=250)
+        df = pd.DataFrame(klines, columns=[
+            'time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+        ])
+        df['close'] = df['close'].astype(float)
 
-        if free_qty > 0:
-            order = client.order_market_sell(symbol=symbol, quantity=free_qty)
-            log_print(f"✅ [MARKET SOLD] {symbol} | Order ID: {order['orderId']}")
-        else:
-            log_print(f"⚠️ [SELL SKIPPED] {symbol}: No free balance available.")
+        # 1. EMA 200
+        df['ema200'] = ta.ema(df['close'], length=200)
 
-        positions[symbol] = False
-        buy_prices[symbol] = 0.0
+        # 2. RSI 3
+        df['rsi3'] = ta.rsi(df['close'], length=3)
 
-    except BinanceAPIException as e:
-        log_print(f"❌ [SELL ERROR] {symbol}: {e.message}")
+        # 3. Stochastic RSI (14, 14, 3, 3)
+        stoch_rsi = ta.stochrsi(df['close'], length=14, rsi_length=14, k=3, d=3)
+        df['stoch_k'] = stoch_rsi['STOCHRSIk_14_14_3_3']
+        df['stoch_d'] = stoch_rsi['STOCHRSId_14_14_3_3']
+
+        return df
     except Exception as e:
-        log_print(f"❌ [SELL EXCEPTION] {symbol}: {e}")
+        # IP Rate limit এর ঝুঁকি এড়াতে সামান্য বিরতি
+        time.sleep(0.5)
+        return None
 
-# ==========================================
-# 6. WEBSOCKET REAL-TIME TICK LISTENER
-# ==========================================
-def on_message(ws, message):
-    data = json.loads(message)
-    if 'k' in data:
-        k = data['k']
-        symbol = data['s']
-        current_price = float(k['c'])
-        is_closed = k['x']
+def execute_buy(symbol):
+    """Market Buy Order Executed"""
+    try:
+        print(f"--> [BUY SIGNAL DETECTED] Buying {symbol} for ${TRADE_AMOUNT_USDT}")
+        order = client.create_order(
+            symbol=symbol,
+            side=SIDE_BUY,
+            type=ORDER_TYPE_MARKET,
+            quoteOrderQty=TRADE_AMOUNT_USDT
+        )
+        
+        # কেনা দাম এবং পরিমান বের করা
+        executed_qty = float(order['executedQty'])
+        cummulative_quote_qty = float(order['cummulativeQuoteQty'])
+        avg_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else 0
 
-        # ক্যান্ডেল ক্লোজ হলে মেমোরিতে ডাটা যুক্ত করা
-        if is_closed and symbol in candle_data:
-            candle_data[symbol].append(current_price)
-            if len(candle_data[symbol]) > 250:
-                candle_data[symbol].pop(0)
+        open_positions[symbol] = {
+            'buy_price': avg_price,
+            'qty': executed_qty,
+            'prev_rsi': None
+        }
+        print(f"SUCCESS: Bought {symbol} at avg price {avg_price}")
+    except Exception as e:
+        print(f"Error buying {symbol}: {e}")
 
-        # ট্রেডিং স্ট্র্যাটেজি চেক
-        if symbol in candle_data:
-            process_tick(symbol, current_price, is_closed)
+def execute_sell(symbol, reason):
+    """Market Sell Order Executed (100% Position)"""
+    try:
+        qty = open_positions[symbol]['qty']
+        print(f"--> [SELL SIGNAL: {reason}] Selling 100% of {symbol} (Qty: {qty})")
+        
+        # পজিশন সাইজ ও প্রিসিশন সংক্রান্ত সমস্যা এড়াতে কোয়ান্টিটি ফরম্যাট
+        info = client.get_symbol_info(symbol)
+        step_size = None
+        for f in info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                step_size = float(f['stepSize'])
+                break
+        
+        if step_size:
+            precision = int(round(-pd.np.log10(step_size))) if step_size < 1 else 0
+            qty = round(qty, precision)
 
-def start_websocket():
-    streams = [f"{sym.lower()}@kline_5m" for sym in symbols]
-    socket_url = f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}"
+        order = client.create_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+        print(f"SUCCESS: Sold {symbol} completely. Reason: {reason}")
+        del open_positions[symbol]
+    except Exception as e:
+        print(f"Error selling {symbol}: {e}")
+
+# ---------------------------------------------------------
+# STRATEGY ENGINE LOOP
+# ---------------------------------------------------------
+def strategy_loop():
+    print("Strategy Bot Thread Started...")
+    time.sleep(2) # ১-২ সেকেন্ড পরেই স্ক্যানিং শুরু হবে
     
-    ws = websocket.WebSocketApp(
-        socket_url,
-        on_message=on_message,
-        on_error=lambda ws, err: log_print(f"❌ WS Error: {err}"),
-        on_close=lambda ws, code, msg: log_print("🔌 WS Connection Closed. Reconnecting...")
-    )
-    ws.run_forever()
-
-def start_bot():
-    preload_history()
-    log_print("🤖 Real-Time Execution Bot Running! Scanning 47 Altcoins...")
     while True:
         try:
-            start_websocket()
-        except Exception as e:
-            log_print(f"⚠️ WebSocket connection lost: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
+            symbols = get_top_100_usdt_pairs()
+            print(f"--- Starting Scan for Top {len(symbols)} Pairs ---")
+            
+            for index, symbol in enumerate(symbols):
+                df = get_klines_data(symbol)
+                
+                if df is None or len(df) < 200:
+                    continue
+                
+                # সর্বশেষ ক্যান্ডেলের তথ্য
+                last_row = df.iloc[-1]
+                prev_row = df.iloc[-2]
+                
+                current_price = last_row['close']
+                ema200 = last_row['ema200']
+                rsi3 = last_row['rsi3']
+                stoch_k = last_row['stoch_k']
+                
+                # -----------------------------------------------------
+                # BUY LOGIC:
+                # 1. RSI{3} < 6
+                # 2. Stoch RSI K < 20
+                # 3. Current Price > EMA200
+                # 4. Not currently open position
+                # -----------------------------------------------------
+                if symbol not in open_positions:
+                    if (rsi3 < 6) and (stoch_k < 20) and (current_price > ema200):
+                        execute_buy(symbol)
 
-# ==========================================
-# 7. MAIN EXECUTION
-# ==========================================
+                # -----------------------------------------------------
+                # SELL LOGIC:
+                # 1. RSI{3} Crossing Above 85 (আগের ক্যান্ডেলে ৮৫ এর নিচে বা সমান ছিল, এখন ৮৫ এর উপরে)
+                # 2. Price dropped >= 3% from buy price
+                # -----------------------------------------------------
+                else:
+                    pos_data = open_positions[symbol]
+                    buy_price = pos_data['buy_price']
+                    
+                    # Target 1: Stop Loss (3% Down)
+                    stop_price = buy_price * (1 - STOP_LOSS_PCT)
+                    
+                    # Target 2: RSI Crossing Above 85
+                    prev_rsi3 = prev_row['rsi3']
+                    rsi_crossed_above_85 = (prev_rsi3 <= 85) and (rsi3 > 85)
+                    
+                    if current_price <= stop_price:
+                        execute_sell(symbol, reason="3% Stop-Loss Hit")
+                    elif rsi_crossed_above_85:
+                        execute_sell(symbol, reason="RSI(3) Crossed Above 85")
+
+                # IP Ban প্রতিরোধে রেট লিমিট হ্যান্ডলিং
+                if index % 10 == 0:
+                    time.sleep(1) # প্রতি ১০ টি টোকেন স্ক্যান করার পর ১ সেকেন্ড বিরতি
+                else:
+                    time.sleep(0.1)
+
+            print("--- Scan Loop Completed. Waiting for 3 seconds ---")
+            time.sleep(3)
+
+        except Exception as e:
+            print(f"Error in strategy loop: {e}")
+            time.sleep(10)
+
+# ---------------------------------------------------------
+# MAIN ENTRY POINT
+# ---------------------------------------------------------
 if __name__ == '__main__':
-    bot_thread = threading.Thread(target=start_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    port = int(os.environ.get("PORT", 5000))
+    # Flask এর ব্যাকগ্রাউন্ডে ট্রেডিং লুপ চালানো
+    t = threading.Thread(target=strategy_loop)
+    t.daemon = True
+    t.start()
+
+    # Render Default Port
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
