@@ -2,4 +2,3 @@ python-binance
 pandas
 git+https://github.com/twopirllc/pandas-ta.git@development
 flask
-gunicorn
