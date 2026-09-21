@@ -14,7 +14,7 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1
 
 client = Client(API_KEY, API_SECRET)
 
-TRADE_AMOUNT_USDT = 35.0   # আপনার প্রয়োজনমত পরিবর্তন করতে পারেন (যেমন 15.0)
+TRADE_AMOUNT_USDT = 35.0   # $35 Market Order per Trade
 STOP_LOSS_PCT = 0.03       # 3% Stop Loss
 TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
@@ -34,19 +34,23 @@ def home():
 # CUSTOM INDICATOR CALCULATIONS
 # ---------------------------------------------------------
 def calculate_indicators(df):
+    # 1. EMA 200
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
+    # 2. RSI (Period = 3)
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
     rs = gain / loss
     df['rsi3'] = 100 - (100 / (1 + rs))
 
+    # 3. RSI (Period = 14) for Stoch RSI
     gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs14 = gain14 / loss14
     rsi14 = 100 - (100 / (1 + rs14))
 
+    # Stoch RSI (14, 14, 3, 3) -> K line
     stoch_rsi = (rsi14 - rsi14.rolling(14).min()) / (rsi14.rolling(14).max() - rsi14.rolling(14).min())
     df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100
 
@@ -55,7 +59,7 @@ def calculate_indicators(df):
 # ---------------------------------------------------------
 # STRATEGY FUNCTIONS
 # ---------------------------------------------------------
-def get_top_100_usdt_pairs():
+def get_top_50_usdt_pairs():
     try:
         tickers = client.get_ticker()
         usdt_pairs = []
@@ -66,7 +70,7 @@ def get_top_100_usdt_pairs():
                 if base_asset not in STABLECOINS:
                     usdt_pairs.append({'symbol': symbol, 'quoteVolume': float(t['quoteVolume'])})
         sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
-        return [p['symbol'] for p in sorted_pairs[:100]]
+        return [p['symbol'] for p in sorted_pairs[:50]]
     except Exception as e:
         print(f"Error fetching pairs: {e}", flush=True)
         return []
@@ -127,49 +131,63 @@ def strategy_loop():
     
     while True:
         try:
-            symbols = get_top_100_usdt_pairs()
+            symbols = get_top_50_usdt_pairs()
             if not symbols:
-                print("Could not fetch pairs or IP Banned. Waiting 1 minute...", flush=True)
-                time.sleep(60)
+                print("Could not fetch pairs or IP Banned. Waiting 2 minutes...", flush=True)
+                time.sleep(120)
                 continue
 
-            print(f"\n================ Scanning {len(symbols)} Pairs ================", flush=True)
+            print(f"\n================ Scanning {len(symbols)} Top Pairs (Closed Candles Only) ================", flush=True)
             
             for index, symbol in enumerate(symbols):
                 df = get_klines_data(symbol)
                 
-                # IP Ban এড়াতে প্রতি রিকোয়েস্টের পর ১ সেকেন্ড বিরতি
-                time.sleep(1.0)
+                # IP Rate Limit ডিলে
+                time.sleep(1.5)
 
                 if df is None or len(df) < 200:
                     continue
                 
-                last_row = df.iloc[-1]
-                prev_row = df.iloc[-2]
+                # -------------------------------------------------------------
+                # ক্যান্ডেল ক্লোজড ডাটা ফিল্টারিং:
+                # df.iloc[-1] = রানিং/চলতি ক্যান্ডেল (এটি ব্যবহার করা হচ্ছে না)
+                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া শেষ ৫-মিনিটের ক্যান্ডেল
+                # df.iloc[-3] = তার আগের ক্লোজ হওয়া ক্যান্ডেল
+                # -------------------------------------------------------------
+                closed_candle = df.iloc[-2]
+                prev_closed_candle = df.iloc[-3]
+                live_candle = df.iloc[-1]
                 
-                current_price = last_row['close']
-                ema200 = last_row['ema200']
-                rsi3 = last_row['rsi3']
-                stoch_k = last_row['stoch_k']
+                closed_price = closed_candle['close']
+                closed_ema200 = closed_candle['ema200']
+                closed_rsi3 = closed_candle['rsi3']
+                closed_stoch_k = closed_candle['stoch_k']
+                
+                current_live_price = live_candle['close']
 
-                # BUY CONDITION
+                # BUY CONDITION (ক্লোজড ক্যান্ডেলের ইন্ডকেটর ভ্যালু দিয়ে)
                 if symbol not in open_positions:
-                    if (rsi3 < 6) and (stoch_k < 20) and (current_price > ema200):
+                    if (closed_rsi3 < 6) and (closed_stoch_k < 20) and (closed_price > closed_ema200):
+                        print(f"Signal Confirmed on Closed Candle for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                         execute_buy(symbol)
 
                 # SELL CONDITION
                 else:
                     buy_price = open_positions[symbol]['buy_price']
                     stop_price = buy_price * (1 - STOP_LOSS_PCT)
-                    prev_rsi3 = prev_row['rsi3']
                     
-                    if current_price <= stop_price:
-                        execute_sell(symbol, reason="3% Stop-Loss Hit")
-                    elif (prev_rsi3 <= 85) and (rsi3 > 85):
-                        execute_sell(symbol, reason="RSI(3) Crossed Above 85")
+                    prev_rsi3 = prev_closed_candle['rsi3']
+                    
+                    # ৩% স্টপ লস সবসময় লাইভ প্রাইসে চেক হবে (ঝুঁকি কমানোর জন্য)
+                    if current_live_price <= stop_price:
+                        execute_sell(symbol, reason="3% Stop-Loss Hit (Live Price)")
+                    
+                    # প্রফিট টেক (RSI > 85) ক্লোজড ক্যান্ডেলের ক্রসওভারে হবে
+                    elif (prev_rsi3 <= 85) and (closed_rsi3 > 85):
+                        execute_sell(symbol, reason="RSI(3) Closed Above 85")
 
-            print("================ Scan Finished. Waiting 15s ================\n", flush=True)
-            time.sleep(15)
+            print("================ Scan Finished. Waiting 30s ================\n", flush=True)
+            time.sleep(30)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
