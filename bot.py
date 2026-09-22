@@ -160,6 +160,8 @@ def strategy_loop():
                 continue
 
             print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
+            # এক লাইনে স্ক্যান হওয়া ৫০টি টোকেনের নাম প্রিন্ট করা হবে
+            print(f"Active Pairs: {', '.join(cached_symbols)}", flush=True)
             
             for index, symbol in enumerate(cached_symbols):
                 df = get_klines_data(symbol)
