@@ -22,6 +22,10 @@ TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WBTC', 'WETH', 'PAX']
 open_positions = {}
 
+# ক্যাশিংয়ের জন্য গ্লোবাল ভ্যারিয়েবল
+cached_symbols = []
+last_symbol_fetch_time = 0
+
 # ---------------------------------------------------------
 # FLASK SERVER (Render Port Binding)
 # ---------------------------------------------------------
@@ -32,29 +36,35 @@ def home():
     return "Trading Bot is Active & Running!", 200
 
 # ---------------------------------------------------------
-# CUSTOM INDICATOR CALCULATIONS
+# ACCURATE TRADINGVIEW / BINANCE INDICATOR CALCULATIONS
 # ---------------------------------------------------------
 def calculate_indicators(df):
     # 1. EMA 100 & EMA 200
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-    # 2. RSI (Period = 3)
+    # 2. ACCURATE RSI 3 (Binance & TradingView Wilder's RMA Method)
     delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
-    rs = gain / loss
-    df['rsi3'] = 100 - (100 / (1 + rs))
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
 
-    # 3. RSI (Period = 14) for Stoch RSI
-    gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs14 = gain14 / loss14
-    rsi14 = 100 - (100 / (1 + rs14))
+    # Wilder's Smoothing for RSI 3
+    alpha3 = 1.0 / 3
+    avg_gain3 = gain.ewm(alpha=alpha3, adjust=False).mean()
+    avg_loss3 = loss.ewm(alpha=alpha3, adjust=False).mean()
+    rs3 = avg_gain3 / avg_loss3
+    df['rsi3'] = 100.0 - (100.0 / (1.0 + rs3))
+
+    # 3. ACCURATE RSI 14 (Wilder's RMA Method) for Stoch RSI
+    alpha14 = 1.0 / 14
+    avg_gain14 = gain.ewm(alpha=alpha14, adjust=False).mean()
+    avg_loss14 = loss.ewm(alpha=alpha14, adjust=False).mean()
+    rs14 = avg_gain14 / avg_loss14
+    rsi14 = 100.0 - (100.0 / (1.0 + rs14))
 
     # Stoch RSI (14, 14, 3, 3) -> K line
     stoch_rsi = (rsi14 - rsi14.rolling(14).min()) / (rsi14.rolling(14).max() - rsi14.rolling(14).min())
-    df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100
+    df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100.0
 
     return df
 
@@ -128,39 +138,44 @@ def execute_sell(symbol, reason):
         print(f"Error selling {symbol}: {e}", flush=True)
 
 def strategy_loop():
+    global cached_symbols, last_symbol_fetch_time
     print("Bot Scanner Thread Started...", flush=True)
     time.sleep(5)
     
     while True:
         try:
-            symbols = get_top_50_usdt_pairs()
-            if not symbols:
+            current_time = time.time()
+            
+            # প্রতি ১০ মিনিটে (৬০০ সেকেন্ড) একবার পেয়ার লিস্ট রিফ্রেশ করবে API Weight বাঁচানোর জন্য
+            if not cached_symbols or (current_time - last_symbol_fetch_time) > 600:
+                print("Fetching Top 50 USDT Pairs from Binance...", flush=True)
+                new_pairs = get_top_50_usdt_pairs()
+                if new_pairs:
+                    cached_symbols = new_pairs
+                    last_symbol_fetch_time = current_time
+
+            if not cached_symbols:
                 print("Could not fetch pairs or IP Banned. Waiting 1 minute...", flush=True)
                 time.sleep(60)
                 continue
 
-            print(f"\n================ Scanning {len(symbols)} Top Pairs ================", flush=True)
+            print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
             
-            for index, symbol in enumerate(symbols):
+            for index, symbol in enumerate(cached_symbols):
                 df = get_klines_data(symbol)
                 
-                # দ্রুত স্ক্যানিংয়ের জন্য ডিলে ০.৩ সেকেন্ডে নামানো হয়েছে
-                time.sleep(0.3)
+                # Render Shared IP-র জন্য ০.৫ সেকেন্ড ডিলে
+                time.sleep(0.5)
 
                 if df is None or len(df) < 200:
                     continue
                 
-                # -------------------------------------------------------------
-                # ক্যান্ডেল ডাটা বিভাজন:
-                # df.iloc[-3] = ২ ক্যান্ডেল আগের বন্ধ হওয়া ক্যান্ডেল (Crossing Below চেক করতে)
-                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া ক্যান্ডেল (কনফার্মড বাই সিগন্যালের জন্য)
-                # df.iloc[-1] = রানিং/লাইভ ক্যান্ডেল (লাইভ প্রফিট টেক ও স্টপ-লসের জন্য)
-                # -------------------------------------------------------------
+                # ক্যান্ডেল ডাটা
                 prev_closed_candle = df.iloc[-3]
                 closed_candle = df.iloc[-2]
                 live_candle = df.iloc[-1]
                 
-                # বাই চেক এরিয়া (কনফার্মড ক্লোজড ক্যান্ডেল দিয়ে)
+                # বাই ডাটা
                 closed_price = closed_candle['close']
                 closed_ema100 = closed_candle['ema100']
                 closed_ema200 = closed_candle['ema200']
@@ -168,16 +183,12 @@ def strategy_loop():
                 prev_closed_rsi3 = prev_closed_candle['rsi3']
                 closed_stoch_k = closed_candle['stoch_k']
                 
-                # সেল চেক এরিয়া (রানিং ক্যান্ডেল)
+                # সেল ডাটা
                 current_live_price = live_candle['close']
                 live_rsi3 = live_candle['rsi3']
 
                 # =============================================================
                 # BUY CONDITION
-                # 1. EMA 100 > EMA 200
-                # 2. 5m Candle Price > EMA 100
-                # 3. RSI(3) Crossing Below 6 on Candle Close (Prev >= 6, Closed < 6)
-                # 4. Stoch RSI K (14,14,3,3) < 20
                 # =============================================================
                 if symbol not in open_positions:
                     if (closed_ema100 > closed_ema200) and \
@@ -185,13 +196,11 @@ def strategy_loop():
                        (prev_closed_rsi3 >= 6) and (closed_rsi3 < 6) and \
                        (closed_stoch_k < 20):
                         
-                        print(f"Signal Confirmed for {symbol} | EMA100 > EMA200 | Price > EMA100 | RSI(3) Crossed Below 6 (Prev: {prev_closed_rsi3:.2f} -> Closed: {closed_rsi3:.2f}) | Stoch_K: {closed_stoch_k:.2f}", flush=True)
+                        print(f"Signal Confirmed for {symbol} | EMA100 > EMA200 | Price > EMA100 | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                         execute_buy(symbol)
 
                 # =============================================================
                 # SELL CONDITION
-                # 1. 3% Stop-Loss (Live Price)
-                # 2. Live RSI(3) >= 85 and Price is in Profit
                 # =============================================================
                 else:
                     buy_price = open_positions[symbol]['buy_price']
@@ -201,16 +210,16 @@ def strategy_loop():
                     if current_live_price <= stop_price:
                         execute_sell(symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
                     
-                    # ২. টেক প্রফিট: লাভে থাকা অবস্থায় লাইভ RSI(3) ৮৫ বা তার উপরে উঠলে
+                    # ২. প্রফিটে থাকলে ও লাইভ RSI(3) >= 85 হলে
                     elif (live_rsi3 >= 85) and (current_live_price > buy_price):
                         execute_sell(symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | Profit: {((current_live_price - buy_price)/buy_price)*100:.2f}%")
 
-            print("================ Scan Finished. Waiting 5s ================\n", flush=True)
-            time.sleep(5)
+            print("================ Scan Finished. Waiting 10s ================\n", flush=True)
+            time.sleep(10)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
-            time.sleep(10)
+            time.sleep(15)
 
 # ---------------------------------------------------------
 # MAIN RUNNER
