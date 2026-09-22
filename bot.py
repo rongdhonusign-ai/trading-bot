@@ -10,8 +10,8 @@ from binance.enums import *
 # ---------------------------------------------------------
 # BINANCE API KEYS
 # ---------------------------------------------------------
-API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
-API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
+API_KEY = os.environ.get("BINANCE_API_KEY", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
 
 client = Client(API_KEY, API_SECRET)
 
@@ -138,7 +138,7 @@ def strategy_loop():
                 time.sleep(120)
                 continue
 
-            print(f"\n================ Scanning {len(symbols)} Top Pairs (Closed Candles Only) ================", flush=True)
+            print(f"\n================ Scanning {len(symbols)} Top Pairs ================", flush=True)
             
             for index, symbol in enumerate(symbols):
                 df = get_klines_data(symbol)
@@ -150,38 +150,41 @@ def strategy_loop():
                     continue
                 
                 # -------------------------------------------------------------
-                # ক্যান্ডেল ক্লোজড ডাটা ফিল্টারিং:
-                # df.iloc[-1] = রানিং/চলতি ক্যান্ডেল
-                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া শেষ ৫-মিনিটের ক্যান্ডেল
+                # ক্যান্ডেল ডাটা বিভাজন:
+                # df.iloc[-1] = রানিং/লাইভ ক্যান্ডেল (লাইভ প্রফিট টেক ও স্টপ-লসের জন্য)
+                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া ক্যান্ডেল (কনফার্মড বাই সিগন্যালের জন্য)
                 # -------------------------------------------------------------
                 closed_candle = df.iloc[-2]
                 live_candle = df.iloc[-1]
                 
+                # বাই চেক এরিয়া (কনফার্মড ক্লোজড ক্যান্ডেল দিয়ে)
                 closed_price = closed_candle['close']
                 closed_ema200 = closed_candle['ema200']
                 closed_rsi3 = closed_candle['rsi3']
                 closed_stoch_k = closed_candle['stoch_k']
                 
+                # সেল চেক এরিয়া (রানিং ক্যান্ডেল দিয়ে - ইন্সট্যান্ট এক্সিকিউশন)
                 current_live_price = live_candle['close']
+                live_rsi3 = live_candle['rsi3']
 
-                # BUY CONDITION (ক্লোজড ক্যান্ডেলের ইন্ডিকেটর ভ্যালু দিয়ে)
+                # BUY CONDITION (ক্লোজড ক্যান্ডেলের কনফার্মড ভ্যালু অনুযায়ী)
                 if symbol not in open_positions:
                     if (closed_rsi3 < 6) and (closed_stoch_k < 20) and (closed_price > closed_ema200):
                         print(f"Signal Confirmed on Closed Candle for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                         execute_buy(symbol)
 
-                # SELL CONDITION
+                # SELL CONDITION (রানিং/লাইভ ক্যান্ডেলের ওপর ভিত্তি করে সাথে সাথে সেল)
                 else:
                     buy_price = open_positions[symbol]['buy_price']
                     stop_price = buy_price * (1 - STOP_LOSS_PCT)
                     
-                    # ১. ৩% স্টপ লস (লাইভ প্রাইসে চেক হবে)
+                    # ১. ৩% স্টপ লস (লাইভ প্রাইসে তৎক্ষণাৎ সেল)
                     if current_live_price <= stop_price:
                         execute_sell(symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
                     
-                    # ২. প্রফিট টেক (RSI-3 ক্লোজড ক্যান্ডেলে ৮৫ বা তার উপরে থাকলেই সেল হবে)
-                    elif closed_rsi3 >= 85:
-                        execute_sell(symbol, reason=f"RSI(3) Closed at {closed_rsi3:.2f} (>= 85)")
+                    # ২. ইনস্ট্যান্ট টেক প্রফিট (রানিং ক্যান্ডেলেই RSI-3 মান ৮৫ বা তার বেশি হওয়া মাত্রই সেল)
+                    elif live_rsi3 >= 85:
+                        execute_sell(symbol, reason=f"Live RSI(3) hit {live_rsi3:.2f} (>= 85)")
 
             print("================ Scan Finished. Waiting 30s ================\n", flush=True)
             time.sleep(30)
