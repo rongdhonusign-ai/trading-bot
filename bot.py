@@ -10,8 +10,8 @@ from binance.enums import *
 # ---------------------------------------------------------
 # BINANCE API KEYS
 # ---------------------------------------------------------
-API_KEY = os.environ.get("BINANCE_API_KEY", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
-API_SECRET = os.environ.get("BINANCE_API_SECRET", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
+API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
 
 client = Client(API_KEY, API_SECRET)
 
@@ -35,7 +35,8 @@ def home():
 # CUSTOM INDICATOR CALCULATIONS
 # ---------------------------------------------------------
 def calculate_indicators(df):
-    # 1. EMA 200
+    # 1. EMA 100 & EMA 200
+    df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
     # 2. RSI (Period = 3)
@@ -152,39 +153,55 @@ def strategy_loop():
                 # -------------------------------------------------------------
                 # ক্যান্ডেল ডাটা বিভাজন:
                 # df.iloc[-1] = রানিং/লাইভ ক্যান্ডেল (লাইভ প্রফিট টেক ও স্টপ-লসের জন্য)
-                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া ক্যান্ডেল (কনফার্মড বাই সিগন্যালের জন্য)
+                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া ক্যান্ডেল (কনফার্মড বাই সিগন্যাল ও প্রিভিয়াস RSI-র জন্য)
                 # -------------------------------------------------------------
                 closed_candle = df.iloc[-2]
                 live_candle = df.iloc[-1]
                 
-                # বাই চেক এরিয়া (কনফার্মড ক্লোজড ক্যান্ডেল দিয়ে)
+                # বাই চেক এরিয়া (কনফার্মড ক্লোজড ক্যান্ডেল দিয়ে)
                 closed_price = closed_candle['close']
+                closed_ema100 = closed_candle['ema100']
                 closed_ema200 = closed_candle['ema200']
                 closed_rsi3 = closed_candle['rsi3']
                 closed_stoch_k = closed_candle['stoch_k']
                 
-                # সেল চেক এরিয়া (রানিং ক্যান্ডেল দিয়ে - ইন্সট্যান্ট এক্সিকিউশন)
+                # সেল চেক এরিয়া (রানিং ক্যান্ডেল + ক্রসিং চেক)
                 current_live_price = live_candle['close']
                 live_rsi3 = live_candle['rsi3']
+                prev_rsi3 = closed_candle['rsi3']  # ক্যান্ডেল ক্লোজের মান যা ক্রসিং চেক করতে সাহায্য করবে
 
-                # BUY CONDITION (ক্লোজড ক্যান্ডেলের কনফার্মড ভ্যালু অনুযায়ী)
+                # =============================================================
+                # BUY CONDITION
+                # 1. EMA 100 > EMA 200
+                # 2. 5m Candle Price > EMA 100
+                # 3. RSI(3) < 6
+                # 4. Stoch RSI K (14,14,3,3) < 20
+                # =============================================================
                 if symbol not in open_positions:
-                    if (closed_rsi3 < 6) and (closed_stoch_k < 20) and (closed_price > closed_ema200):
-                        print(f"Signal Confirmed on Closed Candle for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
+                    if (closed_ema100 > closed_ema200) and \
+                       (closed_price > closed_ema100) and \
+                       (closed_rsi3 < 6) and \
+                       (closed_stoch_k < 20):
+                        
+                        print(f"Signal Confirmed on Closed Candle for {symbol} | EMA100 > EMA200 | Price > EMA100 | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                         execute_buy(symbol)
 
-                # SELL CONDITION (রানিং/লাইভ ক্যান্ডেলের ওপর ভিত্তি করে সাথে সাথে সেল)
+                # =============================================================
+                # SELL CONDITION
+                # 1. 3% Stop-Loss (Live Price)
+                # 2. RSI(3) Crossing Above 85 (আগে ৮৫ এর নিচে ছিল, এখন ৮৫ বা তার উপরে উঠেছে)
+                # =============================================================
                 else:
                     buy_price = open_positions[symbol]['buy_price']
                     stop_price = buy_price * (1 - STOP_LOSS_PCT)
                     
-                    # ১. ৩% স্টপ লস (লাইভ প্রাইসে তৎক্ষণাৎ সেল)
+                    # ১. ৩% স্টপ লস (লাইভ প্রাইজ অনুযায়ী সাথে সাথে সেল)
                     if current_live_price <= stop_price:
                         execute_sell(symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
                     
-                    # ২. ইনস্ট্যান্ট টেক প্রফিট (রানিং ক্যান্ডেলেই RSI-3 মান ৮৫ বা তার বেশি হওয়া মাত্রই সেল)
-                    elif live_rsi3 >= 85:
-                        execute_sell(symbol, reason=f"Live RSI(3) hit {live_rsi3:.2f} (>= 85)")
+                    # ২. RSI(3) Crossing Above 85 (৮৫ কে নিচ থেকে উপরে ক্রস করা)
+                    elif (prev_rsi3 < 85) and (live_rsi3 >= 85):
+                        execute_sell(symbol, reason=f"RSI(3) Crossed Above 85 (Prev: {prev_rsi3:.2f} -> Live: {live_rsi3:.2f})")
 
             print("================ Scan Finished. Waiting 30s ================\n", flush=True)
             time.sleep(30)
