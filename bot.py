@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import threading
 import pandas as pd
 from flask import Flask
@@ -116,7 +117,7 @@ def execute_sell(symbol, reason):
                 break
         
         if step_size:
-            precision = int(round(-pd.np.log10(step_size))) if step_size < 1 else 0
+            precision = int(round(-math.log10(step_size))) if step_size < 1 else 0
             qty = round(qty, precision)
 
         client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
@@ -150,12 +151,10 @@ def strategy_loop():
                 
                 # -------------------------------------------------------------
                 # ক্যান্ডেল ক্লোজড ডাটা ফিল্টারিং:
-                # df.iloc[-1] = রানিং/চলতি ক্যান্ডেল (এটি ব্যবহার করা হচ্ছে না)
-                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া শেষ ৫-মিনিটের ক্যান্ডেল
-                # df.iloc[-3] = তার আগের ক্লোজ হওয়া ক্যান্ডেল
+                # df.iloc[-1] = রানিং/চলতি ক্যান্ডেল
+                # df.iloc[-2] = সবেমাত্র ক্লোজ হওয়া শেষ ৫-মিনিটের ক্যান্ডেল
                 # -------------------------------------------------------------
                 closed_candle = df.iloc[-2]
-                prev_closed_candle = df.iloc[-3]
                 live_candle = df.iloc[-1]
                 
                 closed_price = closed_candle['close']
@@ -165,7 +164,7 @@ def strategy_loop():
                 
                 current_live_price = live_candle['close']
 
-                # BUY CONDITION (ক্লোজড ক্যান্ডেলের ইন্ডকেটর ভ্যালু দিয়ে)
+                # BUY CONDITION (ক্লোজড ক্যান্ডেলের ইন্ডিকেটর ভ্যালু দিয়ে)
                 if symbol not in open_positions:
                     if (closed_rsi3 < 6) and (closed_stoch_k < 20) and (closed_price > closed_ema200):
                         print(f"Signal Confirmed on Closed Candle for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
@@ -176,15 +175,13 @@ def strategy_loop():
                     buy_price = open_positions[symbol]['buy_price']
                     stop_price = buy_price * (1 - STOP_LOSS_PCT)
                     
-                    prev_rsi3 = prev_closed_candle['rsi3']
-                    
-                    # ৩% স্টপ লস সবসময় লাইভ প্রাইসে চেক হবে (ঝুঁকি কমানোর জন্য)
+                    # ১. ৩% স্টপ লস (লাইভ প্রাইসে চেক হবে)
                     if current_live_price <= stop_price:
-                        execute_sell(symbol, reason="3% Stop-Loss Hit (Live Price)")
+                        execute_sell(symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
                     
-                    # প্রফিট টেক (RSI > 85) ক্লোজড ক্যান্ডেলের ক্রসওভারে হবে
-                    elif (prev_rsi3 <= 85) and (closed_rsi3 > 85):
-                        execute_sell(symbol, reason="RSI(3) Closed Above 85")
+                    # ২. প্রফিট টেক (RSI-3 ক্লোজড ক্যান্ডেলে ৮৫ বা তার উপরে থাকলেই সেল হবে)
+                    elif closed_rsi3 >= 85:
+                        execute_sell(symbol, reason=f"RSI(3) Closed at {closed_rsi3:.2f} (>= 85)")
 
             print("================ Scan Finished. Waiting 30s ================\n", flush=True)
             time.sleep(30)
