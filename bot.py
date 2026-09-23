@@ -39,7 +39,8 @@ def home():
 # ACCURATE TRADINGVIEW / BINANCE INDICATOR CALCULATIONS
 # ---------------------------------------------------------
 def calculate_indicators(df):
-    # 1. EMA 100 & EMA 200
+    # 1. EMA 50, EMA 100 & EMA 200
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
@@ -71,7 +72,7 @@ def calculate_indicators(df):
 # ---------------------------------------------------------
 # STRATEGY FUNCTIONS
 # ---------------------------------------------------------
-def get_top_50_usdt_pairs():
+def get_top_150_usdt_pairs():
     try:
         tickers = client.get_ticker()
         usdt_pairs = []
@@ -82,7 +83,8 @@ def get_top_50_usdt_pairs():
                 if base_asset not in STABLECOINS:
                     usdt_pairs.append({'symbol': symbol, 'quoteVolume': float(t['quoteVolume'])})
         sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
-        return [p['symbol'] for p in sorted_pairs[:50]]
+        # টপ ১৫০টি ভলিউম টোকেন রিটার্ন করবে
+        return [p['symbol'] for p in sorted_pairs[:150]]
     except Exception as e:
         print(f"Error fetching pairs: {e}", flush=True)
         return []
@@ -146,30 +148,33 @@ def strategy_loop():
         try:
             current_time = time.time()
             
-            # প্রতি ১৫ মিনিটে (৯০০ সেকেন্ড) ১ বার পেয়ার লিস্ট রিফ্রেশ করা হবে
+            # প্রতি ১৫ মিনিটে (৯০০ সেকেন্ড) ১ বার পেয়ার লিস্ট রিফ্রেশ করবে
             if not cached_symbols or (current_time - last_symbol_fetch_time) > 900:
-                print("Fetching Top 50 USDT Pairs from Binance...", flush=True)
-                new_pairs = get_top_50_usdt_pairs()
-                last_symbol_fetch_time = current_time  # ফেচ ব্যর্থ হলেও টাইম আপডেট হবে যেন বারবার হিট না করে
+                print("Fetching Top 150 USDT Pairs from Binance...", flush=True)
+                new_pairs = get_top_150_usdt_pairs()
+                last_symbol_fetch_time = current_time
                 if new_pairs:
                     cached_symbols = new_pairs
 
-            # যদি ক্যাশ খালি থাকে বা IP Banned হয়, তবে ৫ মিনিট ওয়েট করবে
             if not cached_symbols:
                 print("Could not fetch pairs or IP Banned. Waiting 5 minutes...", flush=True)
                 time.sleep(300)
                 continue
 
             print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
-            print(f"Active Pairs: {', '.join(cached_symbols)}", flush=True)
+            print(f"Active Pairs Count: {len(cached_symbols)}", flush=True)
             if open_positions:
                 print(f"--> Currently Tracking Positions for Sell: {list(open_positions.keys())}", flush=True)
             
             for index, symbol in enumerate(cached_symbols):
                 df = get_klines_data(symbol)
                 
-                # Render Shared IP-র জন্য ০.৮ সেকেন্ড ডিলে
-                time.sleep(0.8)
+                # API Rate Limit এড়াতে প্রতি টোকেনের মাঝে ০.৩ সেকেন্ড ডিলে
+                time.sleep(0.3)
+
+                # প্রতি ৫০টি টোকেন স্ক্যান হওয়ার পর ৩ সেকেন্ডের সেফটি বিরতি (Batch Break)
+                if (index + 1) % 50 == 0:
+                    time.sleep(3)
 
                 if df is None or len(df) < 200:
                     continue
@@ -181,6 +186,7 @@ def strategy_loop():
                 
                 # বাই ডাটা
                 closed_price = closed_candle['close']
+                closed_ema50 = closed_candle['ema50']
                 closed_ema100 = closed_candle['ema100']
                 closed_ema200 = closed_candle['ema200']
                 closed_rsi3 = closed_candle['rsi3']
@@ -195,12 +201,13 @@ def strategy_loop():
                 # BUY CONDITION
                 # =============================================================
                 if symbol not in open_positions:
-                    if (closed_ema100 > closed_ema200) and \
-                       (closed_price > closed_ema100) and \
+                    if (closed_ema50 > closed_ema100) and \
+                       (closed_ema100 > closed_ema200) and \
+                       (closed_price > closed_ema50) and \
                        (prev_closed_rsi3 >= 6) and (closed_rsi3 < 6) and \
                        (closed_stoch_k < 20):
                         
-                        print(f"Signal Confirmed for {symbol} | EMA100 > EMA200 | Price > EMA100 | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
+                        print(f"Signal Confirmed for {symbol} | EMA50 > EMA100 > EMA200 | Price > EMA50 | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                         execute_buy(symbol)
 
                 # =============================================================
@@ -219,9 +226,20 @@ def strategy_loop():
                     elif live_rsi3 >= 85:
                         execute_sell(symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
 
-            print("================ Scan Finished. Waiting 15s ================\n", flush=True)
-            time.sleep(15)
+            print("================ Scan Finished. Waiting 10s ================\n", flush=True)
+            time.sleep(10)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
             time.sleep(30)
+
+# ---------------------------------------------------------
+# MAIN RUNNER
+# ---------------------------------------------------------
+if __name__ == '__main__':
+    t = threading.Thread(target=strategy_loop)
+    t.daemon = True
+    t.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
