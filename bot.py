@@ -12,7 +12,7 @@ import websocket
 # ---------------------------------------------------------
 # BINANCE API KEYS
 # ---------------------------------------------------------
-API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
+API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0"M
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
 
 client = Client(API_KEY, API_SECRET)
@@ -94,7 +94,7 @@ def load_initial_candles(symbol):
         ])
         df['close'] = df['close'].astype(float)
         return df
-    except:
+    except Exception as e:
         return None
 
 # ---------------------------------------------------------
@@ -136,7 +136,7 @@ def on_message(ws, message):
                 closed = df.iloc[-2]
 
                 if symbol not in open_positions:
-                    # বাই সিগন্যাল টেস্ট (RSI3 < 10 এ ফিল্টার করা হয়েছে)
+                    # বাই সিগন্যাল টেস্ট (RSI3 < 10)
                     if (closed['ema50'] > closed['ema100'] > closed['ema200']) and \
                        (closed['close'] > closed['ema50']) and \
                        (prev_closed['rsi3'] >= 10) and (closed['rsi3'] < 10) and \
@@ -144,7 +144,7 @@ def on_message(ws, message):
                         print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f} | Price: {close_price}", flush=True)
                         execute_buy(symbol)
 
-            # কাউন্টার আপডেট (প্রিন্ট ক্লিন রাখার জন্য)
+            # কাউন্টার আপডেট
             with counter_lock:
                 scanned_count += 1
                 if scanned_count % 20 == 0:
@@ -189,7 +189,7 @@ def start_websocket_system():
         df = load_initial_candles(p)
         if df is not None:
             symbol_data[p] = df
-        time.sleep(0.05)
+        time.sleep(0.12)  # IP Ban এড়াতে রিকোয়েস্টের মধ্যে নিরাপদ বিরতি
 
     print(f"Initial Candles Loaded for {len(symbol_data)} Pairs!", flush=True)
 
