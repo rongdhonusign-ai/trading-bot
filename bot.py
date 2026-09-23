@@ -83,7 +83,6 @@ def get_top_150_usdt_pairs():
                 if base_asset not in STABLECOINS:
                     usdt_pairs.append({'symbol': symbol, 'quoteVolume': float(t['quoteVolume'])})
         sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
-        # টপ ১৫০টি ভলিউম টোকেন রিটার্ন করবে
         return [p['symbol'] for p in sorted_pairs[:150]]
     except Exception as e:
         print(f"Error fetching pairs: {e}", flush=True)
@@ -117,6 +116,9 @@ def execute_buy(symbol):
     except Exception as e:
         print(f"Error buying {symbol}: {e}", flush=True)
 
+# ---------------------------------------------------------
+# UPDATED SELL FUNCTION (WITH MANUAL SELL AUTO-CLEARING)
+# ---------------------------------------------------------
 def execute_sell(symbol, reason):
     try:
         qty = open_positions[symbol]['qty']
@@ -138,6 +140,11 @@ def execute_sell(symbol, reason):
         del open_positions[symbol]
     except Exception as e:
         print(f"Error selling {symbol}: {e}", flush=True)
+        # যদি ম্যানুয়ালি সেল করার কারণে ব্যালেন্স না থাকে, তবে বোটের মেমোরি থেকে টোকেনটি ডিলিট করে দেবে
+        if "-2010" in str(e) or "insufficient balance" in str(e).lower():
+            print(f"Manually sold detected or Insufficient balance! Clearing {symbol} from bot memory.", flush=True)
+            if symbol in open_positions:
+                del open_positions[symbol]
 
 def strategy_loop():
     global cached_symbols, last_symbol_fetch_time
