@@ -1,11 +1,14 @@
 import os
+import json
 import time
 import math
+import asyncio
 import threading
 import pandas as pd
 from flask import Flask
 from binance.client import Client
 from binance.enums import *
+import websocket
 
 # ---------------------------------------------------------
 # BINANCE API KEYS
@@ -21,29 +24,25 @@ TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
 STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WBTC', 'WETH', 'PAX']
 open_positions = {}
-
-# ক্যাশিংয়ের জন্য গ্লোবাল ভ্যারিয়েবল
-cached_symbols = []
-last_symbol_fetch_time = 0
+symbol_data = {}  # ক্যান্ডেল হিস্ট্রি স্টোর করার জন্য
 
 # ---------------------------------------------------------
-# FLASK SERVER (Render Port Binding)
+# FLASK SERVER
 # ---------------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Trading Bot is Active & Running!", 200
+    return "Trading Bot via WebSocket is Active!", 200
 
 # ---------------------------------------------------------
-# ACCURATE TRADINGVIEW / BINANCE INDICATOR CALCULATIONS
+# INDICATORS
 # ---------------------------------------------------------
 def calculate_indicators(df):
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-    # RSI 3
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -54,7 +53,6 @@ def calculate_indicators(df):
     rs3 = avg_gain3 / avg_loss3
     df['rsi3'] = 100.0 - (100.0 / (1.0 + rs3))
 
-    # RSI 14 for Stoch RSI
     alpha14 = 1.0 / 14
     avg_gain14 = gain.ewm(alpha=alpha14, adjust=False).mean()
     avg_loss14 = loss.ewm(alpha=alpha14, adjust=False).mean()
@@ -67,194 +65,129 @@ def calculate_indicators(df):
     return df
 
 # ---------------------------------------------------------
-# STRATEGY FUNCTIONS (OPTIMIZED FOR API WEIGHT)
+# FETCH INITIAL TOP 120 PAIRS
 # ---------------------------------------------------------
 def get_top_120_usdt_pairs():
-    """get_all_tickers() দিয়ে মাত্র ১ API Weight খরচে ১২০টি পেয়ার ফিল্টার করা"""
     try:
-        tickers = client.get_all_tickers() # এটি অত্যন্ত হালকা এবং সেফ কল
+        tickers = client.get_all_tickers()
         usdt_pairs = []
         for t in tickers:
             symbol = t['symbol']
             if symbol.endswith('USDT'):
                 base_asset = symbol.replace('USDT', '')
                 if base_asset not in STABLECOINS:
-                    usdt_pairs.append({'symbol': symbol, 'price': float(t['price'])})
-        
-        return [p['symbol'] for p in usdt_pairs[:120]] # টপ ১২০টি পেয়ার
+                    usdt_pairs.append(symbol)
+        return usdt_pairs[:120]
     except Exception as e:
-        print(f"Error fetching pairs: {e}", flush=True)
+        print(f"Error getting pairs: {e}", flush=True)
         return []
 
-def get_klines_data(symbol):
+def load_initial_candles(symbol):
     try:
-        # limit=100 দেওয়া হয়েছে যেন API Ban না হয়
         klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
         ])
         df['close'] = df['close'].astype(float)
-        df = calculate_indicators(df)
         return df
-    except Exception as e:
+    except:
         return None
+
+# ---------------------------------------------------------
+# WEBSOCKET STREAM HANDLER
+# ---------------------------------------------------------
+def on_message(ws, message):
+    data = json.loads(message)
+    if 'data' in data:
+        kline = data['data']['k']
+        symbol = kline['s']
+        is_closed = kline['x']  # ক্যান্ডেল ক্লোজ হয়েছে কিনা (True/False)
+        close_price = float(kline['c'])
+
+        # ১. ওপেন পজিশন ট্র্যাকিং (প্রফিট/স্টপ লস)
+        if symbol in open_positions:
+            buy_price = open_positions[symbol]['buy_price']
+            stop_price = buy_price * (1 - STOP_LOSS_PCT)
+            
+            if close_price <= stop_price:
+                execute_sell(symbol, "Stop-Loss Hit")
+            elif is_closed:
+                # টেক প্রফিট চেক
+                df = symbol_data.get(symbol)
+                if df is not None:
+                    df = calculate_indicators(df)
+                    if df.iloc[-1]['rsi3'] >= 85:
+                        execute_sell(symbol, "Take Profit Hit (RSI3 >= 85)")
+
+        # ২. ক্যান্ডেল ক্লোজ হলে বাই সিগন্যাল স্ক্যানিং
+        if is_closed:
+            df = symbol_data.get(symbol)
+            if df is not None:
+                # নতুন ক্লোজড ক্যান্ডেল ডাটাবেজে যুক্ত করা
+                new_row = pd.DataFrame([{'close': close_price}])
+                df = pd.concat([df, new_row], ignore_index=True).iloc[-100:]
+                df = calculate_indicators(df)
+                symbol_data[symbol] = df
+
+                prev_closed = df.iloc[-3]
+                closed = df.iloc[-2]
+
+                if symbol not in open_positions:
+                    if (closed['ema50'] > closed['ema100'] > closed['ema200']) and \
+                       (closed['close'] > closed['ema50']) and \
+                       (prev_closed['rsi3'] >= 6) and (closed['rsi3'] < 6) and \
+                       (closed['stoch_k'] < 20):
+                        print(f"--> [SIGNAL MATCHED] WebSocket Buy for {symbol}", flush=True)
+                        execute_buy(symbol)
 
 def execute_buy(symbol):
     try:
-        print(f"--> [BUY SIGNAL] Buying {symbol} for ${TRADE_AMOUNT_USDT}", flush=True)
-        order = client.create_order(
-            symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quoteOrderQty=TRADE_AMOUNT_USDT
-        )
-        executed_qty = float(order['executedQty'])
-        cummulative_quote_qty = float(order['cummulativeQuoteQty'])
-        avg_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else 0
-
-        open_positions[symbol] = {'buy_price': avg_price, 'qty': executed_qty}
-        print(f"SUCCESS: Bought {symbol} at avg price {avg_price}", flush=True)
+        order = client.create_order(symbol=symbol, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quoteOrderQty=TRADE_AMOUNT_USDT)
+        exec_qty = float(order['executedQty'])
+        cum_qty = float(order['cummulativeQuoteQty'])
+        avg_price = cum_qty / exec_qty if exec_qty > 0 else 0
+        open_positions[symbol] = {'buy_price': avg_price, 'qty': exec_qty}
+        print(f"SUCCESS: Bought {symbol} at {avg_price}", flush=True)
     except Exception as e:
-        print(f"Error buying {symbol}: {e}", flush=True)
+        print(f"Buy Error {symbol}: {e}", flush=True)
 
 def execute_sell(symbol, reason):
     try:
         qty = open_positions[symbol]['qty']
-        print(f"--> [SELL SIGNAL: {reason}] Selling 100% of {symbol}", flush=True)
-        
         info = client.get_symbol_info(symbol)
-        step_size = None
-        for f in info['filters']:
-            if f['filterType'] == 'LOT_SIZE':
-                step_size = float(f['stepSize'])
-                break
-        
-        if step_size:
-            precision = int(round(-math.log10(step_size))) if step_size < 1 else 0
-            qty = round(qty, precision)
+        step_size = next(f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
+        precision = int(round(-math.log10(float(step_size)))) if float(step_size) < 1 else 0
+        qty = round(qty, precision)
 
         client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
-        print(f"SUCCESS: Sold {symbol}. Reason: {reason}", flush=True)
+        print(f"SUCCESS: Sold {symbol} | Reason: {reason}", flush=True)
         del open_positions[symbol]
     except Exception as e:
-        print(f"Error selling {symbol}: {e}", flush=True)
-        if "-2010" in str(e) or "insufficient balance" in str(e).lower():
-            print(f"Manually sold detected! Clearing {symbol} from memory.", flush=True)
-            if symbol in open_positions:
-                del open_positions[symbol]
+        print(f"Sell Error {symbol}: {e}", flush=True)
 
-# ---------------------------------------------------------
-# POSITIONS TRACKER
-# ---------------------------------------------------------
-def check_and_sell_open_positions():
-    """ওপেন পজিশনগুলোর টেক প্রফিট ও স্টপ লস ট্র্যাকিং"""
-    if not open_positions:
-        return
-
-    for pos_symbol in list(open_positions.keys()):
-        df_pos = get_klines_data(pos_symbol)
-        if df_pos is not None and len(df_pos) >= 50:
-            live_candle = df_pos.iloc[-1]
-            current_live_price = live_candle['close']
-            live_rsi3 = live_candle['rsi3']
-            
-            buy_price = open_positions[pos_symbol]['buy_price']
-            stop_price = buy_price * (1 - STOP_LOSS_PCT)
-            profit_pct = ((current_live_price - buy_price) / buy_price) * 100
-            
-            if current_live_price <= stop_price:
-                execute_sell(pos_symbol, reason=f"3% Stop-Loss Hit (Price: {current_live_price})")
-            elif live_rsi3 >= 85:
-                execute_sell(pos_symbol, reason=f"Take Profit Hit | Live RSI3: {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
-        
-        time.sleep(0.3)
-
-# ---------------------------------------------------------
-# STRATEGY LOOP (SAFE BATCH SCANNING: 3 x 40 PAIRS)
-# ---------------------------------------------------------
-def strategy_loop():
-    global cached_symbols, last_symbol_fetch_time
-    print("Bot Scanner Thread Started...", flush=True)
-    time.sleep(5)
+def start_websocket():
+    pairs = get_top_120_usdt_pairs()
+    print(f"Loading initial candles for {len(pairs)} pairs...", flush=True)
     
-    while True:
-        try:
-            current_time = time.time()
-            
-            # প্রতি ১৫ মিনিটে পেয়ার লিস্ট রিফ্রেশ
-            if not cached_symbols or (current_time - last_symbol_fetch_time) > 900:
-                print("Fetching Top 120 USDT Pairs from Binance...", flush=True)
-                new_pairs = get_top_120_usdt_pairs()
-                last_symbol_fetch_time = current_time
-                if new_pairs:
-                    cached_symbols = new_pairs
+    for p in pairs:
+        df = load_initial_candles(p)
+        if df is not None:
+            symbol_data[p] = df
+        time.sleep(0.1) # সেফ লোড
 
-            if not cached_symbols:
-                print("Could not fetch pairs. Waiting 3 minutes...", flush=True)
-                time.sleep(180)
-                continue
+    # ১২০টি টোকেনকে বিন্যান্স স্ট্রিম ইউআরএল-এ যুক্ত করা
+    streams = "/".join([f"{p.lower()}@kline_5m" for p in pairs])
+    socket_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
 
-            # ১২০টি পেয়ারকে ৪০টি করে ৩টি ব্যাচে ভাগ করা (40 x 3 = 120)
-            batch_size = 40
-            batches = [cached_symbols[i:i + batch_size] for i in range(0, len(cached_symbols), batch_size)]
-
-            for batch_index, current_batch in enumerate(batches):
-                
-                # ব্যাচ শুরুর আগে ওপেন পজিশন চেক
-                if open_positions:
-                    check_and_sell_open_positions()
-
-                print(f"\n---> Scanning Batch {batch_index + 1}/3 ({len(current_batch)} Pairs) <---", flush=True)
-
-                for index, symbol in enumerate(current_batch):
-                    
-                    df = get_klines_data(symbol)
-                    time.sleep(0.4) # সেফ ডিলে
-
-                    if df is None or len(df) < 50:
-                        continue
-                    
-                    prev_closed_candle = df.iloc[-3]
-                    closed_candle = df.iloc[-2]
-                    
-                    closed_price = closed_candle['close']
-                    closed_ema50 = closed_candle['ema50']
-                    closed_ema100 = closed_candle['ema100']
-                    closed_ema200 = closed_candle['ema200']
-                    closed_rsi3 = closed_candle['rsi3']
-                    prev_closed_rsi3 = prev_closed_candle['rsi3']
-                    closed_stoch_k = closed_candle['stoch_k']
-
-                    # BUY CONDITION
-                    if symbol not in open_positions:
-                        if (closed_ema50 > closed_ema100) and \
-                           (closed_ema100 > closed_ema200) and \
-                           (closed_price > closed_ema50) and \
-                           (prev_closed_rsi3 >= 6) and (closed_rsi3 < 6) and \
-                           (closed_stoch_k < 20):
-                            
-                            print(f"Signal Confirmed for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
-                            execute_buy(symbol)
-
-                # ব্যাচ শেষে সেফটি কুল-ডাউন ২০ সেকেন্ড
-                if batch_index < len(batches) - 1:
-                    print(f"--> Batch {batch_index + 1} done. Cooling down for 20 seconds...", flush=True)
-                    time.sleep(20)
-
-            # ব্যাচ শেষে পজিশন চেক
-            if open_positions:
-                check_and_sell_open_positions()
-
-            print("\n================ All Batches Finished. Waiting 15s ================\n", flush=True)
-            time.sleep(15)
-            
-        except Exception as e:
-            print(f"Loop error: {e}", flush=True)
-            time.sleep(20)
+    ws = websocket.WebSocketApp(socket_url, on_message=on_message)
+    ws.run_forever()
 
 # ---------------------------------------------------------
-# MAIN RUNNER
+# MAIN
 # ---------------------------------------------------------
 if __name__ == '__main__':
-    t = threading.Thread(target=strategy_loop)
+    t = threading.Thread(target=start_websocket)
     t.daemon = True
     t.start()
 
