@@ -25,8 +25,8 @@ STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WB
 open_positions = {}
 symbol_data = {}  # ক্যান্ডেল হিস্ট্রি স্টোর করার জন্য
 
-# Thread-safe Counter Variables
-scanned_symbols_this_candle = set()
+# Thread-Safe Counter Variables
+scanned_count = 0
 counter_lock = threading.Lock()
 
 # ---------------------------------------------------------
@@ -101,7 +101,7 @@ def load_initial_candles(symbol):
 # WEBSOCKET STREAM HANDLER
 # ---------------------------------------------------------
 def on_message(ws, message):
-    global scanned_symbols_this_candle
+    global scanned_count
     data = json.loads(message)
     if 'data' in data:
         kline = data['data']['k']
@@ -136,28 +136,19 @@ def on_message(ws, message):
                 closed = df.iloc[-2]
 
                 if symbol not in open_positions:
+                    # বাই সিগন্যাল টেস্ট
                     if (closed['ema50'] > closed['ema100'] > closed['ema200']) and \
                        (closed['close'] > closed['ema50']) and \
                        (prev_closed['rsi3'] >= 6) and (closed['rsi3'] < 6) and \
                        (closed['stoch_k'] < 20):
-                        print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f}", flush=True)
+                        print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f} | Price: {close_price}", flush=True)
                         execute_buy(symbol)
 
-            # Thread-safe Counting
+            # কাউন্টার আপডেট (প্রিন্ট ক্লিন রাখার জন্য)
             with counter_lock:
-                scanned_symbols_this_candle.add(symbol)
-                count = len(scanned_symbols_this_candle)
-                total_loaded_pairs = len(symbol_data) if len(symbol_data) > 0 else 120
-
-                # প্রতি ১০টি টোকেন স্ক্যান হলে একটি লাইট স্টেটাস প্রিন্ট
-                if count % 10 == 0 or count == total_loaded_pairs:
-                    print(f"--> [Scan Progress] {count}/{total_loaded_pairs} tokens scanned...", flush=True)
-
-                if count >= total_loaded_pairs:
-                    print(f"\n==================================================")
-                    print(f" SUCCESS: All {count}/{total_loaded_pairs} Tokens Successfully Scanned!")
-                    print(f"==================================================\n", flush=True)
-                    scanned_symbols_this_candle.clear()
+                scanned_count += 1
+                if scanned_count % 20 == 0:
+                    print(f"--> [Live Scan Active] Processed {scanned_count} Candle Closes...", flush=True)
 
 def execute_buy(symbol):
     try:
