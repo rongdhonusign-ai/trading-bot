@@ -173,7 +173,7 @@ def check_and_sell_open_positions():
         time.sleep(0.2)  # দ্রুত চেকিংয়ের সময় ছোট ডিলে
 
 # ---------------------------------------------------------
-# STRATEGY LOOP (WITH HIGH-PRIORITY POSITION MONITORING)
+# STRATEGY LOOP (BATCH SCANNING + INSTANT SELL TRACKING)
 # ---------------------------------------------------------
 def strategy_loop():
     global cached_symbols, last_symbol_fetch_time
@@ -197,68 +197,69 @@ def strategy_loop():
                 time.sleep(300)
                 continue
 
-            # =============================================================
-            # ১. হাই-প্রায়োরিটি চেক: নতুন স্ক্যান শুরুর আগে কেনা পজিশন চেক
-            # =============================================================
-            if open_positions:
-                print(f"\n[PRIORITY CHECK] Monitoring Open Positions: {list(open_positions.keys())}", flush=True)
-                check_and_sell_open_positions()
+            # ১৫০টি পেয়ারকে ৩টি ৫০-এর ব্যাচে ভাগ করা (Batch 1: 0-50, Batch 2: 50-100, Batch 3: 100-150)
+            batch_size = 50
+            batches = [cached_symbols[i:i + batch_size] for i in range(0, len(cached_symbols), batch_size)]
 
-            # =============================================================
-            # ২. টপ ১৫০ পেয়ার স্ক্যান (মার্কেট বাই করার জন্য)
-            # =============================================================
-            print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
-            print(f"Active Pairs Count: {len(cached_symbols)}", flush=True)
-            
-            for index, symbol in enumerate(cached_symbols):
+            for batch_index, current_batch in enumerate(batches):
                 
-                # মিড-স্ক্যান চেক: প্রতি ১০টি টোকেন স্ক্যান করার মাঝে ওপেন পজিশনগুলো দ্রুত চেক করা
-                if open_positions and index % 10 == 0:
+                # ১. প্রতিটি ব্যাচ শুরু করার আগে কেনা পজিশনগুলোর সেল চেকিং (হাই-প্রায়োরিটি)
+                if open_positions:
+                    print(f"\n[PRIORITY CHECK] Tracking Open Positions before Batch {batch_index + 1}: {list(open_positions.keys())}", flush=True)
                     check_and_sell_open_positions()
 
-                df = get_klines_data(symbol)
-                
-                # এপিআই রেট লিমিট রক্ষা করতে সামান্য ডিলে
-                time.sleep(0.3)
+                print(f"\n---> Scanning Batch {batch_index + 1}/3 ({len(current_batch)} Pairs) <---", flush=True)
 
-                # প্রতি ৫০টি টোকেন পর ৩ সেকেন্ড সেফটি ব্রেইক
-                if (index + 1) % 50 == 0:
-                    time.sleep(3)
+                for index, symbol in enumerate(current_batch):
+                    
+                    # মিড-স্ক্যান চেক: ব্যাচের মধ্যে প্রতি ১০টি টোকেন পরপর ওপেন পজিশন চেক
+                    if open_positions and index % 10 == 0:
+                        check_and_sell_open_positions()
 
-                if df is None or len(df) < 200:
-                    continue
-                
-                # ক্যান্ডেল ডাটা
-                prev_closed_candle = df.iloc[-3]
-                closed_candle = df.iloc[-2]
-                
-                closed_price = closed_candle['close']
-                closed_ema50 = closed_candle['ema50']
-                closed_ema100 = closed_candle['ema100']
-                closed_ema200 = closed_candle['ema200']
-                closed_rsi3 = closed_candle['rsi3']
-                prev_closed_rsi3 = prev_closed_candle['rsi3']
-                closed_stoch_k = closed_candle['stoch_k']
+                    df = get_klines_data(symbol)
+                    
+                    # API Rate Limit বাঁচাতে প্রতি টোকেনের মাঝে ০.৪ সেকেন্ড বিরতি
+                    time.sleep(0.4)
 
-                # =============================================================
-                # BUY CONDITION
-                # =============================================================
-                if symbol not in open_positions:
-                    if (closed_ema50 > closed_ema100) and \
-                       (closed_ema100 > closed_ema200) and \
-                       (closed_price > closed_ema50) and \
-                       (prev_closed_rsi3 >= 6) and (closed_rsi3 < 6) and \
-                       (closed_stoch_k < 20):
-                        
-                        print(f"Signal Confirmed for {symbol} | EMA50 > EMA100 > EMA200 | Price > EMA50 | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
-                        execute_buy(symbol)
+                    if df is None or len(df) < 200:
+                        continue
+                    
+                    # ক্যান্ডেল ডাটা
+                    prev_closed_candle = df.iloc[-3]
+                    closed_candle = df.iloc[-2]
+                    
+                    closed_price = closed_candle['close']
+                    closed_ema50 = closed_candle['ema50']
+                    closed_ema100 = closed_candle['ema100']
+                    closed_ema200 = closed_candle['ema200']
+                    closed_rsi3 = closed_candle['rsi3']
+                    prev_closed_rsi3 = prev_closed_candle['rsi3']
+                    closed_stoch_k = closed_candle['stoch_k']
 
-            print("================ Scan Finished. Waiting 5s ================\n", flush=True)
-            time.sleep(5)
+                    # =============================================================
+                    # BUY CONDITION
+                    # =============================================================
+                    if symbol not in open_positions:
+                        if (closed_ema50 > closed_ema100) and \
+                           (closed_ema100 > closed_ema200) and \
+                           (closed_price > closed_ema50) and \
+                           (prev_closed_rsi3 >= 6) and (closed_rsi3 < 6) and \
+                           (closed_stoch_k < 20):
+                            
+                            print(f"Signal Confirmed for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
+                            execute_buy(symbol)
+
+                # ৫০টি টোকেন স্ক্যান শেষে Binance API রিকুয়েস্ট কুল-ডাউনের জন্য ২০ সেকেন্ডের সেফটি বিরতি
+                if batch_index < len(batches) - 1:
+                    print(f"--> Batch {batch_index + 1} completed. Cooling down API weight for 20 seconds...", flush=True)
+                    time.sleep(20)
+
+            print("\n================ All 3 Batches Finished. Waiting 10s ================\n", flush=True)
+            time.sleep(10)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
-            time.sleep(10)
+            time.sleep(15)
 
 # ---------------------------------------------------------
 # MAIN RUNNER
