@@ -39,31 +39,28 @@ def home():
 # ACCURATE TRADINGVIEW / BINANCE INDICATOR CALCULATIONS
 # ---------------------------------------------------------
 def calculate_indicators(df):
-    # 1. EMA 50, EMA 100 & EMA 200
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-    # 2. ACCURATE RSI 3 (Binance & TradingView Wilder's RMA Method)
+    # RSI 3
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
 
-    # Wilder's Smoothing for RSI 3
     alpha3 = 1.0 / 3
     avg_gain3 = gain.ewm(alpha=alpha3, adjust=False).mean()
     avg_loss3 = loss.ewm(alpha=alpha3, adjust=False).mean()
     rs3 = avg_gain3 / avg_loss3
     df['rsi3'] = 100.0 - (100.0 / (1.0 + rs3))
 
-    # 3. ACCURATE RSI 14 (Wilder's RMA Method) for Stoch RSI
+    # RSI 14 for Stoch RSI
     alpha14 = 1.0 / 14
     avg_gain14 = gain.ewm(alpha=alpha14, adjust=False).mean()
     avg_loss14 = loss.ewm(alpha=alpha14, adjust=False).mean()
     rs14 = avg_gain14 / avg_loss14
     rsi14 = 100.0 - (100.0 / (1.0 + rs14))
 
-    # Stoch RSI (14, 14, 3, 3) -> K line
     stoch_rsi = (rsi14 - rsi14.rolling(14).min()) / (rsi14.rolling(14).max() - rsi14.rolling(14).min())
     df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100.0
 
@@ -72,7 +69,8 @@ def calculate_indicators(df):
 # ---------------------------------------------------------
 # STRATEGY FUNCTIONS
 # ---------------------------------------------------------
-def get_top_150_usdt_pairs():
+def get_top_120_usdt_pairs():
+    """টপ ১২০টি পেয়ার ফিল্টার করা"""
     try:
         tickers = client.get_ticker()
         usdt_pairs = []
@@ -83,14 +81,15 @@ def get_top_150_usdt_pairs():
                 if base_asset not in STABLECOINS:
                     usdt_pairs.append({'symbol': symbol, 'quoteVolume': float(t['quoteVolume'])})
         sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
-        return [p['symbol'] for p in sorted_pairs[:150]]
+        return [p['symbol'] for p in sorted_pairs[:120]] # ১২০টি টপ পেয়ার
     except Exception as e:
         print(f"Error fetching pairs: {e}", flush=True)
         return []
 
 def get_klines_data(symbol):
     try:
-        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=250)
+        # limit=100 দেওয়া হয়েছে যেন হালকা ক্যান্ডেল ডাটা আসে এবং API Ban না হয়
+        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
@@ -137,23 +136,22 @@ def execute_sell(symbol, reason):
         del open_positions[symbol]
     except Exception as e:
         print(f"Error selling {symbol}: {e}", flush=True)
-        # ম্যানুয়ালি সেল করলে বা ব্যালেন্স না থাকলে মেমোরি থেকে ডিলিট করে দেওয়া হবে
         if "-2010" in str(e) or "insufficient balance" in str(e).lower():
-            print(f"Manually sold detected or Insufficient balance! Clearing {symbol} from bot memory.", flush=True)
+            print(f"Manually sold detected! Clearing {symbol} from memory.", flush=True)
             if symbol in open_positions:
                 del open_positions[symbol]
 
 # ---------------------------------------------------------
-# OPEN POSITIONS TRACKER FUNCTION
+# POSITIONS TRACKER
 # ---------------------------------------------------------
 def check_and_sell_open_positions():
-    """ওপেন পজিশনগুলোর লাইভ প্রাইস এবং RSI চটজলদি চেক করে সেল করার ফাংশন"""
+    """ওপেন পজিশনগুলোর টেক প্রফিট ও স্টপ লস ট্র্যাকিং"""
     if not open_positions:
         return
 
     for pos_symbol in list(open_positions.keys()):
         df_pos = get_klines_data(pos_symbol)
-        if df_pos is not None and len(df_pos) >= 200:
+        if df_pos is not None and len(df_pos) >= 50:
             live_candle = df_pos.iloc[-1]
             current_live_price = live_candle['close']
             live_rsi3 = live_candle['rsi3']
@@ -162,18 +160,15 @@ def check_and_sell_open_positions():
             stop_price = buy_price * (1 - STOP_LOSS_PCT)
             profit_pct = ((current_live_price - buy_price) / buy_price) * 100
             
-            # ১. ৩% স্টপ লস চেক
             if current_live_price <= stop_price:
-                execute_sell(pos_symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
-            
-            # ২. টেক প্রফিট চেক (Live RSI3 >= 85)
+                execute_sell(pos_symbol, reason=f"3% Stop-Loss Hit (Price: {current_live_price})")
             elif live_rsi3 >= 85:
-                execute_sell(pos_symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
+                execute_sell(pos_symbol, reason=f"Take Profit Hit | Live RSI3: {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
         
-        time.sleep(0.2)  # দ্রুত চেকিংয়ের সময় ছোট ডিলে
+        time.sleep(0.3)
 
 # ---------------------------------------------------------
-# STRATEGY LOOP (BATCH SCANNING + INSTANT SELL TRACKING)
+# STRATEGY LOOP (SAFE BATCH SCANNING: 3 x 40 PAIRS)
 # ---------------------------------------------------------
 def strategy_loop():
     global cached_symbols, last_symbol_fetch_time
@@ -184,47 +179,39 @@ def strategy_loop():
         try:
             current_time = time.time()
             
-            # প্রতি ১৫ মিনিটে পেয়ার লিস্ট রিফ্রেশ করা
+            # প্রতি ১৫ মিনিটে পেয়ার লিস্ট রিফ্রেশ
             if not cached_symbols or (current_time - last_symbol_fetch_time) > 900:
-                print("Fetching Top 150 USDT Pairs from Binance...", flush=True)
-                new_pairs = get_top_150_usdt_pairs()
+                print("Fetching Top 120 USDT Pairs from Binance...", flush=True)
+                new_pairs = get_top_120_usdt_pairs()
                 last_symbol_fetch_time = current_time
                 if new_pairs:
                     cached_symbols = new_pairs
 
             if not cached_symbols:
-                print("Could not fetch pairs or IP Banned. Waiting 5 minutes...", flush=True)
-                time.sleep(300)
+                print("Could not fetch pairs. Waiting 3 minutes...", flush=True)
+                time.sleep(180)
                 continue
 
-            # ১৫০টি পেয়ারকে ৩টি ৫০-এর ব্যাচে ভাগ করা (Batch 1: 0-50, Batch 2: 50-100, Batch 3: 100-150)
-            batch_size = 50
+            # ১২০টি পেয়ারকে ৪০টি করে ৩টি ব্যাচে ভাগ করা (40 x 3 = 120)
+            batch_size = 40
             batches = [cached_symbols[i:i + batch_size] for i in range(0, len(cached_symbols), batch_size)]
 
             for batch_index, current_batch in enumerate(batches):
                 
-                # ১. প্রতিটি ব্যাচ শুরু করার আগে কেনা পজিশনগুলোর সেল চেকিং (হাই-প্রায়োরিটি)
+                # ব্যাচ শুরুর আগে ওপেন পজিশন চেক
                 if open_positions:
-                    print(f"\n[PRIORITY CHECK] Tracking Open Positions before Batch {batch_index + 1}: {list(open_positions.keys())}", flush=True)
                     check_and_sell_open_positions()
 
                 print(f"\n---> Scanning Batch {batch_index + 1}/3 ({len(current_batch)} Pairs) <---", flush=True)
 
                 for index, symbol in enumerate(current_batch):
                     
-                    # মিড-স্ক্যান চেক: ব্যাচের মধ্যে প্রতি ১০টি টোকেন পরপর ওপেন পজিশন চেক
-                    if open_positions and index % 10 == 0:
-                        check_and_sell_open_positions()
-
                     df = get_klines_data(symbol)
-                    
-                    # API Rate Limit বাঁচাতে প্রতি টোকেনের মাঝে ০.৪ সেকেন্ড বিরতি
-                    time.sleep(0.4)
+                    time.sleep(0.4) # সেফ ডিলে
 
-                    if df is None or len(df) < 200:
+                    if df is None or len(df) < 50:
                         continue
                     
-                    # ক্যান্ডেল ডাটা
                     prev_closed_candle = df.iloc[-3]
                     closed_candle = df.iloc[-2]
                     
@@ -236,9 +223,7 @@ def strategy_loop():
                     prev_closed_rsi3 = prev_closed_candle['rsi3']
                     closed_stoch_k = closed_candle['stoch_k']
 
-                    # =============================================================
                     # BUY CONDITION
-                    # =============================================================
                     if symbol not in open_positions:
                         if (closed_ema50 > closed_ema100) and \
                            (closed_ema100 > closed_ema200) and \
@@ -249,17 +234,21 @@ def strategy_loop():
                             print(f"Signal Confirmed for {symbol} | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                             execute_buy(symbol)
 
-                # ৫০টি টোকেন স্ক্যান শেষে Binance API রিকুয়েস্ট কুল-ডাউনের জন্য ২০ সেকেন্ডের সেফটি বিরতি
+                # ব্যাচ শেষে সেফটি কুল-ডাউন ২০ সেকেন্ড
                 if batch_index < len(batches) - 1:
-                    print(f"--> Batch {batch_index + 1} completed. Cooling down API weight for 20 seconds...", flush=True)
+                    print(f"--> Batch {batch_index + 1} done. Cooling down for 20 seconds...", flush=True)
                     time.sleep(20)
 
-            print("\n================ All 3 Batches Finished. Waiting 10s ================\n", flush=True)
-            time.sleep(10)
+            # ব্যাচ শেষে পজিশন চেক
+            if open_positions:
+                check_and_sell_open_positions()
+
+            print("\n================ All Batches Finished. Waiting 15s ================\n", flush=True)
+            time.sleep(15)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
-            time.sleep(15)
+            time.sleep(20)
 
 # ---------------------------------------------------------
 # MAIN RUNNER
