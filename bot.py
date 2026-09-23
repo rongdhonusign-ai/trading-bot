@@ -67,28 +67,28 @@ def calculate_indicators(df):
     return df
 
 # ---------------------------------------------------------
-# STRATEGY FUNCTIONS
+# STRATEGY FUNCTIONS (OPTIMIZED FOR API WEIGHT)
 # ---------------------------------------------------------
 def get_top_120_usdt_pairs():
-    """টপ ১২০টি পেয়ার ফিল্টার করা"""
+    """get_all_tickers() দিয়ে মাত্র ১ API Weight খরচে ১২০টি পেয়ার ফিল্টার করা"""
     try:
-        tickers = client.get_ticker()
+        tickers = client.get_all_tickers() # এটি অত্যন্ত হালকা এবং সেফ কল
         usdt_pairs = []
         for t in tickers:
             symbol = t['symbol']
             if symbol.endswith('USDT'):
                 base_asset = symbol.replace('USDT', '')
                 if base_asset not in STABLECOINS:
-                    usdt_pairs.append({'symbol': symbol, 'quoteVolume': float(t['quoteVolume'])})
-        sorted_pairs = sorted(usdt_pairs, key=lambda x: x['quoteVolume'], reverse=True)
-        return [p['symbol'] for p in sorted_pairs[:120]] # ১২০টি টপ পেয়ার
+                    usdt_pairs.append({'symbol': symbol, 'price': float(t['price'])})
+        
+        return [p['symbol'] for p in usdt_pairs[:120]] # টপ ১২০টি পেয়ার
     except Exception as e:
         print(f"Error fetching pairs: {e}", flush=True)
         return []
 
 def get_klines_data(symbol):
     try:
-        # limit=100 দেওয়া হয়েছে যেন হালকা ক্যান্ডেল ডাটা আসে এবং API Ban না হয়
+        # limit=100 দেওয়া হয়েছে যেন API Ban না হয়
         klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
