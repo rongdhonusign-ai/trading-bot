@@ -136,10 +136,10 @@ def on_message(ws, message):
                 closed = df.iloc[-2]
 
                 if symbol not in open_positions:
-                    # বাই সিগন্যাল টেস্ট
+                    # বাই সিগন্যাল টেস্ট (RSI3 < 10 এ ফিল্টার করা হয়েছে)
                     if (closed['ema50'] > closed['ema100'] > closed['ema200']) and \
                        (closed['close'] > closed['ema50']) and \
-                       (prev_closed['rsi3'] >= 6) and (closed['rsi3'] < 6) and \
+                       (prev_closed['rsi3'] >= 10) and (closed['rsi3'] < 10) and \
                        (closed['stoch_k'] < 20):
                         print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f} | Price: {close_price}", flush=True)
                         execute_buy(symbol)
@@ -213,4 +213,4 @@ if __name__ == '__main__':
     t_main.start()
 
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=pYOUR
