@@ -22,7 +22,7 @@ TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WBTC', 'WETH', 'PAX']
 open_positions = {}
 
-# ক্যাশিংয়ের জন্য গ্লোবাল ভ্যারিয়েবল
+# ক্যাশিংয়ের জন্য গ্লোবাল ভ্যারিয়েবল
 cached_symbols = []
 last_symbol_fetch_time = 0
 
@@ -116,9 +116,6 @@ def execute_buy(symbol):
     except Exception as e:
         print(f"Error buying {symbol}: {e}", flush=True)
 
-# ---------------------------------------------------------
-# UPDATED SELL FUNCTION (WITH MANUAL SELL AUTO-CLEARING)
-# ---------------------------------------------------------
 def execute_sell(symbol, reason):
     try:
         qty = open_positions[symbol]['qty']
@@ -140,12 +137,44 @@ def execute_sell(symbol, reason):
         del open_positions[symbol]
     except Exception as e:
         print(f"Error selling {symbol}: {e}", flush=True)
-        # যদি ম্যানুয়ালি সেল করার কারণে ব্যালেন্স না থাকে, তবে বোটের মেমোরি থেকে টোকেনটি ডিলিট করে দেবে
+        # ম্যানুয়ালি সেল করলে বা ব্যালেন্স না থাকলে মেমোরি থেকে ডিলিট করে দেওয়া হবে
         if "-2010" in str(e) or "insufficient balance" in str(e).lower():
             print(f"Manually sold detected or Insufficient balance! Clearing {symbol} from bot memory.", flush=True)
             if symbol in open_positions:
                 del open_positions[symbol]
 
+# ---------------------------------------------------------
+# OPEN POSITIONS TRACKER FUNCTION
+# ---------------------------------------------------------
+def check_and_sell_open_positions():
+    """ওপেন পজিশনগুলোর লাইভ প্রাইস এবং RSI চটজলদি চেক করে সেল করার ফাংশন"""
+    if not open_positions:
+        return
+
+    for pos_symbol in list(open_positions.keys()):
+        df_pos = get_klines_data(pos_symbol)
+        if df_pos is not None and len(df_pos) >= 200:
+            live_candle = df_pos.iloc[-1]
+            current_live_price = live_candle['close']
+            live_rsi3 = live_candle['rsi3']
+            
+            buy_price = open_positions[pos_symbol]['buy_price']
+            stop_price = buy_price * (1 - STOP_LOSS_PCT)
+            profit_pct = ((current_live_price - buy_price) / buy_price) * 100
+            
+            # ১. ৩% স্টপ লস চেক
+            if current_live_price <= stop_price:
+                execute_sell(pos_symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
+            
+            # ২. টেক প্রফিট চেক (Live RSI3 >= 85)
+            elif live_rsi3 >= 85:
+                execute_sell(pos_symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
+        
+        time.sleep(0.2)  # দ্রুত চেকিংয়ের সময় ছোট ডিলে
+
+# ---------------------------------------------------------
+# STRATEGY LOOP (WITH HIGH-PRIORITY POSITION MONITORING)
+# ---------------------------------------------------------
 def strategy_loop():
     global cached_symbols, last_symbol_fetch_time
     print("Bot Scanner Thread Started...", flush=True)
@@ -155,7 +184,7 @@ def strategy_loop():
         try:
             current_time = time.time()
             
-            # প্রতি ১৫ মিনিটে (৯০০ সেকেন্ড) ১ বার পেয়ার লিস্ট রিফ্রেশ করবে
+            # প্রতি ১৫ মিনিটে পেয়ার লিস্ট রিফ্রেশ করা
             if not cached_symbols or (current_time - last_symbol_fetch_time) > 900:
                 print("Fetching Top 150 USDT Pairs from Binance...", flush=True)
                 new_pairs = get_top_150_usdt_pairs()
@@ -168,18 +197,31 @@ def strategy_loop():
                 time.sleep(300)
                 continue
 
+            # =============================================================
+            # ১. হাই-প্রায়োরিটি চেক: নতুন স্ক্যান শুরুর আগে কেনা পজিশন চেক
+            # =============================================================
+            if open_positions:
+                print(f"\n[PRIORITY CHECK] Monitoring Open Positions: {list(open_positions.keys())}", flush=True)
+                check_and_sell_open_positions()
+
+            # =============================================================
+            # ২. টপ ১৫০ পেয়ার স্ক্যান (মার্কেট বাই করার জন্য)
+            # =============================================================
             print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
             print(f"Active Pairs Count: {len(cached_symbols)}", flush=True)
-            if open_positions:
-                print(f"--> Currently Tracking Positions for Sell: {list(open_positions.keys())}", flush=True)
             
             for index, symbol in enumerate(cached_symbols):
+                
+                # মিড-স্ক্যান চেক: প্রতি ১০টি টোকেন স্ক্যান করার মাঝে ওপেন পজিশনগুলো দ্রুত চেক করা
+                if open_positions and index % 10 == 0:
+                    check_and_sell_open_positions()
+
                 df = get_klines_data(symbol)
                 
-                # API Rate Limit এড়াতে প্রতি টোকেনের মাঝে ০.৩ সেকেন্ড ডিলে
+                # এপিআই রেট লিমিট রক্ষা করতে সামান্য ডিলে
                 time.sleep(0.3)
 
-                # প্রতি ৫০টি টোকেন স্ক্যান হওয়ার পর ৩ সেকেন্ডের সেফটি বিরতি (Batch Break)
+                # প্রতি ৫০টি টোকেন পর ৩ সেকেন্ড সেফটি ব্রেইক
                 if (index + 1) % 50 == 0:
                     time.sleep(3)
 
@@ -189,9 +231,7 @@ def strategy_loop():
                 # ক্যান্ডেল ডাটা
                 prev_closed_candle = df.iloc[-3]
                 closed_candle = df.iloc[-2]
-                live_candle = df.iloc[-1]
                 
-                # বাই ডাটা
                 closed_price = closed_candle['close']
                 closed_ema50 = closed_candle['ema50']
                 closed_ema100 = closed_candle['ema100']
@@ -199,10 +239,6 @@ def strategy_loop():
                 closed_rsi3 = closed_candle['rsi3']
                 prev_closed_rsi3 = prev_closed_candle['rsi3']
                 closed_stoch_k = closed_candle['stoch_k']
-                
-                # সেল ডাটা
-                current_live_price = live_candle['close']
-                live_rsi3 = live_candle['rsi3']
 
                 # =============================================================
                 # BUY CONDITION
@@ -217,28 +253,12 @@ def strategy_loop():
                         print(f"Signal Confirmed for {symbol} | EMA50 > EMA100 > EMA200 | Price > EMA50 | RSI(3): {closed_rsi3:.2f} | Stoch_K: {closed_stoch_k:.2f}", flush=True)
                         execute_buy(symbol)
 
-                # =============================================================
-                # SELL CONDITION
-                # =============================================================
-                else:
-                    buy_price = open_positions[symbol]['buy_price']
-                    stop_price = buy_price * (1 - STOP_LOSS_PCT)
-                    profit_pct = ((current_live_price - buy_price) / buy_price) * 100
-                    
-                    # ১. ৩% স্টপ লস
-                    if current_live_price <= stop_price:
-                        execute_sell(symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
-                    
-                    # ২. টেক প্রফিট: লাইভ RSI(3) >= 85 হলেই সেল করে দেবে
-                    elif live_rsi3 >= 85:
-                        execute_sell(symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
-
-            print("================ Scan Finished. Waiting 10s ================\n", flush=True)
-            time.sleep(10)
+            print("================ Scan Finished. Waiting 5s ================\n", flush=True)
+            time.sleep(5)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
-            time.sleep(30)
+            time.sleep(10)
 
 # ---------------------------------------------------------
 # MAIN RUNNER
