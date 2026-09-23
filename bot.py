@@ -2,7 +2,6 @@ import os
 import json
 import time
 import math
-import asyncio
 import threading
 import pandas as pd
 from flask import Flask
@@ -113,7 +112,6 @@ def on_message(ws, message):
             if close_price <= stop_price:
                 execute_sell(symbol, "Stop-Loss Hit")
             elif is_closed:
-                # টেক প্রফিট চেক
                 df = symbol_data.get(symbol)
                 if df is not None:
                     df = calculate_indicators(df)
@@ -122,9 +120,12 @@ def on_message(ws, message):
 
         # ২. ক্যান্ডেল ক্লোজ হলে বাই সিগন্যাল স্ক্যানিং
         if is_closed:
+            # লগে প্রিন্ট দেওয়ার জন্য যুক্ত করা লাইন
+            print(f"[5M Candle Closed] {symbol} | Price: {close_price}", flush=True)
+
             df = symbol_data.get(symbol)
             if df is not None:
-                # নতুন ক্লোজড ক্যান্ডেল ডাটাবেজে যুক্ত করা
+                # নতুন ক্লোজড ক্যান্ডেল যোগ করা
                 new_row = pd.DataFrame([{'close': close_price}])
                 df = pd.concat([df, new_row], ignore_index=True).iloc[-100:]
                 df = calculate_indicators(df)
@@ -138,7 +139,7 @@ def on_message(ws, message):
                        (closed['close'] > closed['ema50']) and \
                        (prev_closed['rsi3'] >= 6) and (closed['rsi3'] < 6) and \
                        (closed['stoch_k'] < 20):
-                        print(f"--> [SIGNAL MATCHED] WebSocket Buy for {symbol}", flush=True)
+                        print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f}", flush=True)
                         execute_buy(symbol)
 
 def execute_buy(symbol):
@@ -174,12 +175,12 @@ def start_websocket():
         df = load_initial_candles(p)
         if df is not None:
             symbol_data[p] = df
-        time.sleep(0.1) # সেফ লোড
+        time.sleep(0.1)
 
-    # ১২০টি টোকেনকে বিন্যান্স স্ট্রিম ইউআরএল-এ যুক্ত করা
     streams = "/".join([f"{p.lower()}@kline_5m" for p in pairs])
     socket_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
 
+    print("WebSocket Scanning Started Successfully...", flush=True)
     ws = websocket.WebSocketApp(socket_url, on_message=on_message)
     ws.run_forever()
 
