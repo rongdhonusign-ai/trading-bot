@@ -25,6 +25,9 @@ STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WB
 open_positions = {}
 symbol_data = {}  # ক্যান্ডেল হিস্ট্রি স্টোর করার জন্য
 
+# স্ক্যান কাউন্টারের জন্য গ্লোবাল ভ্যারিয়েবল
+scanned_symbols_this_candle = set()
+
 # ---------------------------------------------------------
 # FLASK SERVER
 # ---------------------------------------------------------
@@ -32,7 +35,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Trading Bot via WebSocket is Active!", 200
+    return "Trading Bot via Multi-Stream WebSocket is Active!", 200
 
 # ---------------------------------------------------------
 # INDICATORS
@@ -97,11 +100,12 @@ def load_initial_candles(symbol):
 # WEBSOCKET STREAM HANDLER
 # ---------------------------------------------------------
 def on_message(ws, message):
+    global scanned_symbols_this_candle
     data = json.loads(message)
     if 'data' in data:
         kline = data['data']['k']
         symbol = kline['s']
-        is_closed = kline['x']  # ক্যান্ডেল ক্লোজ হয়েছে কিনা (True/False)
+        is_closed = kline['x']  # ক্যান্ডেল ক্লোজ হয়েছে কিনা
         close_price = float(kline['c'])
 
         # ১. ওপেন পজিশন ট্র্যাকিং (প্রফিট/স্টপ লস)
@@ -120,12 +124,13 @@ def on_message(ws, message):
 
         # ২. ক্যান্ডেল ক্লোজ হলে বাই সিগন্যাল স্ক্যানিং
         if is_closed:
-            # লগে প্রিন্ট দেওয়ার জন্য যুক্ত করা লাইন
-            print(f"[5M Candle Closed] {symbol} | Price: {close_price}", flush=True)
+            scanned_symbols_this_candle.add(symbol)
+            total_loaded_pairs = len(symbol_data) if len(symbol_data) > 0 else 120
+            
+            print(f"[{len(scanned_symbols_this_candle)}/{total_loaded_pairs}] 5M Candle Closed: {symbol} | Price: {close_price}", flush=True)
 
             df = symbol_data.get(symbol)
             if df is not None:
-                # নতুন ক্লোজড ক্যান্ডেল যোগ করা
                 new_row = pd.DataFrame([{'close': close_price}])
                 df = pd.concat([df, new_row], ignore_index=True).iloc[-100:]
                 df = calculate_indicators(df)
@@ -141,6 +146,11 @@ def on_message(ws, message):
                        (closed['stoch_k'] < 20):
                         print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f}", flush=True)
                         execute_buy(symbol)
+
+            # সবকটি টোকেন স্ক্যান হলে কনফার্মেশন ও রিসেট
+            if len(scanned_symbols_this_candle) >= total_loaded_pairs:
+                print(f"\n====== Successfully Scanned All {len(scanned_symbols_this_candle)} Tokens! ======\n", flush=True)
+                scanned_symbols_this_candle.clear()
 
 def execute_buy(symbol):
     try:
@@ -167,7 +177,14 @@ def execute_sell(symbol, reason):
     except Exception as e:
         print(f"Sell Error {symbol}: {e}", flush=True)
 
-def start_websocket():
+def start_single_socket(stream_pairs):
+    """একটি নির্দিষ্ট ব্যাচের জন্য Socket চালু রাখা"""
+    streams = "/".join([f"{p.lower()}@kline_5m" for p in stream_pairs])
+    socket_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    ws = websocket.WebSocketApp(socket_url, on_message=on_message)
+    ws.run_forever()
+
+def start_websocket_system():
     pairs = get_top_120_usdt_pairs()
     print(f"Loading initial candles for {len(pairs)} pairs...", flush=True)
     
@@ -175,22 +192,28 @@ def start_websocket():
         df = load_initial_candles(p)
         if df is not None:
             symbol_data[p] = df
-        time.sleep(0.1)
+        time.sleep(0.05)
 
-    streams = "/".join([f"{p.lower()}@kline_5m" for p in pairs])
-    socket_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    print(f"Initial Candles Loaded for {len(symbol_data)} Pairs!", flush=True)
 
-    print("WebSocket Scanning Started Successfully...", flush=True)
-    ws = websocket.WebSocketApp(socket_url, on_message=on_message)
-    ws.run_forever()
+    # ১২০টি টোকেনকে ৪০টি করে ৩টি স্ট্রিম গ্রুপে ভাগ করা (URL Length Limit এড়াতে)
+    chunk_size = 40
+    chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+
+    print(f"Starting {len(chunks)} Multi-Threaded Websockets for Full Coverage...", flush=True)
+    for idx, chunk in enumerate(chunks):
+        t = threading.Thread(target=start_single_socket, args=(chunk,))
+        t.daemon = True
+        t.start()
+        print(f"WebSocket Stream #{idx+1} Started ({len(chunk)} pairs)", flush=True)
 
 # ---------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------
 if __name__ == '__main__':
-    t = threading.Thread(target=start_websocket)
-    t.daemon = True
-    t.start()
+    t_main = threading.Thread(target=start_websocket_system)
+    t_main.daemon = True
+    t_main.start()
 
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
