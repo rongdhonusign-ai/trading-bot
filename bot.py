@@ -146,17 +146,18 @@ def strategy_loop():
         try:
             current_time = time.time()
             
-            # প্রতি ১০ মিনিটে (৬০০ সেকেন্ড) একবার পেয়ার লিস্ট রিফ্রেশ করবে
-            if not cached_symbols or (current_time - last_symbol_fetch_time) > 600:
+            # প্রতি ১৫ মিনিটে (৯০০ সেকেন্ড) ১ বার পেয়ার লিস্ট রিফ্রেশ করা হবে
+            if not cached_symbols or (current_time - last_symbol_fetch_time) > 900:
                 print("Fetching Top 50 USDT Pairs from Binance...", flush=True)
                 new_pairs = get_top_50_usdt_pairs()
+                last_symbol_fetch_time = current_time  # ফেচ ব্যর্থ হলেও টাইম আপডেট হবে যেন বারবার হিট না করে
                 if new_pairs:
                     cached_symbols = new_pairs
-                    last_symbol_fetch_time = current_time
 
+            # যদি ক্যাশ খালি থাকে বা IP Banned হয়, তবে ৫ মিনিট ওয়েট করবে
             if not cached_symbols:
-                print("Could not fetch pairs or IP Banned. Waiting 1 minute...", flush=True)
-                time.sleep(60)
+                print("Could not fetch pairs or IP Banned. Waiting 5 minutes...", flush=True)
+                time.sleep(300)
                 continue
 
             print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
@@ -167,7 +168,8 @@ def strategy_loop():
             for index, symbol in enumerate(cached_symbols):
                 df = get_klines_data(symbol)
                 
-                time.sleep(0.5)
+                # Render Shared IP-র জন্য ০.৮ সেকেন্ড ডিলে
+                time.sleep(0.8)
 
                 if df is None or len(df) < 200:
                     continue
@@ -217,20 +219,9 @@ def strategy_loop():
                     elif live_rsi3 >= 85:
                         execute_sell(symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
 
-            print("================ Scan Finished. Waiting 10s ================\n", flush=True)
-            time.sleep(10)
+            print("================ Scan Finished. Waiting 15s ================\n", flush=True)
+            time.sleep(15)
             
         except Exception as e:
             print(f"Loop error: {e}", flush=True)
-            time.sleep(15)
-
-# ---------------------------------------------------------
-# MAIN RUNNER
-# ---------------------------------------------------------
-if __name__ == '__main__':
-    t = threading.Thread(target=strategy_loop)
-    t.daemon = True
-    t.start()
-
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+            time.sleep(30)
