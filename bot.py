@@ -25,8 +25,9 @@ STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WB
 open_positions = {}
 symbol_data = {}  # ক্যান্ডেল হিস্ট্রি স্টোর করার জন্য
 
-# স্ক্যান কাউন্টারের জন্য গ্লোবাল ভ্যারিয়েবল
+# Thread-safe Counter Variables
 scanned_symbols_this_candle = set()
+counter_lock = threading.Lock()
 
 # ---------------------------------------------------------
 # FLASK SERVER
@@ -124,11 +125,6 @@ def on_message(ws, message):
 
         # ২. ক্যান্ডেল ক্লোজ হলে বাই সিগন্যাল স্ক্যানিং
         if is_closed:
-            scanned_symbols_this_candle.add(symbol)
-            total_loaded_pairs = len(symbol_data) if len(symbol_data) > 0 else 120
-            
-            print(f"[{len(scanned_symbols_this_candle)}/{total_loaded_pairs}] 5M Candle Closed: {symbol} | Price: {close_price}", flush=True)
-
             df = symbol_data.get(symbol)
             if df is not None:
                 new_row = pd.DataFrame([{'close': close_price}])
@@ -147,10 +143,21 @@ def on_message(ws, message):
                         print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f}", flush=True)
                         execute_buy(symbol)
 
-            # সবকটি টোকেন স্ক্যান হলে কনফার্মেশন ও রিসেট
-            if len(scanned_symbols_this_candle) >= total_loaded_pairs:
-                print(f"\n====== Successfully Scanned All {len(scanned_symbols_this_candle)} Tokens! ======\n", flush=True)
-                scanned_symbols_this_candle.clear()
+            # Thread-safe Counting
+            with counter_lock:
+                scanned_symbols_this_candle.add(symbol)
+                count = len(scanned_symbols_this_candle)
+                total_loaded_pairs = len(symbol_data) if len(symbol_data) > 0 else 120
+
+                # প্রতি ১০টি টোকেন স্ক্যান হলে একটি লাইট স্টেটাস প্রিন্ট
+                if count % 10 == 0 or count == total_loaded_pairs:
+                    print(f"--> [Scan Progress] {count}/{total_loaded_pairs} tokens scanned...", flush=True)
+
+                if count >= total_loaded_pairs:
+                    print(f"\n==================================================")
+                    print(f" SUCCESS: All {count}/{total_loaded_pairs} Tokens Successfully Scanned!")
+                    print(f"==================================================\n", flush=True)
+                    scanned_symbols_this_candle.clear()
 
 def execute_buy(symbol):
     try:
@@ -178,7 +185,6 @@ def execute_sell(symbol, reason):
         print(f"Sell Error {symbol}: {e}", flush=True)
 
 def start_single_socket(stream_pairs):
-    """একটি নির্দিষ্ট ব্যাচের জন্য Socket চালু রাখা"""
     streams = "/".join([f"{p.lower()}@kline_5m" for p in stream_pairs])
     socket_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     ws = websocket.WebSocketApp(socket_url, on_message=on_message)
@@ -196,11 +202,11 @@ def start_websocket_system():
 
     print(f"Initial Candles Loaded for {len(symbol_data)} Pairs!", flush=True)
 
-    # ১২০টি টোকেনকে ৪০টি করে ৩টি স্ট্রিম গ্রুপে ভাগ করা (URL Length Limit এড়াতে)
+    # ৪০টি করে ৩টি থ্রেড গ্রুপ
     chunk_size = 40
     chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
 
-    print(f"Starting {len(chunks)} Multi-Threaded Websockets for Full Coverage...", flush=True)
+    print(f"Starting {len(chunks)} Multi-Threaded Websockets...", flush=True)
     for idx, chunk in enumerate(chunks):
         t = threading.Thread(target=start_single_socket, args=(chunk,))
         t.daemon = True
