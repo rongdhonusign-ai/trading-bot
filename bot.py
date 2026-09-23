@@ -146,7 +146,7 @@ def strategy_loop():
         try:
             current_time = time.time()
             
-            # প্রতি ১০ মিনিটে (৬০০ সেকেন্ড) একবার পেয়ার লিস্ট রিফ্রেশ করবে API Weight বাঁচানোর জন্য
+            # প্রতি ১০ মিনিটে (৬০০ সেকেন্ড) একবার পেয়ার লিস্ট রিফ্রেশ করবে
             if not cached_symbols or (current_time - last_symbol_fetch_time) > 600:
                 print("Fetching Top 50 USDT Pairs from Binance...", flush=True)
                 new_pairs = get_top_50_usdt_pairs()
@@ -160,13 +160,13 @@ def strategy_loop():
                 continue
 
             print(f"\n================ Scanning {len(cached_symbols)} Top Pairs ================", flush=True)
-            # এক লাইনে স্ক্যান হওয়া ৫০টি টোকেনের নাম প্রিন্ট করা হবে
             print(f"Active Pairs: {', '.join(cached_symbols)}", flush=True)
+            if open_positions:
+                print(f"--> Currently Tracking Positions for Sell: {list(open_positions.keys())}", flush=True)
             
             for index, symbol in enumerate(cached_symbols):
                 df = get_klines_data(symbol)
                 
-                # Render Shared IP-র জন্য ০.৫ সেকেন্ড ডিলে
                 time.sleep(0.5)
 
                 if df is None or len(df) < 200:
@@ -207,14 +207,15 @@ def strategy_loop():
                 else:
                     buy_price = open_positions[symbol]['buy_price']
                     stop_price = buy_price * (1 - STOP_LOSS_PCT)
+                    profit_pct = ((current_live_price - buy_price) / buy_price) * 100
                     
                     # ১. ৩% স্টপ লস
                     if current_live_price <= stop_price:
                         execute_sell(symbol, reason=f"3% Stop-Loss Hit (Live Price: {current_live_price})")
                     
-                    # ২. প্রফিটে থাকলে ও লাইভ RSI(3) >= 85 হলে
-                    elif (live_rsi3 >= 85) and (current_live_price > buy_price):
-                        execute_sell(symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | Profit: {((current_live_price - buy_price)/buy_price)*100:.2f}%")
+                    # ২. টেক প্রফিট: লাইভ RSI(3) >= 85 হলেই সেল করে দেবে
+                    elif live_rsi3 >= 85:
+                        execute_sell(symbol, reason=f"Take Profit Hit | Live RSI(3): {live_rsi3:.2f} >= 85 | PnL: {profit_pct:.2f}%")
 
             print("================ Scan Finished. Waiting 10s ================\n", flush=True)
             time.sleep(10)
