@@ -86,8 +86,8 @@ def get_top_120_usdt_pairs():
 
 def load_initial_candles(symbol):
     try:
-        # EMA200 নিখুঁতভাবে বের করতে অন্তত ৩০০টি ক্যান্ডেল লোড করা হচ্ছে
-        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=300)
+        # EMA200 নিখুঁত করার জন্য ২৫০টি ক্যান্ডেল লোড করা হচ্ছে
+        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=250)
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
@@ -135,32 +135,39 @@ def on_message(ws, message):
         # ---------------------------------------------------------
         if is_closed:
             if df is not None:
-                # ক্যান্ডেল পারমানেন্টলি সেভ করা ও ইন্ডেক্স রিসেট করা
+                # ক্যান্ডেল সেভ করা ও ইন্ডেক্স রিসেট করা
                 new_row = pd.DataFrame([{'close': close_price}], dtype=float)
-                df = pd.concat([df, new_row], ignore_index=True).iloc[-300:].reset_index(drop=True)
+                df = pd.concat([df, new_row], ignore_index=True).iloc[-250:].reset_index(drop=True)
                 df = calculate_indicators(df)
                 symbol_data[symbol] = df
 
-                # নতুন বন্ধ হওয়া ক্যান্ডেল
+                # সদ্য বন্ধ হওয়া ক্যান্ডেল
                 closed_candle = df.iloc[-1]
 
                 if symbol not in open_positions:
-                    # ১. প্রাইজ EMA50 এর উপরে থাকতে হবে
-                    c1_price_above_ema50 = (closed_candle['close'] > closed_candle['ema50'])
+                    ema50 = closed_candle['ema50']
+                    ema100 = closed_candle['ema100']
+                    ema200 = closed_candle['ema200']
+
+                    # EMA ভ্যালু যেন ০.০০ না হয় (সুরক্ষাকবচ)
+                    valid_ema = (ema50 > 0) and (ema100 > 0) and (ema200 > 0)
+
+                    # ১. প্রাইজ EMA50 এর উপরে
+                    c1_price_above_ema50 = (closed_candle['close'] > ema50)
                     
-                    # ২. EMA ট্রেন্ড: EMA50 > EMA100 > EMA200 হতে হবে
-                    c2_ema_alignment = (closed_candle['ema50'] > closed_candle['ema100']) and (closed_candle['ema100'] > closed_candle['ema200'])
+                    # ২. EMA ট্রেন্ড: EMA50 > EMA100 > EMA200
+                    c2_ema_alignment = (ema50 > ema100) and (ema100 > ema200)
                     
-                    # ৩. RSI(3) ১০ এর কম হতে হবে
+                    # ৩. RSI(3) < 10
                     c3_rsi3_low = (closed_candle['rsi3'] < 10.0)
                     
-                    # ৪. Stoch K ২০ এর কম হতে হবে
+                    # ৪. Stoch K < 20
                     c4_stoch_low = (closed_candle['stoch_k'] < 20.0)
 
-                    # সবগুলো শর্ত একসাথে পূরণ হলেই কেবল বাই এক্সিকিউট হবে
-                    if c1_price_above_ema50 and c2_ema_alignment and c3_rsi3_low and c4_stoch_low:
+                    # সব শর্ত একসঙ্গে সত্য হলে বাই হবে
+                    if valid_ema and c1_price_above_ema50 and c2_ema_alignment and c3_rsi3_low and c4_stoch_low:
                         print(f"\n[BUY SIGNAL MATCHED] {symbol}", flush=True)
-                        print(f"--> Price: {closed_candle['close']} | EMA50: {closed_candle['ema50']:.2f} | EMA100: {closed_candle['ema100']:.2f} | EMA200: {closed_candle['ema200']:.2f}", flush=True)
+                        print(f"--> Price: {closed_candle['close']} | EMA50: {ema50:.2f} | EMA100: {ema100:.2f} | EMA200: {ema200:.2f}", flush=True)
                         print(f"--> RSI3: {closed_candle['rsi3']:.2f} | Stoch K: {closed_candle['stoch_k']:.2f}\n", flush=True)
                         
                         execute_buy(symbol)
@@ -204,13 +211,14 @@ def start_single_socket(stream_pairs):
 
 def start_websocket_system():
     pairs = get_top_120_usdt_pairs()
-    print(f"Loading initial candles for {len(pairs)} pairs...", flush=True)
+    print(f"Loading initial candles for {len(pairs)} pairs safely...", flush=True)
     
     for p in pairs:
         df = load_initial_candles(p)
         if df is not None:
             symbol_data[p] = df
-        time.sleep(0.12)
+        # IP Ban এড়াতে ০.৫৫ সেকেন্ড বিরতি দেওয়া হয়েছে
+        time.sleep(0.55)
 
     print(f"Initial Candles Loaded for {len(symbol_data)} Pairs!", flush=True)
 
