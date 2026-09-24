@@ -43,7 +43,7 @@ def calculate_indicators(df):
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
 
-    # RSI 14 Calculaton
+    # RSI 14 Calculation
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -106,7 +106,7 @@ def sync_existing_binance_positions():
                     price = float(ticker['price'])
                     value_usdt = total_qty * price
 
-                    # ধরে নেওয়া হচ্ছে ন্যূনতম ৫ ডলারের বেশি ব্যালেন্স থাকলে সেটা ট্রেকিংয়ে রাখা হবে
+                    # ধরে নেওয়া হচ্ছে ন্যূনতম ৫ ডলারের বেশি ব্যালেন্স থাকলে সেটা ট্রেকিংয়ে রাখা হবে
                     if value_usdt >= 5.0:
                         open_positions[symbol] = {
                             'buy_price': price,
@@ -148,7 +148,7 @@ def on_message(ws, message):
         df = symbol_data.get(symbol)
 
         # -----------------------------------------------------
-        # ১. রিয়েল-টাইম সেল ফিল্টার (দ্রুততম সেল বাস্তবায়নের জন্য)
+        # ১. রিয়েল-টাইম সেল ফিল্টার (দ্রুততম সেল বাস্তবায়নের জন্য)
         # -----------------------------------------------------
         if symbol in open_positions:
             if df is not None:
@@ -162,7 +162,7 @@ def on_message(ws, message):
                 prev_k = open_positions[symbol].get('prev_k', curr_k)
                 prev_d = open_positions[symbol].get('prev_d', curr_d)
 
-                # Cross-Up Check: Stoch K & D ৮৫-এর উপরে যাওয়া বা অতিক্রম করা
+                # Cross-Up Check: Stoch K & D ৮৫-এর উপরে যাওয়া বা অতিক্রম করা
                 is_crossed_above = (prev_k <= 85.0 or prev_d <= 85.0) and (curr_k > 85.0 and curr_d > 85.0)
                 is_above_85 = (curr_k > 85.0 and curr_d > 85.0)
 
@@ -198,8 +198,8 @@ def on_message(ws, message):
                     # ২. ৫ মিনিটের ক্যান্ডেল ক্লোজ প্রাইজ > EMA50
                     c2_price_above_ema50 = (closed_candle['close'] > ema50)
                     
-                    # ৩. Stoch RSI 14,14,3,3 এর K-line ও D-line < 5.0
-                    c3_stoch_low = (stoch_k < 5.0) and (stoch_d < 5.0)
+                    # ৩. Stoch RSI 14,14,3,3 এর K-line ও D-line < 10.0
+                    c3_stoch_low = (stoch_k < 10.0) and (stoch_d < 10.0)
 
                     if c1_ema_trend and c2_price_above_ema50 and c3_stoch_low:
                         print(f"\n[BUY SIGNAL MATCHED] {symbol}", flush=True)
@@ -236,7 +236,7 @@ def execute_buy(symbol):
 
 def execute_sell(symbol, reason):
     try:
-        # ব্যালেন্স বা অপেন পজিশন থেকে আসল কোয়ান্টিটি চেক করা
+        # ব্যালেন্স বা অপেন পজিশন থেকে আসল কোয়ান্টিটি চেক করা
         qty = open_positions[symbol]['qty']
         
         info = client.get_symbol_info(symbol)
