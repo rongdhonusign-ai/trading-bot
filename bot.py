@@ -40,6 +40,7 @@ def home():
 # INDICATORS CALCULATOR (EMA50, EMA100, Stoch RSI 14,14,3,3)
 # ---------------------------------------------------------
 def calculate_indicators(df):
+    df = df.copy()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
 
@@ -106,7 +107,6 @@ def sync_existing_binance_positions():
                     price = float(ticker['price'])
                     value_usdt = total_qty * price
 
-                    # ধরে নেওয়া হচ্ছে ন্যূনতম ৫ ডলারের বেশি ব্যালেন্স থাকলে সেটা ট্রেকিংয়ে রাখা হবে
                     if value_usdt >= 5.0:
                         open_positions[symbol] = {
                             'buy_price': price,
@@ -148,35 +148,29 @@ def on_message(ws, message):
         df = symbol_data.get(symbol)
 
         # -----------------------------------------------------
-        # ১. রিয়েল-টাইম সেল ফিল্টার (দ্রুততম সেল বাস্তবায়নের জন্য)
+        # ১. রিয়েল-টাইম সেল ফিল্টার (লাইভ প্রাইস ট্র্যাক করা)
         # -----------------------------------------------------
-        if symbol in open_positions:
-            if df is not None:
-                # চলন্ত লাইভ প্রাইসের সাহায্যে ইন্ডিকেটর হিসাব
-                df_temp = pd.concat([df, pd.DataFrame([{'close': close_price}], dtype=float)], ignore_index=True)
-                df_calc = calculate_indicators(df_temp)
-                
-                curr_k = df_calc.iloc[-1]['stoch_k']
-                curr_d = df_calc.iloc[-1]['stoch_d']
-                
-                prev_k = open_positions[symbol].get('prev_k', curr_k)
-                prev_d = open_positions[symbol].get('prev_d', curr_d)
+        if symbol in open_positions and df is not None:
+            # বর্তমান রানিং ক্যান্ডেলের ক্লোজ প্রাইজ আপডেট করে ইন্ডিকেটর ক্যালকুলেট করা
+            df_temp = df.copy()
+            df_temp.loc[df_temp.index[-1], 'close'] = close_price
+            df_calc = calculate_indicators(df_temp)
+            
+            curr_k = df_calc.iloc[-1]['stoch_k']
+            curr_d = df_calc.iloc[-1]['stoch_d']
 
-                # Cross-Up Check: Stoch K & D ৮৫-এর উপরে যাওয়া বা অতিক্রম করা
-                is_crossed_above = (prev_k <= 85.0 or prev_d <= 85.0) and (curr_k > 85.0 and curr_d > 85.0)
-                is_above_85 = (curr_k > 85.0 and curr_d > 85.0)
-
-                if is_crossed_above or is_above_85:
-                    execute_sell(symbol, f"Stoch RSI (14,14,3,3) Cross Above 85! (K: {curr_k:.2f}, D: {curr_d:.2f})")
-
-                # হিস্টোরিকাল ডাটা আপডেট রাখা
-                open_positions[symbol]['prev_k'] = curr_k
-                open_positions[symbol]['prev_d'] = curr_d
+            # Stoch RSI K এবং D উভয়ই ৮৫-এর বেশি হলে ইন্সট্যান্ট সেল
+            if curr_k >= 85.0 and curr_d >= 85.0:
+                print(f"\n[SELL SIGNAL TRIGGERED] {symbol} | K: {curr_k:.2f}, D: {curr_d:.2f}", flush=True)
+                execute_sell(symbol, f"Stoch RSI (14,14,3,3) Both Above 85! (K: {curr_k:.2f}, D: {curr_d:.2f})")
 
         # ---------------------------------------------------------
-        # ২. কেবল ক্যান্ডেল ক্লোজ হলেই বাই ফিল্টার রান করবে
+        # ২. ক্যান্ডেল ক্লোজ হওয়ার পর বাই ও ব্যাকআপ সেল ফিল্টার
         # ---------------------------------------------------------
         if is_closed:
+            if df is None:
+                df = load_initial_candles(symbol)
+
             if df is not None:
                 new_row = pd.DataFrame([{'close': close_price}], dtype=float)
                 df = pd.concat([df, new_row], ignore_index=True).iloc[-200:].reset_index(drop=True)
@@ -184,28 +178,27 @@ def on_message(ws, message):
                 symbol_data[symbol] = df
 
                 closed_candle = df.iloc[-1]
+                stoch_k = closed_candle['stoch_k']
+                stoch_d = closed_candle['stoch_d']
 
-                if symbol not in open_positions:
+                # ব্যাকআপ সেল ফিল্টার: যদি ক্যান্ডেল ক্লোজ হওয়ার সময়েও K, D >= 85 থাকে
+                if symbol in open_positions:
+                    if stoch_k >= 85.0 and stoch_d >= 85.0:
+                        execute_sell(symbol, f"Candle Closed Stoch RSI Both Above 85! (K: {stoch_k:.2f}, D: {stoch_d:.2f})")
+
+                # বাই ফিল্টার (শুধুমাত্র নতুন ট্রেডের জন্য)
+                elif symbol not in open_positions:
                     ema50 = closed_candle['ema50']
                     ema100 = closed_candle['ema100']
-                    stoch_k = closed_candle['stoch_k']
-                    stoch_d = closed_candle['stoch_d']
 
-                    # বাই শর্তাবলি:
-                    # ১. EMA50 > EMA100
                     c1_ema_trend = (ema50 > ema100)
-                    
-                    # ২. ৫ মিনিটের ক্যান্ডেল ক্লোজ প্রাইজ > EMA50
                     c2_price_above_ema50 = (closed_candle['close'] > ema50)
-                    
-                    # ৩. Stoch RSI 14,14,3,3 এর K-line ও D-line < 10.0
                     c3_stoch_low = (stoch_k < 10.0) and (stoch_d < 10.0)
 
                     if c1_ema_trend and c2_price_above_ema50 and c3_stoch_low:
                         print(f"\n[BUY SIGNAL MATCHED] {symbol}", flush=True)
                         print(f"--> Price: {closed_candle['close']} | EMA50: {ema50:.2f} | EMA100: {ema100:.2f}", flush=True)
                         print(f"--> Stoch K: {stoch_k:.2f} | Stoch D: {stoch_d:.2f}\n", flush=True)
-                        
                         execute_buy(symbol)
 
             with counter_lock:
@@ -236,10 +229,8 @@ def execute_buy(symbol):
 
 def execute_sell(symbol, reason):
     try:
-        # ১. কয়েন নাম আলাদা করা (যেমন CELRUSDT থেকে CELR)
         asset = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "").replace("FDUSD", "")
         
-        # ২. সরাসরি বাইন্যান্স ওয়ালেট থেকে Free Balance চেক করা
         balance = client.get_asset_balance(asset=asset)
         if not balance:
             print(f"Sell Error {symbol}: Asset balance not found", flush=True)
@@ -247,15 +238,11 @@ def execute_sell(symbol, reason):
 
         free_qty = float(balance['free'])
 
-        # ৩. এক্সচেঞ্জের LOT_SIZE ফিল্টার অনুযায়ী রাউন্ড করা
         info = client.get_symbol_info(symbol)
         step_size = next(f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         precision = int(round(-math.log10(float(step_size)))) if float(step_size) < 1 else 0
         
-        # ওয়ালেটের ফ্রি ব্যালেন্সকে প্রিসিশন অনুযায়ী ডাউন-রাউন্ড (Floor) করা
         sell_qty = math.floor(free_qty * (10 ** precision)) / (10 ** precision)
-
-        # ৪. ন্যূনতম লট সাইজের চেয়ে ব্যালেন্স বেশি থাকলে অর্ডার এক্সিকিউট করা
         min_qty = float(next(f['minQty'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'))
         
         if sell_qty >= min_qty:
@@ -269,7 +256,6 @@ def execute_sell(symbol, reason):
         else:
             print(f"Sell Cancelled {symbol}: Insufficient free quantity ({sell_qty} < {min_qty})", flush=True)
 
-        # সফলভাবে প্রসেস হলে অপেন পজিশন থেকে মুছে ফেলা
         if symbol in open_positions:
             del open_positions[symbol]
 
@@ -283,7 +269,6 @@ def start_single_socket(stream_pairs):
     ws.run_forever()
 
 def start_websocket_system():
-    # সর্বপ্রথমে বাইন্যান্সে থাকা বিদ্যমান পজিশন চেক
     sync_existing_binance_positions()
 
     pairs = get_top_120_usdt_pairs()
