@@ -174,8 +174,8 @@ def on_message(ws, message):
 
             with counter_lock:
                 scanned_count += 1
-                if scanned_count % 20 == 0:
-                    print(f"--> [Live Scan Active] Processed {scanned_count} Candle Closes...", flush=True)
+                # কোন টোকেনের ক্যান্ডেল ক্লোজ হয়ে স্ক্যান হচ্ছে তা লগে পরিষ্কার দেখাবে
+                print(f"--> [{scanned_count}] Candle Closed & Scanned: {symbol} | Price: {close_price}", flush=True)
 
 def execute_buy(symbol):
     try:
