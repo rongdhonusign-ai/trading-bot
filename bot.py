@@ -10,7 +10,7 @@ from binance.enums import *
 import websocket
 
 # ---------------------------------------------------------
-# BINANCE API KEYS
+# BINANCE API KEYS (Use Environment Variables for Security)
 # ---------------------------------------------------------
 API_KEY = os.environ.get("BINANCE_API_KEY", "yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
@@ -136,7 +136,7 @@ def load_initial_candles(symbol):
         return None
 
 # ---------------------------------------------------------
-# WEBSOCKET STREAM HANDLER
+# WEBSOCKET STREAM HANDLER (FIXED)
 # ---------------------------------------------------------
 def on_message(ws, message):
     global scanned_count
@@ -147,29 +147,37 @@ def on_message(ws, message):
         is_closed = kline['x']
         close_price = float(kline['c'])
 
-        df = symbol_data.get(symbol)
-
         # -----------------------------------------------------
-        # ১. রিয়েল-টাইম সেল ফিল্টার (লাইভ প্রাইস ট্র্যাক করা)
+        # ১. রিয়েল-টাইম সেল ফিল্টার (লাইভ প্রাইজ ট্র্যাক করা)
         # -----------------------------------------------------
-        if symbol in open_positions and df is not None:
-            # বর্তমান রানিং ক্যান্ডেলের ক্লোজ প্রাইজ আপডেট করে ইন্ডিকেটর ক্যালকুলেট করা
-            df_temp = df.copy()
-            df_temp.loc[df_temp.index[-1], 'close'] = close_price
-            df_calc = calculate_indicators(df_temp)
+        if symbol in open_positions:
+            df = symbol_data.get(symbol)
             
-            curr_k = df_calc.iloc[-1]['stoch_k']
-            curr_d = df_calc.iloc[-1]['stoch_d']
+            # ডাটাফ্রেম না থাকলে ইন্সট্যান্ট লোড করে নেওয়া
+            if df is None:
+                df = load_initial_candles(symbol)
+                if df is not None:
+                    symbol_data[symbol] = df
 
-            # Stoch RSI K এবং D উভয়ই ৮৫-এর বেশি হলে ইন্সট্যান্ট সেল
-            if curr_k >= 85.0 and curr_d >= 85.0:
-                print(f"\n[SELL SIGNAL TRIGGERED] {symbol} | K: {curr_k:.2f}, D: {curr_d:.2f}", flush=True)
-                execute_sell(symbol, f"Stoch RSI Both Above 85! (K: {curr_k:.2f}, D: {curr_d:.2f})")
+            if df is not None and not df.empty:
+                df_temp = df.copy()
+                df_temp.loc[df_temp.index[-1], 'close'] = close_price
+                df_calc = calculate_indicators(df_temp)
+                
+                curr_k = df_calc.iloc[-1]['stoch_k']
+                curr_d = df_calc.iloc[-1]['stoch_d']
+
+                # Stoch RSI K এবং D উভয়ই ৮৫-এর বেশি হলে ইন্সট্যান্ট সেল
+                if curr_k >= 85.0 and curr_d >= 85.0:
+                    print(f"\n[SELL SIGNAL TRIGGERED] {symbol} | K: {curr_k:.2f}, D: {curr_d:.2f}", flush=True)
+                    execute_sell(symbol, f"Stoch RSI Both Above 85! (K: {curr_k:.2f}, D: {curr_d:.2f})")
+                    return
 
         # ---------------------------------------------------------
-        # ২. ক্যান্ডেল ক্লোজ হওয়ার পর বাই ও ব্যাকআপ সেল ফিল্টার
+        # ২. ক্যান্ডেল ক্লোজ হওয়ার পর বাই ও ব্যাকআপ সেল ফিল্টার
         # ---------------------------------------------------------
         if is_closed:
+            df = symbol_data.get(symbol)
             if df is None:
                 df = load_initial_candles(symbol)
 
@@ -177,13 +185,13 @@ def on_message(ws, message):
                 new_row = pd.DataFrame([{'close': close_price}], dtype=float)
                 df = pd.concat([df, new_row], ignore_index=True).iloc[-200:].reset_index(drop=True)
                 df = calculate_indicators(df)
-                symbol_data[symbol] = df
+                symbol_data[symbol] = df  # গ্লোবাল ডাটা আপডেট
 
                 closed_candle = df.iloc[-1]
                 stoch_k = closed_candle['stoch_k']
                 stoch_d = closed_candle['stoch_d']
 
-                # ব্যাকআপ সেল ফিল্টার: যদি ক্যান্ডেল ক্লোজ হওয়ার সময়েও K, D >= 85 থাকে
+                # ব্যাকআপ সেল ফিল্টার: যদি ক্যান্ডেল ক্লোজ হওয়ার সময়েও K, D >= 85 থাকে
                 if symbol in open_positions:
                     if stoch_k >= 85.0 and stoch_d >= 85.0:
                         execute_sell(symbol, f"Candle Closed Stoch RSI Both Above 85! (K: {stoch_k:.2f}, D: {stoch_d:.2f})")
@@ -229,6 +237,9 @@ def execute_buy(symbol):
     except Exception as e:
         print(f"Buy Error {symbol}: {e}", flush=True)
 
+# ---------------------------------------------------------
+# ACCURATE LOT SIZE SELL EXECUTION (FIXED)
+# ---------------------------------------------------------
 def execute_sell(symbol, reason):
     try:
         asset = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "").replace("FDUSD", "")
@@ -239,14 +250,32 @@ def execute_sell(symbol, reason):
             return
 
         free_qty = float(balance['free'])
+        if free_qty <= 0:
+            print(f"Sell Cancelled {symbol}: Free balance is 0", flush=True)
+            if symbol in open_positions:
+                del open_positions[symbol]
+            return
 
+        # Step Size এবং Precision সঠিকভাবে ডায়নামিকালি বের করা
         info = client.get_symbol_info(symbol)
-        step_size = next(f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
-        precision = int(round(-math.log10(float(step_size)))) if float(step_size) < 1 else 0
+        step_size = None
+        min_qty = 0.0
         
-        sell_qty = math.floor(free_qty * (10 ** precision)) / (10 ** precision)
-        min_qty = float(next(f['minQty'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'))
-        
+        for f in info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                step_size = float(f['stepSize'])
+                min_qty = float(f['minQty'])
+                break
+
+        if step_size:
+            precision = int(round(-math.log10(step_size))) if step_size < 1 else 0
+            if precision > 0:
+                sell_qty = math.floor(free_qty * (10 ** precision)) / (10 ** precision)
+            else:
+                sell_qty = math.floor(free_qty)
+        else:
+            sell_qty = free_qty
+
         if sell_qty >= min_qty:
             client.create_order(
                 symbol=symbol, 
@@ -255,11 +284,10 @@ def execute_sell(symbol, reason):
                 quantity=sell_qty
             )
             print(f"\n⚡ SUCCESS: Instant Sold {sell_qty} {symbol} | Reason: {reason}\n", flush=True)
+            if symbol in open_positions:
+                del open_positions[symbol]
         else:
             print(f"Sell Cancelled {symbol}: Insufficient free quantity ({sell_qty} < {min_qty})", flush=True)
-
-        if symbol in open_positions:
-            del open_positions[symbol]
 
     except Exception as e:
         print(f"Sell Error {symbol}: {e}", flush=True)
