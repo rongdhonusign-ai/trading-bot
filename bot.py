@@ -37,14 +37,14 @@ def home():
     return "Trading Bot via Multi-Stream WebSocket is Active!", 200
 
 # ---------------------------------------------------------
-# INDICATORS CALCULATOR (EMA50, EMA100, Stoch RSI 14,14,3,3)
+# INDICATORS CALCULATOR (EMA50, EMA100, Stoch RSI 14,14,3,3 - Binance Style)
 # ---------------------------------------------------------
 def calculate_indicators(df):
     df = df.copy()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
 
-    # RSI 14 Calculation
+    # 1. RSI 14 Calculation (Wilder's Smoothing / Binance Style)
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -52,20 +52,22 @@ def calculate_indicators(df):
     alpha14 = 1.0 / 14
     avg_gain14 = gain.ewm(alpha=alpha14, adjust=False).mean()
     avg_loss14 = loss.ewm(alpha=alpha14, adjust=False).mean()
+    
     rs14 = avg_gain14 / avg_loss14
     rsi14 = 100.0 - (100.0 / (1.0 + rs14))
 
-    # Stochastic RSI (14, 14, 3, 3)
-    rsi_min = rsi14.rolling(14).min()
-    rsi_max = rsi14.rolling(14).max()
+    # 2. Stochastic RSI (14, 14, 3, 3)
+    rsi_min = rsi14.rolling(window=14).min()
+    rsi_max = rsi14.rolling(window=14).max()
     
-    # Avoid division by zero
-    stoch_rsi = (rsi14 - rsi_min) / (rsi_max - rsi_min).replace(0, 0.00001)
-    
-    # %K line (3-period SMA of Stoch RSI)
-    df['stoch_k'] = stoch_rsi.rolling(3).mean() * 100.0
-    # %D line (3-period SMA of %K line)
-    df['stoch_d'] = df['stoch_k'].rolling(3).mean()
+    # Avoid division by zero & handle NaNs
+    rsi_diff = (rsi_max - rsi_min).replace(0, 0.00001)
+    stoch_rsi = (rsi14 - rsi_min) / rsi_diff
+    stoch_rsi = stoch_rsi.fillna(0.0)
+
+    # 3. %K line (3-period SMA) & %D line (3-period SMA of %K)
+    df['stoch_k'] = (stoch_rsi.rolling(window=3).mean() * 100.0).round(2)
+    df['stoch_d'] = (df['stoch_k'].rolling(window=3).mean()).round(2)
 
     return df
 
@@ -159,13 +161,13 @@ def on_message(ws, message):
             curr_k = df_calc.iloc[-1]['stoch_k']
             curr_d = df_calc.iloc[-1]['stoch_d']
 
-            # Stoch RSI K এবং D উভয়ই ৮৫-এর বেশি হলে ইন্সট্যান্ট সেল
+            # Stoch RSI K এবং D উভয়ই ৮৫-এর বেশি হলে ইন্সট্যান্ট সেল
             if curr_k >= 85.0 and curr_d >= 85.0:
                 print(f"\n[SELL SIGNAL TRIGGERED] {symbol} | K: {curr_k:.2f}, D: {curr_d:.2f}", flush=True)
-                execute_sell(symbol, f"Stoch RSI (14,14,3,3) Both Above 85! (K: {curr_k:.2f}, D: {curr_d:.2f})")
+                execute_sell(symbol, f"Stoch RSI Both Above 85! (K: {curr_k:.2f}, D: {curr_d:.2f})")
 
         # ---------------------------------------------------------
-        # ২. ক্যান্ডেল ক্লোজ হওয়ার পর বাই ও ব্যাকআপ সেল ফিল্টার
+        # ২. ক্যান্ডেল ক্লোজ হওয়ার পর বাই ও ব্যাকআপ সেল ফিল্টার
         # ---------------------------------------------------------
         if is_closed:
             if df is None:
@@ -181,7 +183,7 @@ def on_message(ws, message):
                 stoch_k = closed_candle['stoch_k']
                 stoch_d = closed_candle['stoch_d']
 
-                # ব্যাকআপ সেল ফিল্টার: যদি ক্যান্ডেল ক্লোজ হওয়ার সময়েও K, D >= 85 থাকে
+                # ব্যাকআপ সেল ফিল্টার: যদি ক্যান্ডেল ক্লোজ হওয়ার সময়েও K, D >= 85 থাকে
                 if symbol in open_positions:
                     if stoch_k >= 85.0 and stoch_d >= 85.0:
                         execute_sell(symbol, f"Candle Closed Stoch RSI Both Above 85! (K: {stoch_k:.2f}, D: {stoch_d:.2f})")
@@ -198,7 +200,7 @@ def on_message(ws, message):
                     if c1_ema_trend and c2_price_above_ema50 and c3_stoch_low:
                         print(f"\n[BUY SIGNAL MATCHED] {symbol}", flush=True)
                         print(f"--> Price: {closed_candle['close']} | EMA50: {ema50:.2f} | EMA100: {ema100:.2f}", flush=True)
-                        print(f"--> Stoch K: {stoch_k:.2f} | Stoch D: {stoch_d:.2f}\n", flush=True)
+                        print(f"--> Calculated Stoch K: {stoch_k:.2f} | Stoch D: {stoch_d:.2f}\n", flush=True)
                         execute_buy(symbol)
 
             with counter_lock:
