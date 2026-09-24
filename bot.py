@@ -86,7 +86,8 @@ def get_top_120_usdt_pairs():
 
 def load_initial_candles(symbol):
     try:
-        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
+        # EMA200 নিখুঁতভাবে বের করতে অন্তত ৩০০টি ক্যান্ডেল লোড করা হচ্ছে
+        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=300)
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
@@ -94,6 +95,7 @@ def load_initial_candles(symbol):
         df['close'] = df['close'].astype(float)
         return df
     except Exception as e:
+        print(f"Error loading candles for {symbol}: {e}", flush=True)
         return None
 
 # ---------------------------------------------------------
@@ -108,22 +110,21 @@ def on_message(ws, message):
         is_closed = kline['x']
         close_price = float(kline['c'])
 
-        # ১. রিয়েল-টাইম ক্যান্ডেল আপডেট
         df = symbol_data.get(symbol)
-        if df is not None:
-            # লাইভ প্রাইজ দিয়ে টেম্পোরারি রো আপডেট
-            df_temp = pd.concat([df, pd.DataFrame([{'close': close_price}])], ignore_index=True)
-            df_calc = calculate_indicators(df_temp)
-            current_rsi3 = df_calc.iloc[-1]['rsi3']
 
-            # -----------------------------------------------------
-            # সেল ফিল্টার (ইনস্ট্যান্ট রেসপন্স - ক্যান্ডেল ক্লোজের জন্য ওয়েট করবে না)
-            # -----------------------------------------------------
-            if symbol in open_positions:
-                buy_price = open_positions[symbol]['buy_price']
-                stop_price = buy_price * (1 - STOP_LOSS_PCT)
+        # -----------------------------------------------------
+        # ১. রিয়েল-টাইম সেল ফিল্টার (স্টপ লস ও টেক প্রফিট চেক)
+        # -----------------------------------------------------
+        if symbol in open_positions:
+            buy_price = open_positions[symbol]['buy_price']
+            stop_price = buy_price * (1 - STOP_LOSS_PCT)
 
-                # স্টপ লস বা টেক প্রফিট (RSI3 >= 85) হিট হলে সেল
+            if df is not None:
+                # টেম্পোরারি প্রাইজ দিয়ে লাইভ RSI3 হিসাব
+                df_temp = pd.concat([df, pd.DataFrame([{'close': close_price}], dtype=float)], ignore_index=True)
+                df_calc = calculate_indicators(df_temp)
+                current_rsi3 = df_calc.iloc[-1]['rsi3']
+
                 if close_price <= stop_price:
                     execute_sell(symbol, f"Stop-Loss Hit (Price: {close_price})")
                 elif current_rsi3 >= 85:
@@ -134,25 +135,34 @@ def on_message(ws, message):
         # ---------------------------------------------------------
         if is_closed:
             if df is not None:
-                # ক্যান্ডেল পারমানেন্টলি সেভ
-                new_row = pd.DataFrame([{'close': close_price}])
-                df = pd.concat([df, new_row], ignore_index=True).iloc[-100:]
+                # ক্যান্ডেল পারমানেন্টলি সেভ করা ও ইন্ডেক্স রিসেট করা
+                new_row = pd.DataFrame([{'close': close_price}], dtype=float)
+                df = pd.concat([df, new_row], ignore_index=True).iloc[-300:].reset_index(drop=True)
                 df = calculate_indicators(df)
                 symbol_data[symbol] = df
 
-                # সঠিক ইনডেক্সিং (একদম পারফেক্ট বন্ধ হওয়া ক্যান্ডেল)
+                # নতুন বন্ধ হওয়া ক্যান্ডেল
                 closed_candle = df.iloc[-1]
-                prev_candle = df.iloc[-2]
 
                 if symbol not in open_positions:
-                    # পারফেক্ট বাই কন্ডিশন
-                    ema_trend = (closed_candle['ema50'] > closed_candle['ema100'] > closed_candle['ema200'])
-                    above_ema50 = (closed_candle['close'] > closed_candle['ema50'])
-                    rsi_drop = (prev_candle['rsi3'] >= 10) and (closed_candle['rsi3'] < 10)
-                    stoch_low = (closed_candle['stoch_k'] < 20)
+                    # ১. প্রাইজ EMA50 এর উপরে থাকতে হবে
+                    c1_price_above_ema50 = (closed_candle['close'] > closed_candle['ema50'])
+                    
+                    # ২. EMA ট্রেন্ড: EMA50 > EMA100 > EMA200 হতে হবে
+                    c2_ema_alignment = (closed_candle['ema50'] > closed_candle['ema100']) and (closed_candle['ema100'] > closed_candle['ema200'])
+                    
+                    # ৩. RSI(3) ১০ এর কম হতে হবে
+                    c3_rsi3_low = (closed_candle['rsi3'] < 10.0)
+                    
+                    # ৪. Stoch K ২০ এর কম হতে হবে
+                    c4_stoch_low = (closed_candle['stoch_k'] < 20.0)
 
-                    if ema_trend and above_ema50 and rsi_drop and stoch_low:
-                        print(f"--> [BUY MATCHED] {symbol} | RSI(3): {closed_candle['rsi3']:.2f} | Price: {close_price}", flush=True)
+                    # সবগুলো শর্ত একসাথে পূরণ হলেই কেবল বাই এক্সিকিউট হবে
+                    if c1_price_above_ema50 and c2_ema_alignment and c3_rsi3_low and c4_stoch_low:
+                        print(f"\n[BUY SIGNAL MATCHED] {symbol}", flush=True)
+                        print(f"--> Price: {closed_candle['close']} | EMA50: {closed_candle['ema50']:.2f} | EMA100: {closed_candle['ema100']:.2f} | EMA200: {closed_candle['ema200']:.2f}", flush=True)
+                        print(f"--> RSI3: {closed_candle['rsi3']:.2f} | Stoch K: {closed_candle['stoch_k']:.2f}\n", flush=True)
+                        
                         execute_buy(symbol)
 
             with counter_lock:
