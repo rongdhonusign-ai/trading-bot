@@ -236,19 +236,43 @@ def execute_buy(symbol):
 
 def execute_sell(symbol, reason):
     try:
-        # ব্যালেন্স বা অপেন পজিশন থেকে আসল কোয়ান্টিটি চেক করা
-        qty = open_positions[symbol]['qty']
+        # ১. কয়েন নাম আলাদা করা (যেমন CELRUSDT থেকে CELR)
+        asset = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "").replace("FDUSD", "")
         
+        # ২. সরাসরি বাইন্যান্স ওয়ালেট থেকে Free Balance চেক করা
+        balance = client.get_asset_balance(asset=asset)
+        if not balance:
+            print(f"Sell Error {symbol}: Asset balance not found", flush=True)
+            return
+
+        free_qty = float(balance['free'])
+
+        # ৩. এক্সচেঞ্জের LOT_SIZE ফিল্টার অনুযায়ী রাউন্ড করা
         info = client.get_symbol_info(symbol)
         step_size = next(f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE')
         precision = int(round(-math.log10(float(step_size)))) if float(step_size) < 1 else 0
-        qty = round(qty, precision)
-
-        client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
-        print(f"\n⚡ SUCCESS: Instant Sold 100% {symbol} | Reason: {reason}\n", flush=True)
         
+        # ওয়ালেটের ফ্রি ব্যালেন্সকে প্রিসিশন অনুযায়ী ডাউন-রাউন্ড (Floor) করা
+        sell_qty = math.floor(free_qty * (10 ** precision)) / (10 ** precision)
+
+        # ৪. ন্যূনতম লট সাইজের চেয়ে ব্যালেন্স বেশি থাকলে অর্ডার এক্সিকিউট করা
+        min_qty = float(next(f['minQty'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'))
+        
+        if sell_qty >= min_qty:
+            client.create_order(
+                symbol=symbol, 
+                side=SIDE_SELL, 
+                type=ORDER_TYPE_MARKET, 
+                quantity=sell_qty
+            )
+            print(f"\n⚡ SUCCESS: Instant Sold {sell_qty} {symbol} | Reason: {reason}\n", flush=True)
+        else:
+            print(f"Sell Cancelled {symbol}: Insufficient free quantity ({sell_qty} < {min_qty})", flush=True)
+
+        # সফলভাবে প্রসেস হলে অপেন পজিশন থেকে মুছে ফেলা
         if symbol in open_positions:
             del open_positions[symbol]
+
     except Exception as e:
         print(f"Sell Error {symbol}: {e}", flush=True)
 
