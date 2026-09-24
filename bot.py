@@ -23,9 +23,8 @@ TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
 STABLECOINS = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'DAI', 'EUR', 'GBP', 'WBTC', 'WETH', 'PAX']
 open_positions = {}
-symbol_data = {}  # ক্যান্ডেল হিস্ট্রি স্টোর করার জন্য
+symbol_data = {}
 
-# Thread-Safe Counter Variables
 scanned_count = 0
 counter_lock = threading.Lock()
 
@@ -39,7 +38,7 @@ def home():
     return "Trading Bot via Multi-Stream WebSocket is Active!", 200
 
 # ---------------------------------------------------------
-# INDICATORS
+# INDICATORS CALCULATOR
 # ---------------------------------------------------------
 def calculate_indicators(df):
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -106,45 +105,56 @@ def on_message(ws, message):
     if 'data' in data:
         kline = data['data']['k']
         symbol = kline['s']
-        is_closed = kline['x']  # ক্যান্ডেল ক্লোজ হয়েছে কিনা
+        is_closed = kline['x']
         close_price = float(kline['c'])
 
-        # ১. ওপেন পজিশন ট্র্যাকিং (প্রফিট/স্টপ লস)
-        if symbol in open_positions:
-            buy_price = open_positions[symbol]['buy_price']
-            stop_price = buy_price * (1 - STOP_LOSS_PCT)
-            
-            if close_price <= stop_price:
-                execute_sell(symbol, "Stop-Loss Hit")
-            elif is_closed:
-                df = symbol_data.get(symbol)
-                if df is not None:
-                    df = calculate_indicators(df)
-                    if df.iloc[-1]['rsi3'] >= 85:
-                        execute_sell(symbol, "Take Profit Hit (RSI3 >= 85)")
+        # ১. রিয়েল-টাইম ক্যান্ডেল আপডেট
+        df = symbol_data.get(symbol)
+        if df is not None:
+            # লাইভ প্রাইজ দিয়ে টেম্পোরারি রো আপডেট
+            df_temp = pd.concat([df, pd.DataFrame([{'close': close_price}])], ignore_index=True)
+            df_calc = calculate_indicators(df_temp)
+            current_rsi3 = df_calc.iloc[-1]['rsi3']
 
-        # ২. ক্যান্ডেল ক্লোজ হলে বাই সিগন্যাল স্ক্যানিং
+            # -----------------------------------------------------
+            # সেল ফিল্টার (ইনস্ট্যান্ট রেসপন্স - ক্যান্ডেল ক্লোজের জন্য ওয়েট করবে না)
+            # -----------------------------------------------------
+            if symbol in open_positions:
+                buy_price = open_positions[symbol]['buy_price']
+                stop_price = buy_price * (1 - STOP_LOSS_PCT)
+
+                # স্টপ লস বা টেক প্রফিট (RSI3 >= 85) হিট হলে সেল
+                if close_price <= stop_price:
+                    execute_sell(symbol, f"Stop-Loss Hit (Price: {close_price})")
+                elif current_rsi3 >= 85:
+                    execute_sell(symbol, f"Take-Profit Hit (RSI3: {current_rsi3:.2f})")
+
+        # ---------------------------------------------------------
+        # ২. কেবল ক্যান্ডেল ক্লোজ হলেই বাই ফিল্টার রান করবে
+        # ---------------------------------------------------------
         if is_closed:
-            df = symbol_data.get(symbol)
             if df is not None:
+                # ক্যান্ডেল পারমানেন্টলি সেভ
                 new_row = pd.DataFrame([{'close': close_price}])
                 df = pd.concat([df, new_row], ignore_index=True).iloc[-100:]
                 df = calculate_indicators(df)
                 symbol_data[symbol] = df
 
-                prev_closed = df.iloc[-3]
-                closed = df.iloc[-2]
+                # সঠিক ইনডেক্সিং (একদম পারফেক্ট বন্ধ হওয়া ক্যান্ডেল)
+                closed_candle = df.iloc[-1]
+                prev_candle = df.iloc[-2]
 
                 if symbol not in open_positions:
-                    # বাই সিগন্যাল টেস্ট (RSI3 < 10)
-                    if (closed['ema50'] > closed['ema100'] > closed['ema200']) and \
-                       (closed['close'] > closed['ema50']) and \
-                       (prev_closed['rsi3'] >= 10) and (closed['rsi3'] < 10) and \
-                       (closed['stoch_k'] < 20):
-                        print(f"--> [SIGNAL MATCHED] Buying {symbol} | RSI(3): {closed['rsi3']:.2f} | Price: {close_price}", flush=True)
+                    # পারফেক্ট বাই কন্ডিশন
+                    ema_trend = (closed_candle['ema50'] > closed_candle['ema100'] > closed_candle['ema200'])
+                    above_ema50 = (closed_candle['close'] > closed_candle['ema50'])
+                    rsi_drop = (prev_candle['rsi3'] >= 10) and (closed_candle['rsi3'] < 10)
+                    stoch_low = (closed_candle['stoch_k'] < 20)
+
+                    if ema_trend and above_ema50 and rsi_drop and stoch_low:
+                        print(f"--> [BUY MATCHED] {symbol} | RSI(3): {closed_candle['rsi3']:.2f} | Price: {close_price}", flush=True)
                         execute_buy(symbol)
 
-            # কাউন্টার আপডেট
             with counter_lock:
                 scanned_count += 1
                 if scanned_count % 20 == 0:
@@ -171,7 +181,8 @@ def execute_sell(symbol, reason):
 
         client.create_order(symbol=symbol, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=qty)
         print(f"SUCCESS: Sold {symbol} | Reason: {reason}", flush=True)
-        del open_positions[symbol]
+        if symbol in open_positions:
+            del open_positions[symbol]
     except Exception as e:
         print(f"Sell Error {symbol}: {e}", flush=True)
 
@@ -189,11 +200,10 @@ def start_websocket_system():
         df = load_initial_candles(p)
         if df is not None:
             symbol_data[p] = df
-        time.sleep(0.12)  # IP Ban এড়াতে রিকোয়েস্টের মধ্যে নিরাপদ বিরতি
+        time.sleep(0.12)
 
     print(f"Initial Candles Loaded for {len(symbol_data)} Pairs!", flush=True)
 
-    # ৪০টি করে ৩টি থ্রেড গ্রুপ
     chunk_size = 40
     chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
 
