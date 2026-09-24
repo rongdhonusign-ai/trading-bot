@@ -86,7 +86,7 @@ def get_top_120_usdt_pairs():
 
 def load_initial_candles(symbol):
     try:
-        # EMA200 নিখুঁত করার জন্য ২৫০টি ক্যান্ডেল লোড করা হচ্ছে
+        # EMA200 নিখুঁত বের করতে ২৫০টি ক্যান্ডেল ফেচ করা হচ্ছে
         klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=250)
         df = pd.DataFrame(klines, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
@@ -113,7 +113,7 @@ def on_message(ws, message):
         df = symbol_data.get(symbol)
 
         # -----------------------------------------------------
-        # ১. রিয়েল-টাইম সেল ফিল্টার (স্টপ লস ও টেক প্রফিট চেক)
+        # ১. রিয়েল-টাইম সেল ফিল্টার (ইনস্ট্যান্ট সেল)
         # -----------------------------------------------------
         if symbol in open_positions:
             buy_price = open_positions[symbol]['buy_price']
@@ -135,7 +135,7 @@ def on_message(ws, message):
         # ---------------------------------------------------------
         if is_closed:
             if df is not None:
-                # ক্যান্ডেল সেভ করা ও ইন্ডেক্স রিসেট করা
+                # ক্যান্ডেল পারমানেন্টলি সেভ ও ইনডেক্স রিসেট
                 new_row = pd.DataFrame([{'close': close_price}], dtype=float)
                 df = pd.concat([df, new_row], ignore_index=True).iloc[-250:].reset_index(drop=True)
                 df = calculate_indicators(df)
@@ -149,7 +149,7 @@ def on_message(ws, message):
                     ema100 = closed_candle['ema100']
                     ema200 = closed_candle['ema200']
 
-                    # EMA ভ্যালু যেন ০.০০ না হয় (সুরক্ষাকবচ)
+                    # EMA ভ্যালু জিরো না হওয়া নিশ্চিত করা
                     valid_ema = (ema50 > 0) and (ema100 > 0) and (ema200 > 0)
 
                     # ১. প্রাইজ EMA50 এর উপরে
@@ -164,7 +164,7 @@ def on_message(ws, message):
                     # ৪. Stoch K < 20
                     c4_stoch_low = (closed_candle['stoch_k'] < 20.0)
 
-                    # সব শর্ত একসঙ্গে সত্য হলে বাই হবে
+                    # সব শর্ত একসাথে সত্য হলে বাই হবে
                     if valid_ema and c1_price_above_ema50 and c2_ema_alignment and c3_rsi3_low and c4_stoch_low:
                         print(f"\n[BUY SIGNAL MATCHED] {symbol}", flush=True)
                         print(f"--> Price: {closed_candle['close']} | EMA50: {ema50:.2f} | EMA100: {ema100:.2f} | EMA200: {ema200:.2f}", flush=True)
@@ -211,26 +211,35 @@ def start_single_socket(stream_pairs):
 
 def start_websocket_system():
     pairs = get_top_120_usdt_pairs()
-    print(f"Loading initial candles for {len(pairs)} pairs safely...", flush=True)
     
-    for p in pairs:
-        df = load_initial_candles(p)
-        if df is not None:
-            symbol_data[p] = df
-        # IP Ban এড়াতে ০.৫৫ সেকেন্ড বিরতি দেওয়া হয়েছে
-        time.sleep(0.55)
-
-    print(f"Initial Candles Loaded for {len(symbol_data)} Pairs!", flush=True)
-
+    # ১২০টি টোকেনকে ৪০টি করে ৩টি ব্যাচে ভাগ করা
     chunk_size = 40
     chunks = [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
 
-    print(f"Starting {len(chunks)} Multi-Threaded Websockets...", flush=True)
+    print(f"Starting Batch Initialization for {len(pairs)} Pairs in {len(chunks)} Chunks...", flush=True)
+
     for idx, chunk in enumerate(chunks):
+        print(f"\n--> [Batch {idx+1}/{len(chunks)}] Loading candles for {len(chunk)} pairs...", flush=True)
+        
+        # ব্যাচের ৪০টি টোকেনের ক্যান্ডেল নিরাপদ বিরতিতে ফেচ করা
+        for p in chunk:
+            df = load_initial_candles(p)
+            if df is not None:
+                symbol_data[p] = df
+            time.sleep(0.4) # ক্যান্ডেল রিকোয়েস্টের মাঝে বিরতি
+
+        # এই ব্যাচের ৪০টি টোকেনের জন্য ওয়েবসকেট চালু করা
         t = threading.Thread(target=start_single_socket, args=(chunk,))
         t.daemon = True
         t.start()
-        print(f"WebSocket Stream #{idx+1} Started ({len(chunk)} pairs)", flush=True)
+        print(f"--> WebSocket Stream #{idx+1} Active ({len(chunk)} pairs)", flush=True)
+
+        # পরের ব্যাচে যাওয়ার আগে সেফটি পজ (IP Ban আটকানোর জন্য)
+        if idx < len(chunks) - 1:
+            print("--> Waiting 20 seconds before initializing next batch to keep Binance Rate Limit safe...", flush=True)
+            time.sleep(20)
+
+    print("\n[ALL 120 PAIRS FULLY LOADED & LIVE SCANNING ACTIVE]", flush=True)
 
 # ---------------------------------------------------------
 # MAIN
