@@ -29,24 +29,24 @@ TRADE_AMOUNT_USDT = 15.0
 TIME_FRAME = '5m'
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2
-STOP_LOSS_PCT = 0.03 # 3%
+STOP_LOSS_PCT = 0.03 # ৩%
 
-# পজিশন ট্র্যাকিং (কয়েন অনুযায়ী ক্রয়মূল্য ও পরিমাণ রাখা)
+# পজিশন ট্র্যাকিং
 positions = {}
 
-# স্ট্যাবলকয়েন ও অনাকাঙ্ক্ষিত পেয়ারের ব্লকলিস্ট
+# স্ট্যাবলকয়েন ও অনাকাঙ্ক্ষিত পেয়ারের ব্লকলিস্ট
 STABLECOINS = {
     'USDT', 'USDC', 'BUSD', 'FDUSD', 'TUSD', 'DAI', 'EUR', 'GBP', 
     'WBTC', 'WEAX', 'AEUR', 'PAX', 'USDP', 'SUSD'
 }
 
 # ----------------------------------------------------
-# ৩. এক্সচেঞ্জ ইনিশিয়ালাইজেশন
+# ৩. এক্সচেঞ্জ ইনিশিয়ালাইজেশন
 # ----------------------------------------------------
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
-    'enableRateLimit': True, # IP Ban প্রতিরোধী
+    'enableRateLimit': True, # IP Ban প্রতিরোধী বিল্ট-ইন লিমিটার
     'options': {
         'defaultType': 'spot'
     }
@@ -63,13 +63,11 @@ async def get_top_50_altcoins():
         for symbol, ticker in tickers.items():
             if symbol.endswith('/USDT'):
                 base = symbol.split('/')[0]
-                # স্ট্যাবলকয়েন, ডাউন/আপ লেভারেজড টোকেন বাদ দেওয়া
                 if base not in STABLECOINS and not any(x in base for x in ['UP', 'DOWN', 'BULL', 'BEAR']):
                     quote_volume = ticker.get('quoteVolume', 0)
                     if quote_volume:
                         usdt_pairs.append((symbol, quote_volume))
 
-        # ভলিউম অনুযায়ী সাজিয়ে শীর্ষ ৫০ বেছে নেওয়া
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         top_50 = [item[0] for item in usdt_pairs[:50]]
         return top_50
@@ -82,18 +80,16 @@ async def get_top_50_altcoins():
 # ----------------------------------------------------
 async def analyze_and_trade(symbol):
     try:
-        # Bollinger Bands এবং MA20 ক্যালকুলেশনের জন্য ক্যান্ডেল ডেটা
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
         if len(ohlcv) < 26:
             return
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Bollinger Bands নির্ণয়
         bb = ta.bbands(df['close'], length=BOLLINGER_PERIOD, std=BOLLINGER_STD)
         df['lower_band'] = bb[f'BBL_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0']
         df['upper_band'] = bb[f'BBU_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0']
-        df['ma20'] = bb[f'BBM_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0'] # MA20 হলো মিডল ব্যান্ড
+        df['ma20'] = bb[f'BBM_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0']
 
         last_row = df.iloc[-1]
         five_candles_ago = df.iloc[-6]
@@ -105,26 +101,24 @@ async def analyze_and_trade(symbol):
         prev_ma20 = five_candles_ago['ma20']
 
         # ------------------------------------------------
-        # সেল লজিক (যদি পজিশন খোলা থাকে)
+        # সেল লজিক
         # ------------------------------------------------
         if symbol in positions:
             entry_price = positions[symbol]['entry_price']
             amount = positions[symbol]['amount']
             
-            # ৩% প্রফিট/লস অথবা Upper Band ক্রস
             stop_loss_price = entry_price * (1 - STOP_LOSS_PCT)
             
             if current_close > current_upper_band or current_close <= stop_loss_price:
                 reason = "Upper Band Hit" if current_close > current_upper_band else "Stop Loss Hit (3%)"
                 print(f"[{symbol}] Selling 100%. Reason: {reason}")
                 
-                # Market Order এ সম্পূর্ণ বিক্রি
                 order = await exchange.create_market_sell_order(symbol, amount)
                 print(f"Sell Order Executed: {order['id']}")
                 del positions[symbol]
 
         # ------------------------------------------------
-        # বায় লজিক (যদি আগে কেনা না থাকে)
+        # বায় লজিক
         # ------------------------------------------------
         else:
             condition_1 = current_close < current_lower_band
@@ -133,11 +127,18 @@ async def analyze_and_trade(symbol):
             if condition_1 and condition_2:
                 print(f"[{symbol}] BUY Signal Detected!")
                 
-                # Market Order এ কেনা
-                order = await exchange.create_market_buy_order_requires_price(symbol, TRADE_AMOUNT_USDT)
-                # ক্রয়কৃত পরিমাণ বের করা
-                filled_amount = order['filled']
-                executed_price = order['price'] or current_close
+                # সঠিক পদ্ধতিতে USDT অ্যামাউন্ট দিয়ে মার্কেট অর্ডার প্লেস করা
+                order = await exchange.create_order(
+                    symbol, 
+                    'market', 
+                    'buy', 
+                    None, 
+                    None, 
+                    {'quoteOrderQty': TRADE_AMOUNT_USDT}
+                )
+                
+                filled_amount = order.get('filled', 0)
+                executed_price = order.get('average') or order.get('price') or current_close
                 
                 positions[symbol] = {
                     'entry_price': executed_price,
@@ -145,14 +146,19 @@ async def analyze_and_trade(symbol):
                 }
                 print(f"Bought {symbol} at {executed_price} USDT, Amount: {filled_amount}")
 
+    except ccxt.RateLimitExceeded as e:
+        print(f"Rate limit exceeded! Waiting for 60 seconds... Error: {e}")
+        await asyncio.sleep(60)
     except Exception as e:
-        # এপিআই লিমিটিং এড়াতে ছোটখাটো এরর প্রিন্ট করে ওভারলুক করবে
-        pass
+        print(f"Error processing {symbol}: {e}")
 
 # ----------------------------------------------------
 # ৬. প্রধান লুপ (Main Loop)
 # ----------------------------------------------------
 async def main_loop():
+    print("Loading markets...")
+    await exchange.load_markets() # গুরুত্বপূর্ণ: বারবার রিকোয়েস্ট এড়াতে মার্কেট ক্যাশ করে নেওয়া
+    
     while True:
         try:
             print("Fetching top 50 altcoins...")
@@ -161,20 +167,17 @@ async def main_loop():
 
             for symbol in top_50_symbols:
                 await analyze_and_trade(symbol)
-                # IP Ban এড়াতে প্রতিটি রিকোয়েস্টের মাঝে হালকা বিরতি
-                await asyncio.sleep(0.2) 
+                # প্রতিটি রিকোয়েস্টের মাঝে বিরতি ০.৫ সেকেন্ড করা হয়েছে (সেফটি বাড়াতে)
+                await asyncio.sleep(0.5) 
 
-            # প্রতি ৫ মিনিটের ক্যান্ডেল ক্লোজের কাছাকাছি সময়ে আবার চেক করবে
-            print("Scan completed. Waiting for next cycle...")
-            await asyncio.sleep(60) 
+            # টাইমফ্রেম ৫ মিনিট হওয়ায় লুপের বিরতি বাড়িয়ে ৩১০ সেকেন্ড (৫ মিনিট ১০ সেকেন্ড) করা হলো
+            print("Scan completed. Waiting for next 5m cycle...")
+            await asyncio.sleep(310) 
 
         except Exception as e:
             print(f"Error in main loop: {e}")
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    # Flask সার্ভার ব্যাকগ্রাউন্ডে চালু করা
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    # Asyncio বট চালু করা
     asyncio.run(main_loop())
