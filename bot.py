@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance Bot is Active and Healthy!"
+    return "Binance Bot with Proxy Bypass is Active!"
 
 # ----------------------------------------------------
 # ২. কনফিগারেশন
@@ -39,12 +39,16 @@ STABLECOINS = {
 }
 
 # ----------------------------------------------------
-# ৩. CCXT সেটআপ (Rate Limit Strict)
+# ৩. CCXT সেটআপ (Proxy Bypass সহ)
 # ----------------------------------------------------
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
+    'proxies': {
+        'http': 'http://185.199.229.156:7492',   # Working Public Proxy
+        'https': 'http://185.199.229.156:7492',
+    },
     'options': {
         'defaultType': 'spot',
         'adjustForTimeDifference': True
@@ -72,11 +76,11 @@ async def get_top_50_altcoins_safely():
         return [item[0] for item in usdt_pairs[:50]]
 
     except Exception as e:
-        print(f"Error fetching top coins: {e}", flush=True)
+        print(f"Error fetching top coins via Proxy: {e}", flush=True)
         return []
 
 # ----------------------------------------------------
-# ৫. সেল মনিটর
+# ৫. ফাস্ট সেল মনিটর ( Upper Band / SL Check)
 # ----------------------------------------------------
 async def monitor_open_positions():
     if not positions:
@@ -105,7 +109,7 @@ async def monitor_open_positions():
             print(f"Error in fast sell monitor for {symbol}: {e}", flush=True)
 
 # ----------------------------------------------------
-# ৬. বাই লজিক
+# ৬. বাই সিগন্যাল অ্যানালাইসিস
 # ----------------------------------------------------
 async def analyze_and_buy(symbol):
     try:
@@ -158,7 +162,7 @@ async def analyze_and_buy(symbol):
         print(f"Error evaluating {symbol}: {e}", flush=True)
 
 # ----------------------------------------------------
-# ৭. সেফ মেইন লুপ
+# ৭. প্রধান স্ক্যান লুপ (২০ মিনিটে ১ বার লিস্ট আপডেট)
 # ----------------------------------------------------
 async def main_loop():
     current_top_50 = []
@@ -168,9 +172,9 @@ async def main_loop():
         try:
             current_time = time.time()
 
-            # ২০ মিনিট পর পর টপ ৫০ রিফ্রেশ
+            # ২০ মিনিট (১২০০ সেকেন্ড) পর পর নতুন লিস্ট আনবে
             if current_time - last_fetch_time >= TOP_COINS_REFRESH_INTERVAL or not current_top_50:
-                print("🔄 Updating Top 50 Altcoins list...", flush=True)
+                print("🔄 Fetching Top 50 Altcoins via Proxy...", flush=True)
                 new_list = await get_top_50_altcoins_safely()
                 
                 if new_list:
@@ -178,8 +182,8 @@ async def main_loop():
                     last_fetch_time = current_time
                     print(f"✅ Top 50 list updated! ({len(current_top_50)} coins)", flush=True)
                 else:
-                    print("⚠️ Failed to fetch list (IP Limited/Ban). Retrying after 3 minutes...", flush=True)
-                    await asyncio.sleep(180) # Ban খেলে ৩ মিনিট চুপ থাকবে
+                    print("⚠️ Proxy Error / Retry in 2 minutes...", flush=True)
+                    await asyncio.sleep(120)
                     continue
 
             if current_top_50:
@@ -187,7 +191,7 @@ async def main_loop():
                 for symbol in current_top_50:
                     await analyze_and_buy(symbol)
                     await monitor_open_positions()
-                    await asyncio.sleep(1.5) # প্রতি কয়েনে ১.৫ সে. ডিলে (Weight বাচাতে)
+                    await asyncio.sleep(1.5) # ১.৫ সেকেন্ড বিরতি
 
                 print("Cycle finished. Waiting 90 seconds...", flush=True)
                 for _ in range(9):
@@ -199,7 +203,7 @@ async def main_loop():
             await asyncio.sleep(30)
 
 # ----------------------------------------------------
-# ৮. ব্যাকগ্রাউন্ড থ্রেড
+# ৮. ব্যাকগ্রাউন্ড থ্রেড চালু করা
 # ----------------------------------------------------
 def start_async_loop():
     loop = asyncio.new_event_loop()
