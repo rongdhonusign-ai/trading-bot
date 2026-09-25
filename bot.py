@@ -2,7 +2,7 @@ import os
 import asyncio
 import threading
 from flask import Flask
-import ccxt.pro as ccxt  # WebSocket-এর জন্য ccxt.pro
+import ccxt.pro as ccxt
 import pandas as pd
 import pandas_ta as ta
 
@@ -26,14 +26,22 @@ TIME_FRAME = '5m'
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2
 STOP_LOSS_PCT = 0.03
-TOP_COINS_REFRESH_INTERVAL = 1200  # ২০ মিনিট পর পর টপ ৫০ রিফ্রেশ
 
 positions = {}
 
-STABLECOINS = {
-    'USDT', 'USDC', 'BUSD', 'FDUSD', 'TUSD', 'DAI', 'EUR', 'GBP', 
-    'WBTC', 'WEAX', 'AEUR', 'PAX', 'USDP', 'SUSD'
-}
+# REST API এড়াতে টপ ৫০টি কয়েনের রেডি তালিকা (ব্যান-মুক্ত)
+TOP_50_COINS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
+    'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'SHIB/USDT', 'DOT/USDT', 
+    'LINK/USDT', 'NEAR/USDT', 'SUI/USDT', 'LTC/USDT', 'PEPE/USDT', 
+    'FET/USDT', 'APT/USDT', 'ICP/USDT', 'UNI/USDT', 'RENDER/USDT', 
+    'BCH/USDT', 'TIA/USDT', 'FIL/USDT', 'STX/USDT', 'INJ/USDT', 
+    'WIF/USDT', 'GALA/USDT', 'ETC/USDT', 'SEI/USDT', 'ATOM/USDT', 
+    'AR/USDT', 'FLOKI/USDT', 'BONK/USDT', 'FTM/USDT', 'OP/USDT', 
+    'ARB/USDT', 'AAVE/USDT', 'GRT/USDT', 'RUNE/USDT', 'THETA/USDT', 
+    'ALGO/USDT', 'SAND/USDT', 'MANA/USDT', 'ENA/USDT', 'JUP/USDT', 
+    'ORDI/USDT', 'NOT/USDT', 'WLD/USDT', 'MKR/USDT', 'LDO/USDT'
+]
 
 # CCXT Pro WebSocket Client Setup
 exchange = ccxt.binance({
@@ -47,32 +55,9 @@ exchange = ccxt.binance({
 })
 
 # ----------------------------------------------------
-# ৩. সেফ টপ ৫০ ফেচার (API)
-# ----------------------------------------------------
-async def get_top_50_altcoins_safely():
-    try:
-        tickers = await exchange.fetch_tickers()
-        usdt_pairs = []
-
-        for symbol, item in tickers.items():
-            if symbol.endswith('/USDT'):
-                base = symbol.split('/')[0]
-                if base not in STABLECOINS and not any(x in base for x in ['UP', 'DOWN', 'BULL', 'BEAR']):
-                    quote_volume = float(item.get('quoteVolume', 0) or 0)
-                    usdt_pairs.append((symbol, quote_volume))
-
-        usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-        return [item[0] for item in usdt_pairs[:50]]
-
-    except Exception as e:
-        print(f"Error fetching top coins: {e}", flush=True)
-        return []
-
-# ----------------------------------------------------
-# ৪. WebSocket পজিশন মনিটর (Fast Sell Check)
+# ৩. WebSocket পজিশন মনিটর (Fast Sell Check)
 # ----------------------------------------------------
 async def watch_position_symbol(symbol):
-    """শুধুমাত্র যেসব কয়েনে পজিশন ওপেন আছে সেগুলোর রিয়েল-টাইম টিক ওয়াচ করবে"""
     while symbol in positions:
         try:
             ticker = await exchange.watch_ticker(symbol)
@@ -98,17 +83,16 @@ async def watch_position_symbol(symbol):
             await asyncio.sleep(2)
 
 # ----------------------------------------------------
-# ৫. WebSocket দিয়ে কয়েন অ্যানালাইসিস ও বাই সিগন্যাল
+# ৪. WebSocket দিয়ে কয়েন অ্যানালাইসিস ও বাই সিগন্যাল
 # ----------------------------------------------------
 async def watch_and_analyze_symbol(symbol):
-    """WebSocket দিয়ে ক্যাণ্ডেল (OHLCV) স্ট্রিম রিসিভ করে বাই সিগন্যাল অ্যানালাইসিস করবে"""
+    print(f"📡 WebSocket Connected & Watching: {symbol}", flush=True)
     while True:
         try:
             if symbol in positions:
                 await asyncio.sleep(5)
                 continue
 
-            # WebSocket দিয়ে রিয়েল-টাইম ৫ মিনিটের ক্যাণ্ডেল ডেটা স্ট্রিম
             ohlcv = await exchange.watch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
             if len(ohlcv) < 26:
                 continue
@@ -151,7 +135,6 @@ async def watch_and_analyze_symbol(symbol):
                 }
                 print(f"✅ Bought {symbol} at {executed_price} USDT", flush=True)
 
-                # কেনা হয়ে গেলে সাথে সাথে আলাদা WebSocket মনিটর টাস্ক চালু হবে
                 asyncio.create_task(watch_position_symbol(symbol))
 
         except Exception as e:
@@ -159,40 +142,21 @@ async def watch_and_analyze_symbol(symbol):
             await asyncio.sleep(5)
 
 # ----------------------------------------------------
-# ৬. প্রধান লুপ (WebSocket Manager Task)
+# ৫. প্রধান লুপ (WebSocket Manager)
 # ----------------------------------------------------
 async def main_loop():
-    active_tasks = {}
+    print(f"🚀 Starting WebSocket Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
+    
+    # ৫০টি কয়েনের জন্য একসাথে কানেকশন চালু হবে (Rate Limit ছাড়া)
+    for symbol in TOP_50_COINS:
+        asyncio.create_task(watch_and_analyze_symbol(symbol))
+        await asyncio.sleep(0.2) # কানেকশন স্মুথ রাখার জন্য সামান্য বিরতি
 
     while True:
-        try:
-            print("🔄 Fetching Top 50 Altcoins via API...", flush=True)
-            top_50_coins = await get_top_50_altcoins_safely()
-
-            if top_50_coins:
-                print(f"✅ Active WebSocket Streams Starting for Top {len(top_50_coins)} Coins...", flush=True)
-                
-                # পুরানো টাস্ক যেগুলো টপ ৫০ তালিকায় নেই সেগুলো বাদ দেওয়া
-                for symbol in list(active_tasks.keys()):
-                    if symbol not in top_50_coins:
-                        active_tasks[symbol].cancel()
-                        del active_tasks[symbol]
-
-                # নতুন কয়েনগুলোর জন্য আলাদা কনকারেন্ট ব্যাকগ্রাউন্ড WebSocket স্ট্রিম শুরু
-                for symbol in top_50_coins:
-                    if symbol not in active_tasks or active_tasks[symbol].done():
-                        task = asyncio.create_task(watch_and_analyze_symbol(symbol))
-                        active_tasks[symbol] = task
-
-            # ২০ মিনিট পর আবার টপ ৫০ রিফ্রেশ হবে
-            await asyncio.sleep(TOP_COINS_REFRESH_INTERVAL)
-
-        except Exception as e:
-            print(f"Error in Main Manager Loop: {e}", flush=True)
-            await asyncio.sleep(10)
+        await asyncio.sleep(3600) # ব্যাকগ্রাউন্ড লুপ সচল রাখার জন্য
 
 # ----------------------------------------------------
-# ৭. ব্যাকগ্রাউন্ড থ্রেড ও অ্যাপ স্টার্টআপ
+# ৬. ব্যাকগ্রাউন্ড থ্রেড ও অ্যাপ স্টার্টআপ
 # ----------------------------------------------------
 def start_async_loop():
     loop = asyncio.new_event_loop()
@@ -202,7 +166,6 @@ def start_async_loop():
     finally:
         loop.run_until_complete(exchange.close())
 
-# Flask চালু হওয়ার পূর্বে থ্রেড স্টার্ট
 bot_thread = threading.Thread(target=start_async_loop, daemon=True)
 bot_thread.start()
 
