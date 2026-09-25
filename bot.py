@@ -6,12 +6,18 @@ import ccxt.async_support as ccxt
 import pandas as pd
 import pandas_ta as ta
 
+# ----------------------------------------------------
+# ১. Flask Web Server (Health Check Endpoint)
+# ----------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Binance Trading Bot is Running Live!"
 
+# ----------------------------------------------------
+# ২. প্যারামিটার ও কনফিগারেশন
+# ----------------------------------------------------
 API_KEY = os.environ.get('BINANCE_API_KEY', '')
 SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
 
@@ -28,13 +34,19 @@ STABLECOINS = {
     'WBTC', 'WEAX', 'AEUR', 'PAX', 'USDP', 'SUSD'
 }
 
+# ----------------------------------------------------
+# ৩. CCXT এক্সচেঞ্জ সেটআপ
+# ----------------------------------------------------
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
-    'enableRateLimit': True,
+    'enableRateLimit': True, # IP Ban এড়াতে সাহায্য করে
     'options': {'defaultType': 'spot'}
 })
 
+# ----------------------------------------------------
+# ৪. টপ ৫০ অল্টকয়েন ফিল্টারিং ফাংশন
+# ----------------------------------------------------
 async def get_top_50_altcoins():
     try:
         tickers = await exchange.fetch_tickers()
@@ -54,6 +66,9 @@ async def get_top_50_altcoins():
         print(f"Error fetching top coins: {e}", flush=True)
         return []
 
+# ----------------------------------------------------
+# ৫. টেকনিক্যাল এনালাইসিস ও ট্রেডিং লজিক
+# ----------------------------------------------------
 async def analyze_and_trade(symbol):
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
@@ -62,6 +77,7 @@ async def analyze_and_trade(symbol):
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
+        # Bollinger Bands নির্ণয়
         bb = ta.bbands(df['close'], length=BOLLINGER_PERIOD, std=BOLLINGER_STD)
         
         df['lower_band'] = bb.iloc[:, 0]
@@ -77,6 +93,7 @@ async def analyze_and_trade(symbol):
         current_ma20 = last_row['ma20']
         prev_ma20 = five_candles_ago['ma20']
 
+        # Sell Logic
         if symbol in positions:
             entry_price = positions[symbol]['entry_price']
             amount = positions[symbol]['amount']
@@ -90,6 +107,7 @@ async def analyze_and_trade(symbol):
                 print(f"Sell Order Executed: {order['id']}", flush=True)
                 del positions[symbol]
 
+        # Buy Logic
         else:
             condition_1 = current_close < current_lower_band
             condition_2 = current_ma20 > prev_ma20
@@ -115,30 +133,44 @@ async def analyze_and_trade(symbol):
     except Exception as e:
         print(f"Error processing {symbol}: {e}", flush=True)
 
+# ----------------------------------------------------
+# ৬. প্রধান লুপ (Rate Limit Optimized)
+# ----------------------------------------------------
 async def main_loop():
     while True:
         try:
             print("Fetching top 50 altcoins...", flush=True)
             top_50_symbols = await get_top_50_altcoins()
+            
+            # যদি IP Banned বা ডাটা না পায়, তবে ৫ মিনিট অপেক্ষা করবে
+            if not top_50_symbols:
+                print("IP Banned or Fetch Failed. Retrying in 5 minutes...", flush=True)
+                await asyncio.sleep(300)
+                continue
+
             print(f"Scanning {len(top_50_symbols)} coins...", flush=True)
 
             for symbol in top_50_symbols:
                 await analyze_and_trade(symbol)
-                await asyncio.sleep(0.2) 
+                # API Overload এড়াতে প্রতিটি ক্যান্ডেল নেওয়ার মাঝে ১ সেকেন্ড বিরতি
+                await asyncio.sleep(1.0) 
 
             print("Scan completed. Waiting for next cycle...", flush=True)
-            await asyncio.sleep(60) 
+            # একটি ফুল স্ক্যান শেষে ৩ মিনিট বিরতি
+            await asyncio.sleep(180) 
 
         except Exception as e:
             print(f"Error in main loop: {e}", flush=True)
-            await asyncio.sleep(10)
+            await asyncio.sleep(60)
 
+# ----------------------------------------------------
+# ৭. ব্যাকগ্রাউন্ড থ্রেডে Asyncio চালু করার প্রসেস
+# ----------------------------------------------------
 def start_async_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main_loop())
 
-# Gunicorn সার্ভার যখনই bot.py লোড করবে, সাথে সাথে ট্রেডিং বট ব্যাকগ্রাউন্ডে চালু হয়ে যাবে
 bot_thread = threading.Thread(target=start_async_loop, daemon=True)
 bot_thread.start()
 
