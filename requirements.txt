@@ -1,5 +1,6 @@
 Flask
+gunicorn
 ccxt
 pandas
 pandas_ta
-requests
+websockets
