@@ -1,254 +1,180 @@
 import os
-import json
-import time
+import asyncio
 import threading
-import pandas as pd
 from flask import Flask
-from binance.client import Client
-from binance.enums import *
-import websocket
+import ccxt.async_support as ccxt
+import pandas as pd
+import pandas_ta as ta
 
-# ---------------------------------------------------------
-# BINANCE API KEYS (Environment Variables Auto-Detect)
-# ---------------------------------------------------------
-API_KEY = os.environ.get("BINANCE_API_KEY") or os.environ.get("API_KEY")
-API_SECRET = os.environ.get("BINANCE_API_SECRET") or os.environ.get("BINANCE_SECRET_KEY") or os.environ.get("API_SECRET")
-
-client = Client(API_KEY, API_SECRET)
-
-TRADE_AMOUNT_USDT = 30.0  # প্রতি ট্রেডে $30
-TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
-
-open_positions = {}
-symbol_data = {}  # ক্যান্ডেল ডাটা ফ্রেম জমা রাখার জন্য
-
-# ---------------------------------------------------------
-# FLASK SERVER
-# ---------------------------------------------------------
+# ----------------------------------------------------
+# ১. Flask Web Server (Render Free Tier Activity Handler)
+# ----------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Trading Bot via WebSocket is Active!", 200
+    return "Binance Trading Bot is Running!"
 
-# ---------------------------------------------------------
-# INDICATORS (RSI13 + Bollinger Bands 30,2)
-# ---------------------------------------------------------
-def calculate_indicators(df):
-    df = df.copy()
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-    alpha13 = 1.0 / 13
-    avg_gain13 = gain.ewm(alpha=alpha13, adjust=False).mean()
-    avg_loss13 = loss.ewm(alpha=alpha13, adjust=False).mean()
-    rs13 = avg_gain13 / (avg_loss13 + 1e-10) # Division by zero এড়াতে
-    df['rsi13'] = 100.0 - (100.0 / (1.0 + rs13))
+# ----------------------------------------------------
+# ২. ট্রেডিং বটের প্যারামিটার ও কনফিগারেশন
+# ----------------------------------------------------
+API_KEY = os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M')
+SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV')
 
-    df['bb_middle'] = df['close'].rolling(window=30).mean()
-    df['bb_std'] = df['close'].rolling(window=30).std()
-    df['bb_upper'] = df['bb_middle'] + (2 * df['bb_std'])
-    df['bb_lower'] = df['bb_middle'] - (2 * df['bb_std'])
-    return df
+TRADE_AMOUNT_USDT = 15.0
+TIME_FRAME = '5m'
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD = 2
+STOP_LOSS_PCT = 0.03 # 3%
 
-# ---------------------------------------------------------
-# GET TOP 120 USDT PAIRS & PRELOAD HISTORICAL DATA
-# ---------------------------------------------------------
-def get_top_120_usdt_pairs():
-    exchange_info = client.get_exchange_info()
-    symbols = exchange_info['symbols']
-    usdt_pairs = [s['symbol'] for s in symbols if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+# পজিশন ট্র্যাকিং (কয়েন অনুযায়ী ক্রয়মূল্য ও পরিমাণ রাখা)
+positions = {}
 
-    tickers = client.get_ticker()
-    ticker_dict = {t['symbol']: float(t['quoteVolume']) for t in tickers}
+# স্ট্যাবলকয়েন ও অনাকাঙ্ক্ষিত পেয়ারের ব্লকলিস্ট
+STABLECOINS = {
+    'USDT', 'USDC', 'BUSD', 'FDUSD', 'TUSD', 'DAI', 'EUR', 'GBP', 
+    'WBTC', 'WEAX', 'AEUR', 'PAX', 'USDP', 'SUSD'
+}
 
-    usdt_pairs_sorted = sorted(usdt_pairs, key=lambda x: ticker_dict.get(x, 0), reverse=True)
-    return usdt_pairs_sorted[:120]
+# ----------------------------------------------------
+# ৩. এক্সচেঞ্জ ইনিশিয়ালাইজেশন
+# ----------------------------------------------------
+exchange = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': SECRET_KEY,
+    'enableRateLimit': True, # IP Ban প্রতিরোধী
+    'options': {
+        'defaultType': 'spot'
+    }
+})
 
-def preload_historical_candles(symbols):
-    """বট চালুর পরপরই ৩০টি অতীত ক্যান্ডেল লোড করে নেবে যাতে BB ও RSI সঙ্গে সঙ্গে কাজ করে"""
-    print("⏳ Preloading historical candles for indicators...", flush=True)
-    for sym in symbols:
-        try:
-            klines = client.get_klines(symbol=sym, interval=TIMEFRAME, limit=40)
-            data = []
-            for k in klines:
-                data.append({
-                    'open': float(k[1]),
-                    'high': float(k[2]),
-                    'low': float(k[3]),
-                    'close': float(k[4]),
-                    'volume': float(k[5])
-                })
-            symbol_data[sym] = pd.DataFrame(data)
-        except Exception as e:
-            print(f"Error preloading {sym}: {e}", flush=True)
-    print("✅ Preload Complete!", flush=True)
-
-# ---------------------------------------------------------
-# EXECUTION FUNCTIONS
-# ---------------------------------------------------------
-def execute_buy(symbol, amount):
-    if symbol in open_positions:
-        return # আগে থেকে কেনা থাকলে দ্বিতীয়বার কিনবে না
-        
+# ----------------------------------------------------
+# ৪. টপ ৫০ অল্টকয়েন ফিল্টারিং ফাংশন
+# ----------------------------------------------------
+async def get_top_50_altcoins():
     try:
-        order = client.create_order(
-            symbol=symbol,
-            side=SIDE_BUY,
-            type=ORDER_TYPE_MARKET,
-            quoteOrderQty=amount
-        )
-        exec_qty = float(order['executedQty'])
-        cum_qty = float(order['cummulativeQuoteQty'])
-        avg_price = cum_qty / exec_qty if exec_qty > 0 else 0
+        tickers = await exchange.fetch_tickers()
+        usdt_pairs = []
 
-        open_positions[symbol] = {
-            'buy_price': avg_price,
-            'qty': exec_qty
-        }
-        print(f"✅ SUCCESS: Bought {symbol} at {avg_price} (${amount} USDT)", flush=True)
+        for symbol, ticker in tickers.items():
+            if symbol.endswith('/USDT'):
+                base = symbol.split('/')[0]
+                # স্ট্যাবলকয়েন, ডাউন/আপ লেভারেজড টোকেন বাদ দেওয়া
+                if base not in STABLECOINS and not any(x in base for x in ['UP', 'DOWN', 'BULL', 'BEAR']):
+                    quote_volume = ticker.get('quoteVolume', 0)
+                    if quote_volume:
+                        usdt_pairs.append((symbol, quote_volume))
 
+        # ভলিউম অনুযায়ী সাজিয়ে শীর্ষ ৫০ বেছে নেওয়া
+        usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+        top_50 = [item[0] for item in usdt_pairs[:50]]
+        return top_50
     except Exception as e:
-        print(f"Buy Error {symbol}: {e}", flush=True)
+        print(f"Error fetching top coins: {e}")
+        return []
 
-def execute_sell(symbol, reason):
+# ----------------------------------------------------
+# ৫. ক্যান্ডেলস্টিক ও ইন্ডিকেটর ডেটা এনালাইসিস
+# ----------------------------------------------------
+async def analyze_and_trade(symbol):
     try:
-        asset = symbol.replace("USDT","")
-        balance = client.get_asset_balance(asset=asset)
-        if not balance:
+        # Bollinger Bands এবং MA20 ক্যালকুলেশনের জন্য ক্যান্ডেল ডেটা
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
+        if len(ohlcv) < 26:
             return
 
-        free_qty = float(balance['free'])
-        if free_qty <= 0:
-            if symbol in open_positions:
-                del open_positions[symbol]
-            return
-
-        client.create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type=ORDER_TYPE_MARKET,
-            quantity=free_qty
-        )
-        print(f"⚡ SUCCESS: Sold {free_qty} {symbol} | Reason: {reason}", flush=True)
-        if symbol in open_positions:
-            del open_positions[symbol]
-    except Exception as e:
-        print(f"Sell Error {symbol}: {e}", flush=True)
-
-# ---------------------------------------------------------
-# HANDLE MESSAGE & EVALUATE SIGNALS
-# ---------------------------------------------------------
-def handle_combined_message(ws, msg):
-    try:
-        data = json.loads(msg)
-        if 'data' not in data:
-            return
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        kline = data['data']['k']
-        symbol = kline['s']
-        
-        if kline['x']:  # ক্যান্ডেল ক্লোজ হয়েছে
-            close_price = float(kline['c'])
-            open_price = float(kline['o'])
-            high_price = float(kline['h'])
-            low_price = float(kline['l'])
-            volume = float(kline['v'])
+        # Bollinger Bands নির্ণয়
+        bb = ta.bbands(df['close'], length=BOLLINGER_PERIOD, std=BOLLINGER_STD)
+        df['lower_band'] = bb[f'BBL_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0']
+        df['upper_band'] = bb[f'BBU_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0']
+        df['ma20'] = bb[f'BBM_{BOLLINGER_PERIOD}_{BOLLINGER_STD}.0'] # MA20 হলো মিডল ব্যান্ড
 
-            new_row = {
-                'open': open_price,
-                'high': high_price,
-                'low': low_price,
-                'close': close_price,
-                'volume': volume
-            }
+        last_row = df.iloc[-1]
+        five_candles_ago = df.iloc[-6]
 
-            if symbol not in symbol_data:
-                symbol_data[symbol] = pd.DataFrame(columns=['open','high','low','close','volume'])
+        current_close = last_row['close']
+        current_lower_band = last_row['lower_band']
+        current_upper_band = last_row['upper_band']
+        current_ma20 = last_row['ma20']
+        prev_ma20 = five_candles_ago['ma20']
+
+        # ------------------------------------------------
+        # সেল লজিক (যদি পজিশন খোলা থাকে)
+        # ------------------------------------------------
+        if symbol in positions:
+            entry_price = positions[symbol]['entry_price']
+            amount = positions[symbol]['amount']
             
-            # ক্যান্ডেল আপডেট (সর্বশেষ ৫০টি ক্যান্ডেল জমিয়ে রাখা)
-            df = pd.concat([symbol_data[symbol], pd.DataFrame([new_row])], ignore_index=True).tail(50)
-            symbol_data[symbol] = df
+            # ৩% প্রফিট/লস অথবা Upper Band ক্রস
+            stop_loss_price = entry_price * (1 - STOP_LOSS_PCT)
+            
+            if current_close > current_upper_band or current_close <= stop_loss_price:
+                reason = "Upper Band Hit" if current_close > current_upper_band else "Stop Loss Hit (3%)"
+                print(f"[{symbol}] Selling 100%. Reason: {reason}")
+                
+                # Market Order এ সম্পূর্ণ বিক্রি
+                order = await exchange.create_market_sell_order(symbol, amount)
+                print(f"Sell Order Executed: {order['id']}")
+                del positions[symbol]
 
-            print(f"--> Candle Closed & Scanned: {symbol} | Price: {close_price}", flush=True)
+        # ------------------------------------------------
+        # বায় লজিক (যদি আগে কেনা না থাকে)
+        # ------------------------------------------------
+        else:
+            condition_1 = current_close < current_lower_band
+            condition_2 = current_ma20 > prev_ma20
 
-            # ইন্ডিকেটর হিসেব
-            df_calc = calculate_indicators(df)
-            if len(df_calc) >= 30:
-                closed_candle = df_calc.iloc[-1]
-                rsi13 = closed_candle['rsi13']
-                bb_upper = closed_candle['bb_upper']
-                bb_lower = closed_candle['bb_lower']
-
-                # BUY SIGNAL CHECK (যদি আগে কেনা না থাকে)
-                if symbol not in open_positions:
-                    if close_price < bb_lower and rsi13 < 30:
-                        print(f"🚀 [BUY SIGNAL] {symbol} | Price: {close_price} | RSI13: {rsi13:.2f}", flush=True)
-                        execute_buy(symbol, TRADE_AMOUNT_USDT)
-
-                # SELL SIGNAL CHECK (যদি কেনা থাকে)
-                else:
-                    if close_price > bb_upper and rsi13 > 70:
-                        print(f"💰 [SELL SIGNAL] {symbol} | Price: {close_price} | RSI13: {rsi13:.2f}", flush=True)
-                        execute_sell(symbol, "RSI13 > 70 & BB Upper Break")
+            if condition_1 and condition_2:
+                print(f"[{symbol}] BUY Signal Detected!")
+                
+                # Market Order এ কেনা
+                order = await exchange.create_market_buy_order_requires_price(symbol, TRADE_AMOUNT_USDT)
+                # ক্রয়কৃত পরিমাণ বের করা
+                filled_amount = order['filled']
+                executed_price = order['price'] or current_close
+                
+                positions[symbol] = {
+                    'entry_price': executed_price,
+                    'amount': filled_amount
+                }
+                print(f"Bought {symbol} at {executed_price} USDT, Amount: {filled_amount}")
 
     except Exception as e:
-        print(f"Message Handling Error: {e}", flush=True)
+        # এপিআই লিমিটিং এড়াতে ছোটখাটো এরর প্রিন্ট করে ওভারলুক করবে
+        pass
 
-# ---------------------------------------------------------
-# PERIODIC STOP LOSS CHECKER
-# ---------------------------------------------------------
-def periodic_stop_loss_checker(interval=30):
+# ----------------------------------------------------
+# ৬. প্রধান লুপ (Main Loop)
+# ----------------------------------------------------
+async def main_loop():
     while True:
         try:
-            for symbol, pos in list(open_positions.items()):
-                buy_price = pos['buy_price']
-                ticker = client.get_symbol_ticker(symbol=symbol)
-                current_price = float(ticker['price'])
+            print("Fetching top 50 altcoins...")
+            top_50_symbols = await get_top_50_altcoins()
+            print(f"Scanning {len(top_50_symbols)} coins...")
 
-                # Stop Loss (-3%)
-                if current_price <= buy_price * 0.97:
-                    print(f"🛑 [STOP LOSS] {symbol} | Current: {current_price} | Buy: {buy_price}", flush=True)
-                    execute_sell(symbol, "Price dropped 3% below buy price")
+            for symbol in top_50_symbols:
+                await analyze_and_trade(symbol)
+                # IP Ban এড়াতে প্রতিটি রিকোয়েস্টের মাঝে হালকা বিরতি
+                await asyncio.sleep(0.2) 
+
+            # প্রতি ৫ মিনিটের ক্যান্ডেল ক্লোজের কাছাকাছি সময়ে আবার চেক করবে
+            print("Scan completed. Waiting for next cycle...")
+            await asyncio.sleep(60) 
 
         except Exception as e:
-            print(f"Stop Loss Checker Error: {e}", flush=True)
+            print(f"Error in main loop: {e}")
+            await asyncio.sleep(10)
 
-        time.sleep(interval)
-
-# ---------------------------------------------------------
-# START SYSTEM (Combined Websocket Stream)
-# ---------------------------------------------------------
-def start_websocket_system():
-    pairs = get_top_120_usdt_pairs()
-    preload_historical_candles(pairs)
+if __name__ == "__main__":
+    # Flask সার্ভার ব্যাকগ্রাউন্ডে চালু করা
+    threading.Thread(target=run_flask, daemon=True).start()
     
-    # Binance Combined Stream (১টি সকেটে ১২0টি টোকেন)
-    streams = "/".join([f"{s.lower()}@kline_5m" for s in pairs])
-    combined_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
-    
-    ws = websocket.WebSocketApp(
-        combined_url,
-        on_message=handle_combined_message
-    )
-    ws.run_forever()
-
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
-if __name__ == '__main__':
-    try:
-        t_main = threading.Thread(target=start_websocket_system)
-        t_main.daemon = True
-        t_main.start()
-
-        t_checker = threading.Thread(target=periodic_stop_loss_checker, args=(30,))
-        t_checker.daemon = True
-        t_checker.start()
-
-        port = int(os.environ.get("PORT", 10000))
-        app.run(host='0.0.0.0', port=port)
-    except Exception as e:
-        print(f"Main Error: {e}", flush=True)
+    # Asyncio বট চালু করা
+    asyncio.run(main_loop())
