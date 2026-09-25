@@ -1,5 +1,4 @@
 Flask
-gunicorn
 ccxt
 pandas
 pandas_ta
