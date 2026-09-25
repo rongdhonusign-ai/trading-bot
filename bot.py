@@ -12,9 +12,13 @@ app = Flask(__name__)
 def home():
     return "Binance Trading Bot is Running!"
 
+# ----------------------------------------------------
+# ১. Flask Server (Thread-Safe)
+# ----------------------------------------------------
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", 10000))
+    # use_reloader=False না দিলে থ্রেড আটকে যেতে পারে
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 API_KEY = os.environ.get('BINANCE_API_KEY', '')
 SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
@@ -66,10 +70,8 @@ async def analyze_and_trade(symbol):
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Bollinger Bands ক্যালকুলেশন
         bb = ta.bbands(df['close'], length=BOLLINGER_PERIOD, std=BOLLINGER_STD)
         
-        # dynamic column name বের করা
         df['lower_band'] = bb.iloc[:, 0]
         df['ma20'] = bb.iloc[:, 1]
         df['upper_band'] = bb.iloc[:, 2]
@@ -103,7 +105,6 @@ async def analyze_and_trade(symbol):
             if condition_1 and condition_2:
                 print(f"[{symbol}] BUY Signal Detected!")
                 
-                # Binance Spot Market-এ নির্দিষ্ট পরিমাণ USDT খরচ করে কেনার নিয়ম:
                 order = await exchange.create_market_buy_order(
                     symbol, 
                     amount=None, 
@@ -140,11 +141,18 @@ async def main_loop():
             print(f"Error in main loop: {e}")
             await asyncio.sleep(10)
 
+# ----------------------------------------------------
+# ২. মেইন এক্সিকিউশন
+# ----------------------------------------------------
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Flask ব্যাকগ্রাউন্ড থ্রেডে চালু করা
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    loop = asyncio.get_event_loop()
+    # মূল থ্রেডে Asyncio লুপ চালু করা
     try:
-        loop.run_until_complete(main_loop())
+        asyncio.run(main_loop())
+    except (KeyboardInterrupt, SystemExit):
+        pass
     finally:
-        loop.run_until_complete(exchange.close())
+        asyncio.run(exchange.close())
