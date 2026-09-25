@@ -10,15 +10,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance Trading Bot is Running!"
-
-# ----------------------------------------------------
-# ১. Flask Server (Thread-Safe)
-# ----------------------------------------------------
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    # use_reloader=False না দিলে থ্রেড আটকে যেতে পারে
-    app.run(host='0.0.0.0', port=port, use_reloader=False)
+    return "Binance Trading Bot is Running Live!"
 
 API_KEY = os.environ.get('BINANCE_API_KEY', '')
 SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
@@ -59,7 +51,7 @@ async def get_top_50_altcoins():
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         return [item[0] for item in usdt_pairs[:50]]
     except Exception as e:
-        print(f"Error fetching top coins: {e}")
+        print(f"Error fetching top coins: {e}", flush=True)
         return []
 
 async def analyze_and_trade(symbol):
@@ -92,10 +84,10 @@ async def analyze_and_trade(symbol):
             
             if current_close > current_upper_band or current_close <= stop_loss_price:
                 reason = "Upper Band Hit" if current_close > current_upper_band else "Stop Loss Hit (3%)"
-                print(f"[{symbol}] Selling. Reason: {reason}")
+                print(f"[{symbol}] Selling. Reason: {reason}", flush=True)
                 
                 order = await exchange.create_market_sell_order(symbol, amount)
-                print(f"Sell Order Executed: {order['id']}")
+                print(f"Sell Order Executed: {order['id']}", flush=True)
                 del positions[symbol]
 
         else:
@@ -103,7 +95,7 @@ async def analyze_and_trade(symbol):
             condition_2 = current_ma20 > prev_ma20
 
             if condition_1 and condition_2:
-                print(f"[{symbol}] BUY Signal Detected!")
+                print(f"[{symbol}] BUY Signal Detected!", flush=True)
                 
                 order = await exchange.create_market_buy_order(
                     symbol, 
@@ -118,41 +110,38 @@ async def analyze_and_trade(symbol):
                     'entry_price': executed_price,
                     'amount': filled_amount
                 }
-                print(f"Bought {symbol} at {executed_price} USDT, Amount: {filled_amount}")
+                print(f"Bought {symbol} at {executed_price} USDT, Amount: {filled_amount}", flush=True)
 
     except Exception as e:
-        print(f"Error processing {symbol}: {e}")
+        print(f"Error processing {symbol}: {e}", flush=True)
 
 async def main_loop():
     while True:
         try:
-            print("Fetching top 50 altcoins...")
+            print("Fetching top 50 altcoins...", flush=True)
             top_50_symbols = await get_top_50_altcoins()
-            print(f"Scanning {len(top_50_symbols)} coins...")
+            print(f"Scanning {len(top_50_symbols)} coins...", flush=True)
 
             for symbol in top_50_symbols:
                 await analyze_and_trade(symbol)
                 await asyncio.sleep(0.2) 
 
-            print("Scan completed. Waiting for next cycle...")
+            print("Scan completed. Waiting for next cycle...", flush=True)
             await asyncio.sleep(60) 
 
         except Exception as e:
-            print(f"Error in main loop: {e}")
+            print(f"Error in main loop: {e}", flush=True)
             await asyncio.sleep(10)
 
-# ----------------------------------------------------
-# ২. মেইন এক্সিকিউশন
-# ----------------------------------------------------
+def start_async_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main_loop())
+
+# Gunicorn সার্ভার যখনই bot.py লোড করবে, সাথে সাথে ট্রেডিং বট ব্যাকগ্রাউন্ডে চালু হয়ে যাবে
+bot_thread = threading.Thread(target=start_async_loop, daemon=True)
+bot_thread.start()
+
 if __name__ == "__main__":
-    # Flask ব্যাকগ্রাউন্ড থ্রেডে চালু করা
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # মূল থ্রেডে Asyncio লুপ চালু করা
-    try:
-        asyncio.run(main_loop())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        asyncio.run(exchange.close())
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
