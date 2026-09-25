@@ -16,8 +16,8 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-API_KEY = os.environ.get('BINANCE_API_KEY', 'yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M')
-SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV')
+API_KEY = os.environ.get('BINANCE_API_KEY', '')
+SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
 
 TRADE_AMOUNT_USDT = 15.0
 TIME_FRAME = '5m'
