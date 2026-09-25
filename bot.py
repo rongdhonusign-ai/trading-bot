@@ -7,18 +7,12 @@ import ccxt.async_support as ccxt
 import pandas as pd
 import pandas_ta as ta
 
-# ----------------------------------------------------
-# ১. Flask Server
-# ----------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance Bot with Proxy Bypass is Active!"
+    return "Binance Bot is Active!"
 
-# ----------------------------------------------------
-# ২. কনফিগারেশন
-# ----------------------------------------------------
 API_KEY = os.environ.get('BINANCE_API_KEY', '')
 SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
 
@@ -27,8 +21,6 @@ TIME_FRAME = '5m'
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2
 STOP_LOSS_PCT = 0.03
-
-# ২০ মিনিট (১২০০ সেকেন্ড) পর পর টপ ৫০ রিফ্রেশ হবে
 TOP_COINS_REFRESH_INTERVAL = 1200 
 
 positions = {}
@@ -38,9 +30,6 @@ STABLECOINS = {
     'WBTC', 'WEAX', 'AEUR', 'PAX', 'USDP', 'SUSD'
 }
 
-# ----------------------------------------------------
-# ৩. CCXT সেটআপ (নতুন Working Proxy সহ)
-# ----------------------------------------------------
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
@@ -55,9 +44,6 @@ exchange = ccxt.binance({
     }
 })
 
-# ----------------------------------------------------
-# ৪. সেফ টপ ৫০ ফেচার
-# ----------------------------------------------------
 async def get_top_50_altcoins_safely():
     try:
         tickers = await exchange.publicGetTicker24hr()
@@ -76,41 +62,37 @@ async def get_top_50_altcoins_safely():
         return [item[0] for item in usdt_pairs[:50]]
 
     except Exception as e:
-        print(f"Error fetching top coins via Proxy: {e}", flush=True)
+        print(f"Error fetching top coins: {e}", flush=True)
         return []
 
-# ----------------------------------------------------
-# ৫. ফাস্ট সেল মনিটর (Upper Band / SL Check)
-# ----------------------------------------------------
-async def monitor_open_positions():
-    if not positions:
-        return
+# স্বাধীন পজিশন মনিটর লুপ
+async def fast_position_monitor_loop():
+    while True:
+        if positions:
+            for symbol in list(positions.keys()):
+                try:
+                    ticker = await exchange.fetch_ticker(symbol)
+                    current_price = ticker['last']
+                    
+                    entry_price = positions[symbol]['entry_price']
+                    upper_band = positions[symbol]['upper_band']
+                    amount = positions[symbol]['amount']
+                    stop_loss_price = entry_price * (1 - STOP_LOSS_PCT)
 
-    for symbol in list(positions.keys()):
-        try:
-            ticker = await exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
-            
-            entry_price = positions[symbol]['entry_price']
-            upper_band = positions[symbol]['upper_band']
-            amount = positions[symbol]['amount']
-            stop_loss_price = entry_price * (1 - STOP_LOSS_PCT)
+                    if current_price >= upper_band or current_price <= stop_loss_price:
+                        reason = "Upper Band Hit" if current_price >= upper_band else "Stop Loss Hit (3%)"
+                        print(f"⚡ [FAST SELL TRIGGERED] [{symbol}] Reason: {reason} at Price: {current_price}", flush=True)
+                        
+                        order = await exchange.create_market_sell_order(symbol, amount)
+                        print(f"✅ Executed Market Sell Order ID: {order['id']}", flush=True)
+                        
+                        del positions[symbol]
 
-            if current_price >= upper_band or current_price <= stop_loss_price:
-                reason = "Upper Band Hit" if current_price >= upper_band else "Stop Loss Hit (3%)"
-                print(f"⚡ [FAST SELL TRIGGERED] [{symbol}] Reason: {reason} at Price: {current_price}", flush=True)
-                
-                order = await exchange.create_market_sell_order(symbol, amount)
-                print(f"✅ Executed Market Sell Order ID: {order['id']}", flush=True)
-                
-                del positions[symbol]
+                except Exception as e:
+                    print(f"Error in monitor for {symbol}: {e}", flush=True)
+        
+        await asyncio.sleep(5) # প্রতি ৫ সেকেন্ড পর পর ওপেন পজিশন চেক করবে
 
-        except Exception as e:
-            print(f"Error in fast sell monitor for {symbol}: {e}", flush=True)
-
-# ----------------------------------------------------
-# ৬. বাই সিগন্যাল অ্যানালাইসিস
-# ----------------------------------------------------
 async def analyze_and_buy(symbol):
     try:
         if symbol in positions:
@@ -136,10 +118,7 @@ async def analyze_and_buy(symbol):
         current_ma20 = last_row['ma20']
         prev_ma20 = five_candles_ago['ma20']
 
-        condition_1 = current_close < current_lower_band
-        condition_2 = current_ma20 > prev_ma20
-
-        if condition_1 and condition_2:
+        if current_close < current_lower_band and current_ma20 > prev_ma20:
             print(f"🎯 [BUY SIGNAL DETECTED] [{symbol}] Price: {current_close}", flush=True)
             
             order = await exchange.create_market_buy_order(
@@ -161,10 +140,10 @@ async def analyze_and_buy(symbol):
     except Exception as e:
         print(f"Error evaluating {symbol}: {e}", flush=True)
 
-# ----------------------------------------------------
-# ৭. প্রধান স্ক্যান লুপ (২০ মিনিটে ১ বার লিস্ট আপডেট)
-# ----------------------------------------------------
 async def main_loop():
+    # মনিটর লুপটি ব্যাকগ্রাউন্ডে আলাদাভাবে শুরু করা হলো
+    asyncio.create_task(fast_position_monitor_loop())
+    
     current_top_50 = []
     last_fetch_time = 0
 
@@ -172,9 +151,8 @@ async def main_loop():
         try:
             current_time = time.time()
 
-            # ২০ মিনিট পর পর টপ ৫০ রিফ্রেশ
             if current_time - last_fetch_time >= TOP_COINS_REFRESH_INTERVAL or not current_top_50:
-                print("🔄 Fetching Top 50 Altcoins via Proxy...", flush=True)
+                print("🔄 Fetching Top 50 Altcoins...", flush=True)
                 new_list = await get_top_50_altcoins_safely()
                 
                 if new_list:
@@ -182,29 +160,23 @@ async def main_loop():
                     last_fetch_time = current_time
                     print(f"✅ Top 50 list updated! ({len(current_top_50)} coins)", flush=True)
                 else:
-                    print("⚠️ Proxy Error / Retry in 2 minutes...", flush=True)
+                    print("⚠️ Proxy / Network Error! Retrying in 2 minutes...", flush=True)
                     await asyncio.sleep(120)
                     continue
 
             if current_top_50:
-                print(f"🔍 Scanning current top {len(current_top_50)} coins...", flush=True)
+                print(f"🔍 Scanning top coins...", flush=True)
                 for symbol in current_top_50:
                     await analyze_and_buy(symbol)
-                    await monitor_open_positions()
-                    await asyncio.sleep(1.5) # ১.৫ সেকেন্ড বিরতি
+                    await asyncio.sleep(1)
 
-                print("Cycle finished. Waiting 90 seconds...", flush=True)
-                for _ in range(9):
-                    await monitor_open_positions()
-                    await asyncio.sleep(10)
+                print("Cycle finished. Waiting 60 seconds...", flush=True)
+                await asyncio.sleep(60)
 
         except Exception as e:
             print(f"Error in main loop: {e}", flush=True)
             await asyncio.sleep(30)
 
-# ----------------------------------------------------
-# ৮. ব্যাকগ্রাউন্ড থ্রেড চালু করা
-# ----------------------------------------------------
 def start_async_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
