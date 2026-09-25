@@ -1,6 +1,4 @@
+flask
 ccxt
 pandas
-pandas-ta
-flask
-gunicorn
-asyncio
+git+https://github.com/twopirllc/pandas-ta.git@development
