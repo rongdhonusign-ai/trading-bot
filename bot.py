@@ -7,7 +7,7 @@ import pandas as pd
 import pandas_ta as ta
 
 # ----------------------------------------------------
-# ১. Flask Server
+# ১. Flask Server (Render Health Check)
 # ----------------------------------------------------
 app = Flask(__name__)
 
@@ -29,7 +29,7 @@ STOP_LOSS_PCT = 0.03
 
 positions = {}
 
-# REST API এড়াতে টপ ৫০টি কয়েনের রেডি তালিকা (ব্যান-মুক্ত)
+# ৫০টি পপুলার USDT ট্রেডিং পেয়ার (REST API ছাড়া সরাসরি ব্যবহৃত)
 TOP_50_COINS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
     'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'SHIB/USDT', 'DOT/USDT', 
@@ -142,18 +142,18 @@ async def watch_and_analyze_symbol(symbol):
             await asyncio.sleep(5)
 
 # ----------------------------------------------------
-# ৫. প্রধান লুপ (WebSocket Manager)
+# ৫. প্রধান লুপ (Rate-Limit Safe WebSocket Connection)
 # ----------------------------------------------------
 async def main_loop():
     print(f"🚀 Starting WebSocket Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
     
-    # ৫০টি কয়েনের জন্য একসাথে কানেকশন চালু হবে (Rate Limit ছাড়া)
+    # IP Ban এড়াতে প্রতিটি কয়েন কানেক্ট করার মাঝে ২.৫ সেকেন্ডের ডিল দেওয়া হয়েছে
     for symbol in TOP_50_COINS:
         asyncio.create_task(watch_and_analyze_symbol(symbol))
-        await asyncio.sleep(0.2) # কানেকশন স্মুথ রাখার জন্য সামান্য বিরতি
+        await asyncio.sleep(2.5)
 
     while True:
-        await asyncio.sleep(3600) # ব্যাকগ্রাউন্ড লুপ সচল রাখার জন্য
+        await asyncio.sleep(3600)
 
 # ----------------------------------------------------
 # ৬. ব্যাকগ্রাউন্ড থ্রেড ও অ্যাপ স্টার্টআপ
