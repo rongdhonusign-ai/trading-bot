@@ -127,7 +127,7 @@ async def analyze_and_trade(symbol):
             if condition_1 and condition_2:
                 print(f"[{symbol}] BUY Signal Detected!")
                 
-                # সঠিক পদ্ধতিতে USDT অ্যামাউন্ট দিয়ে মার্কেট অর্ডার প্লেস করা
+                # সঠিক পদ্ধতিতে USDT অ্যামাউন্ট দিয়ে মার্কেট অর্ডার দেওয়া
                 order = await exchange.create_order(
                     symbol, 
                     'market', 
@@ -157,7 +157,7 @@ async def analyze_and_trade(symbol):
 # ----------------------------------------------------
 async def main_loop():
     print("Loading markets...")
-    await exchange.load_markets() # গুরুত্বপূর্ণ: বারবার রিকোয়েস্ট এড়াতে মার্কেট ক্যাশ করে নেওয়া
+    await exchange.load_markets() # এপিআই রিকোয়েস্টের সংখ্যা কমাতে মার্কেট ক্যাশ করা
     
     while True:
         try:
@@ -167,10 +167,10 @@ async def main_loop():
 
             for symbol in top_50_symbols:
                 await analyze_and_trade(symbol)
-                # প্রতিটি রিকোয়েস্টের মাঝে বিরতি ০.৫ সেকেন্ড করা হয়েছে (সেফটি বাড়াতে)
-                await asyncio.sleep(0.5) 
+                # বিরতি ০.৫ সেকেন্ড থেকে বাড়িয়ে ১ সেকেন্ড করা হয়েছে (যাতে IP-এর ওপর চাপ না পড়ে)
+                await asyncio.sleep(1.0) 
 
-            # টাইমফ্রেম ৫ মিনিট হওয়ায় লুপের বিরতি বাড়িয়ে ৩১০ সেকেন্ড (৫ মিনিট ১০ সেকেন্ড) করা হলো
+            # টাইমফ্রেম ৫ মিনিট হওয়ায় সম্পূর্ণ লুপের বিরতি ৫ মিনিট ১০ সেকেন্ড রাখা হয়েছে
             print("Scan completed. Waiting for next 5m cycle...")
             await asyncio.sleep(310) 
 
