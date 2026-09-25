@@ -39,15 +39,15 @@ STABLECOINS = {
 }
 
 # ----------------------------------------------------
-# ৩. CCXT সেটআপ (Proxy Bypass সহ)
+# ৩. CCXT সেটআপ (নতুন Working Proxy সহ)
 # ----------------------------------------------------
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
     'proxies': {
-        'http': 'http://185.199.229.156:7492',   # Working Public Proxy
-        'https': 'http://185.199.229.156:7492',
+        'http': 'http://43.134.68.173:3128',
+        'https': 'http://43.134.68.173:3128',
     },
     'options': {
         'defaultType': 'spot',
@@ -80,7 +80,7 @@ async def get_top_50_altcoins_safely():
         return []
 
 # ----------------------------------------------------
-# ৫. ফাস্ট সেল মনিটর ( Upper Band / SL Check)
+# ৫. ফাস্ট সেল মনিটর (Upper Band / SL Check)
 # ----------------------------------------------------
 async def monitor_open_positions():
     if not positions:
@@ -172,7 +172,7 @@ async def main_loop():
         try:
             current_time = time.time()
 
-            # ২০ মিনিট (১২০০ সেকেন্ড) পর পর নতুন লিস্ট আনবে
+            # ২০ মিনিট পর পর টপ ৫০ রিফ্রেশ
             if current_time - last_fetch_time >= TOP_COINS_REFRESH_INTERVAL or not current_top_50:
                 print("🔄 Fetching Top 50 Altcoins via Proxy...", flush=True)
                 new_list = await get_top_50_altcoins_safely()
