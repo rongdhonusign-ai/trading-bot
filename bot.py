@@ -8,17 +8,23 @@ from binance.client import Client
 from binance.enums import *
 import websocket
 
-API_KEY = os.environ.get("yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
-API_SECRET = os.environ.get("3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
+# ---------------------------------------------------------
+# BINANCE API KEYS (Environment Variables Auto-Detect)
+# ---------------------------------------------------------
+API_KEY = os.environ.get("BINANCE_API_KEY") or os.environ.get("API_KEY")
+API_SECRET = os.environ.get("BINANCE_API_SECRET") or os.environ.get("BINANCE_SECRET_KEY") or os.environ.get("API_SECRET")
 
 client = Client(API_KEY, API_SECRET)
 
-TRADE_AMOUNT_USDT = 30.0
+TRADE_AMOUNT_USDT = 30.0  # প্রতি ট্রেডে $30
 TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
 open_positions = {}
-symbol_data = {}  # ক্যান্ডেল ডাটা ফ্রেম জমানোর জন্য
+symbol_data = {}  # ক্যান্ডেল ডাটা ফ্রেম জমা রাখার জন্য
 
+# ---------------------------------------------------------
+# FLASK SERVER
+# ---------------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
@@ -47,7 +53,7 @@ def calculate_indicators(df):
     return df
 
 # ---------------------------------------------------------
-# GET TOP 120 USDT PAIRS & INITIAL HISTORICAL DATA
+# GET TOP 120 USDT PAIRS & PRELOAD HISTORICAL DATA
 # ---------------------------------------------------------
 def get_top_120_usdt_pairs():
     exchange_info = client.get_exchange_info()
@@ -61,7 +67,7 @@ def get_top_120_usdt_pairs():
     return usdt_pairs_sorted[:120]
 
 def preload_historical_candles(symbols):
-    """বট চালুর পরপরই ৩০টি অতীত ক্যান্ডেল লোড করে নেবে যাতে BB কাজ করে"""
+    """বট চালুর পরপরই ৩০টি অতীত ক্যান্ডেল লোড করে নেবে যাতে BB ও RSI সঙ্গে সঙ্গে কাজ করে"""
     print("⏳ Preloading historical candles for indicators...", flush=True)
     for sym in symbols:
         try:
@@ -85,7 +91,7 @@ def preload_historical_candles(symbols):
 # ---------------------------------------------------------
 def execute_buy(symbol, amount):
     if symbol in open_positions:
-        return # আগে থেকেই কেনা থাকলে দ্বিতীয়বার কিনবে না
+        return # আগে থেকে কেনা থাকলে দ্বিতীয়বার কিনবে না
         
     try:
         order = client.create_order(
@@ -162,13 +168,13 @@ def handle_combined_message(ws, msg):
             if symbol not in symbol_data:
                 symbol_data[symbol] = pd.DataFrame(columns=['open','high','low','close','volume'])
             
-            # ক্যান্ডেল আপডেট
+            # ক্যান্ডেল আপডেট (সর্বশেষ ৫০টি ক্যান্ডেল জমিয়ে রাখা)
             df = pd.concat([symbol_data[symbol], pd.DataFrame([new_row])], ignore_index=True).tail(50)
             symbol_data[symbol] = df
 
             print(f"--> Candle Closed & Scanned: {symbol} | Price: {close_price}", flush=True)
 
-            # ইন্ডিকেটর হিসাব
+            # ইন্ডিকেটর হিসেব
             df_calc = calculate_indicators(df)
             if len(df_calc) >= 30:
                 closed_candle = df_calc.iloc[-1]
@@ -176,7 +182,7 @@ def handle_combined_message(ws, msg):
                 bb_upper = closed_candle['bb_upper']
                 bb_lower = closed_candle['bb_lower']
 
-                # BUY SIGNAL CHECK (যদি পজিশন না থাকে)
+                # BUY SIGNAL CHECK (যদি আগে কেনা না থাকে)
                 if symbol not in open_positions:
                     if close_price < bb_lower and rsi13 < 30:
                         print(f"🚀 [BUY SIGNAL] {symbol} | Price: {close_price} | RSI13: {rsi13:.2f}", flush=True)
@@ -219,7 +225,7 @@ def start_websocket_system():
     pairs = get_top_120_usdt_pairs()
     preload_historical_candles(pairs)
     
-    # 120টি কানেকশনের বদলে Binance Combined Stream
+    # Binance Combined Stream (১টি সকেটে ১২0টি টোকেন)
     streams = "/".join([f"{s.lower()}@kline_5m" for s in pairs])
     combined_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     
