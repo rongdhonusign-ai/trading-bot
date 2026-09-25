@@ -2,7 +2,7 @@ import os
 import asyncio
 import threading
 from flask import Flask
-import ccxt.pro as ccxt  # WebSocket-এর জন্য ccxt.pro ব্যবহার করা হয়েছে
+import ccxt.pro as ccxt  # WebSocket-এর জন্য ccxt.pro
 import pandas as pd
 import pandas_ta as ta
 
@@ -47,7 +47,7 @@ exchange = ccxt.binance({
 })
 
 # ----------------------------------------------------
-# ৩. সেফ টপ ৫০ ফেচার (REST API)
+# ৩. সেফ টপ ৫০ ফেচার (API)
 # ----------------------------------------------------
 async def get_top_50_altcoins_safely():
     try:
@@ -192,7 +192,7 @@ async def main_loop():
             await asyncio.sleep(10)
 
 # ----------------------------------------------------
-# ৭. ব্যাকগ্রাউন্ড থ্রেড
+# ৭. ব্যাকগ্রাউন্ড থ্রেড ও অ্যাপ স্টার্টআপ
 # ----------------------------------------------------
 def start_async_loop():
     loop = asyncio.new_event_loop()
@@ -202,6 +202,7 @@ def start_async_loop():
     finally:
         loop.run_until_complete(exchange.close())
 
+# Flask চালু হওয়ার পূর্বে থ্রেড স্টার্ট
 bot_thread = threading.Thread(target=start_async_loop, daemon=True)
 bot_thread.start()
 
