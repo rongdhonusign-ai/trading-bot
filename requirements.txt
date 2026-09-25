@@ -1,5 +1,6 @@
-Flask
-python-binance
+ccxt
 pandas
-websocket-client
-rel
+pandas-ta
+flask
+gunicorn
+asyncio
