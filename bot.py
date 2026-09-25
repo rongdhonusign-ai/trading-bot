@@ -9,7 +9,7 @@ from binance.enums import *
 import websocket
 
 API_KEY = os.environ.get("yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
-API_SECRET = os.environ.get("yRwdwQAR1S9G8DLVeQp39lW99BAGEF4XDG6hoImJkFTol2RFvWmTvksMKy5Bav0M")
+API_SECRET = os.environ.get("3qsGUF6nPgfluSLPe8VXo0DE2gtR1jQIud9URVC5NHezEFp9YQV1lLqG1WncAltV")
 
 client = Client(API_KEY, API_SECRET)
 
