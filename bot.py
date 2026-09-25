@@ -79,8 +79,11 @@ async def watch_position_symbol(symbol):
                 break
 
         except Exception as e:
-            print(f"WebSocket Ticker Error for {symbol}: {e}", flush=True)
-            await asyncio.sleep(2)
+            if "1003" in str(e) or "418" in str(e):
+                await asyncio.sleep(30)
+            else:
+                print(f"WebSocket Ticker Error for {symbol}: {e}", flush=True)
+                await asyncio.sleep(2)
 
 # ----------------------------------------------------
 # ৪. WebSocket দিয়ে কয়েন অ্যানালাইসিস ও বাই সিগন্যাল
@@ -93,6 +96,7 @@ async def watch_and_analyze_symbol(symbol):
                 await asyncio.sleep(5)
                 continue
 
+            # WebSocket Stream for OHLCV
             ohlcv = await exchange.watch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
             if len(ohlcv) < 26:
                 continue
@@ -138,16 +142,21 @@ async def watch_and_analyze_symbol(symbol):
                 asyncio.create_task(watch_position_symbol(symbol))
 
         except Exception as e:
-            print(f"WebSocket Analysis Error for {symbol}: {e}", flush=True)
-            await asyncio.sleep(5)
+            # IP Ban বা Rate Limit ধরা পড়লে ৩০ সেকেন্ডের সেফটি পজ
+            if "1003" in str(e) or "418" in str(e):
+                print(f"⚠️ Rate limit or Ban detected on {symbol}. Waiting 30s...", flush=True)
+                await asyncio.sleep(30)
+            else:
+                print(f"WebSocket Analysis Error for {symbol}: {e}", flush=True)
+                await asyncio.sleep(5)
 
 # ----------------------------------------------------
-# ৫. প্রধান লুপ (Rate-Limit Safe WebSocket Connection)
+# ৫. প্রধান লুপ (Safe Connection Setup)
 # ----------------------------------------------------
 async def main_loop():
     print(f"🚀 Starting WebSocket Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
     
-    # IP Ban এড়াতে প্রতিটি কয়েন কানেক্ট করার মাঝে ২.৫ সেকেন্ডের ডিল দেওয়া হয়েছে
+    # কানেকশনের মধ্যে ২.৫ সেকেন্ডের ডিল দিয়ে ধীরগতিতে চালু হবে
     for symbol in TOP_50_COINS:
         asyncio.create_task(watch_and_analyze_symbol(symbol))
         await asyncio.sleep(2.5)
