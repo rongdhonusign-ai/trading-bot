@@ -1,19 +1,20 @@
 import os
 import asyncio
 import threading
+import time
 from flask import Flask
 import ccxt.async_support as ccxt
 import pandas as pd
 import pandas_ta as ta
 
 # ----------------------------------------------------
-# ১. Flask Web Server
+# ১. Flask Server
 # ----------------------------------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance Dynamic Trading Bot is Running Live!"
+    return "Binance Bot is Active and Healthy!"
 
 # ----------------------------------------------------
 # ২. কনফিগারেশন
@@ -27,6 +28,9 @@ BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2
 STOP_LOSS_PCT = 0.03
 
+# ২০ মিনিট (১২০০ সেকেন্ড) পর পর টপ ৫০ রিফ্রেশ হবে
+TOP_COINS_REFRESH_INTERVAL = 1200 
+
 positions = {}
 
 STABLECOINS = {
@@ -35,22 +39,23 @@ STABLECOINS = {
 }
 
 # ----------------------------------------------------
-# ৩. CCXT সেটআপ
+# ৩. CCXT সেটআপ (Rate Limit Strict)
 # ----------------------------------------------------
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+    'options': {
+        'defaultType': 'spot',
+        'adjustForTimeDifference': True
+    }
 })
 
 # ----------------------------------------------------
-# ৪. সেফ অ্যান্ড ডায়নামিক টপ ৫০ অল্টকয়েন ফেচার
+# ৪. সেফ টপ ৫০ ফেচার
 # ----------------------------------------------------
 async def get_top_50_altcoins_safely():
-    """ভারী fetch_tickers না ডেকে হালকা ২৪ঘণ্টার টিঙ্কার ফেচ করবে"""
     try:
-        # fetch_ticker / 24hr ticker lightweight call
         tickers = await exchange.publicGetTicker24hr()
         usdt_pairs = []
 
@@ -63,20 +68,17 @@ async def get_top_50_altcoins_safely():
                     formatted_symbol = f"{base}/USDT"
                     usdt_pairs.append((formatted_symbol, quote_volume))
 
-        # ভলিউম অনুযায়ী সর্ট করে টপ ৫০ নির্বাচন
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-        top_50 = [item[0] for item in usdt_pairs[:50]]
-        return top_50
+        return [item[0] for item in usdt_pairs[:50]]
 
     except Exception as e:
-        print(f"Error fetching dynamic top coins: {e}", flush=True)
+        print(f"Error fetching top coins: {e}", flush=True)
         return []
 
 # ----------------------------------------------------
-# ৫. ফাস্ট অ্যান্ড সেফ সেল মনিটর
+# ৫. সেল মনিটর
 # ----------------------------------------------------
 async def monitor_open_positions():
-    """কেনা কয়েনগুলো হালকা রিকোয়েস্ট দিয়ে ইনস্ট্যান্ট চেক করবে"""
     if not positions:
         return
 
@@ -103,7 +105,7 @@ async def monitor_open_positions():
             print(f"Error in fast sell monitor for {symbol}: {e}", flush=True)
 
 # ----------------------------------------------------
-# ৬. স্ক্যান ও বাই লজিক
+# ৬. বাই লজিক
 # ----------------------------------------------------
 async def analyze_and_buy(symbol):
     try:
@@ -156,33 +158,41 @@ async def analyze_and_buy(symbol):
         print(f"Error evaluating {symbol}: {e}", flush=True)
 
 # ----------------------------------------------------
-# ৭. প্রধান লুপ (Fully Dynamic + Safe)
+# ৭. সেফ মেইন লুপ
 # ----------------------------------------------------
 async def main_loop():
+    current_top_50 = []
+    last_fetch_time = 0
+
     while True:
         try:
-            print("Fetching dynamic top 50 altcoins...", flush=True)
-            top_50_symbols = await get_top_50_altcoins_safely()
+            current_time = time.time()
 
-            if not top_50_symbols:
-                print("Failed to fetch top coins, retrying in 2 minutes...", flush=True)
-                await asyncio.sleep(120)
-                continue
+            # ২০ মিনিট পর পর টপ ৫০ রিফ্রেশ
+            if current_time - last_fetch_time >= TOP_COINS_REFRESH_INTERVAL or not current_top_50:
+                print("🔄 Updating Top 50 Altcoins list...", flush=True)
+                new_list = await get_top_50_altcoins_safely()
+                
+                if new_list:
+                    current_top_50 = new_list
+                    last_fetch_time = current_time
+                    print(f"✅ Top 50 list updated! ({len(current_top_50)} coins)", flush=True)
+                else:
+                    print("⚠️ Failed to fetch list (IP Limited/Ban). Retrying after 3 minutes...", flush=True)
+                    await asyncio.sleep(180) # Ban খেলে ৩ মিনিট চুপ থাকবে
+                    continue
 
-            print(f"Scanning {len(top_50_symbols)} coins...", flush=True)
+            if current_top_50:
+                print(f"🔍 Scanning current top {len(current_top_50)} coins...", flush=True)
+                for symbol in current_top_50:
+                    await analyze_and_buy(symbol)
+                    await monitor_open_positions()
+                    await asyncio.sleep(1.5) # প্রতি কয়েনে ১.৫ সে. ডিলে (Weight বাচাতে)
 
-            for symbol in top_50_symbols:
-                await analyze_and_buy(symbol)
-                await monitor_open_positions()
-                # IP Ban এড়াতে ১.২ সেকেন্ড বিরতি
-                await asyncio.sleep(1.2) 
-
-            print("Scan completed. Waiting 2 minutes for next cycle...", flush=True)
-            
-            # সাইকেল শেষে ২ মিনিট অপেক্ষার সময় দ্রুত সেল মনিটর
-            for _ in range(12):
-                await monitor_open_positions()
-                await asyncio.sleep(10)
+                print("Cycle finished. Waiting 90 seconds...", flush=True)
+                for _ in range(9):
+                    await monitor_open_positions()
+                    await asyncio.sleep(10)
 
         except Exception as e:
             print(f"Error in main loop: {e}", flush=True)
