@@ -19,12 +19,8 @@ client = Client(API_KEY, API_SECRET)
 TRADE_AMOUNT_USDT = 30.0   # প্রতি ট্রেডে $30
 TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
-STABLECOINS = ['USDT','USDC','BUSD','TUSD','FDUSD','DAI','EUR','GBP','WBTC','WETH','PAX']
 open_positions = {}
 symbol_data = {}
-
-scanned_count = 0
-counter_lock = threading.Lock()
 
 # ---------------------------------------------------------
 # FLASK SERVER
@@ -57,6 +53,20 @@ def calculate_indicators(df):
     return df
 
 # ---------------------------------------------------------
+# GET TOP 120 USDT PAIRS
+# ---------------------------------------------------------
+def get_top_120_usdt_pairs():
+    exchange_info = client.get_exchange_info()
+    symbols = exchange_info['symbols']
+    usdt_pairs = [s['symbol'] for s in symbols if s['quoteAsset'] == 'USDT']
+
+    tickers = client.get_ticker()
+    ticker_dict = {t['symbol']: float(t['quoteVolume']) for t in tickers}
+
+    usdt_pairs_sorted = sorted(usdt_pairs, key=lambda x: ticker_dict.get(x, 0), reverse=True)
+    return usdt_pairs_sorted[:120]
+
+# ---------------------------------------------------------
 # EXECUTION FUNCTIONS
 # ---------------------------------------------------------
 def execute_buy(symbol, amount):
@@ -79,7 +89,6 @@ def execute_buy(symbol, amount):
 
     except Exception as e:
         print(f"Buy Error {symbol}: {e}", flush=True)
-        return
 
 def execute_sell(symbol, reason):
     try:
@@ -109,6 +118,32 @@ def execute_sell(symbol, reason):
         print(f"Sell Error {symbol}: {e}", flush=True)
 
 # ---------------------------------------------------------
+# HANDLE MESSAGE (ক্যান্ডেল ক্লোজ হলে ডাটা আপডেট)
+# ---------------------------------------------------------
+def handle_message(symbol, msg):
+    data = json.loads(msg)
+    kline = data['k']
+    if kline['x']:  # ক্যান্ডেল ক্লোজ হয়েছে
+        close_price = float(kline['c'])
+        open_price = float(kline['o'])
+        high_price = float(kline['h'])
+        low_price = float(kline['l'])
+        volume = float(kline['v'])
+
+        new_row = {
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': close_price,
+            'volume': volume
+        }
+        if symbol not in symbol_data:
+            symbol_data[symbol] = pd.DataFrame(columns=['open','high','low','close','volume'])
+        symbol_data[symbol] = pd.concat([symbol_data[symbol], pd.DataFrame([new_row])], ignore_index=True)
+
+        print(f"--> Candle Closed & Scanned: {symbol} | Price: {close_price}", flush=True)
+
+# ---------------------------------------------------------
 # PERIODIC CHECKER (BUY + SELL)
 # ---------------------------------------------------------
 def periodic_sell_checker(interval=60):
@@ -133,11 +168,11 @@ def periodic_sell_checker(interval=60):
                     execute_sell(symbol, "Price dropped 3% below buy price")
                     continue
 
-                # RSI + BB Upper SELL
+                # RSI + BB Upper SELL / BUY
                 df = symbol_data.get(symbol)
                 if df is not None and not df.empty:
                     df_calc = calculate_indicators(df)
-                    closed_candle = df_calc.iloc[-1]   # সর্বশেষ ক্লোজ হওয়া ক্যান্ডেল
+                    closed_candle = df_calc.iloc[-1]
                     rsi13 = closed_candle['rsi13']
                     bb_upper = closed_candle['bb_upper']
                     bb_lower = closed_candle['bb_lower']
@@ -148,7 +183,7 @@ def periodic_sell_checker(interval=60):
                         print(f"[SELL SIGNAL] {symbol} | Close: {close_price} | RSI13: {rsi13:.2f}")
                         execute_sell(symbol, "RSI13 > 70 & BB Upper Break")
 
-                    # BUY শর্ত (ক্যান্ডেল ক্লোজ হলে)
+                    # BUY শর্ত
                     if close_price < bb_lower and rsi13 < 30:
                         print(f"[BUY SIGNAL] {symbol} | Close: {close_price} | RSI13: {rsi13:.2f}")
                         execute_buy(symbol, TRADE_AMOUNT_USDT)
@@ -159,15 +194,24 @@ def periodic_sell_checker(interval=60):
         time.sleep(interval)
 
 # ---------------------------------------------------------
-# START SYSTEM
+# START SYSTEM (১২০ টোকেনকে ৩ ভাগে ভাগ করে স্ক্যান)
 # ---------------------------------------------------------
 def start_websocket_system():
     pairs = get_top_120_usdt_pairs()
     chunk_size = 40
     chunks = [pairs[i:i+chunk_size] for i in range(0, len(pairs), chunk_size)]
-    # এখানে WebSocket চালু করার লজিক থাকবে
-    # ...
 
+    for chunk in chunks:
+        for symbol in chunk:
+            ws = websocket.WebSocketApp(
+                f"wss://stream.binance.com:9443/ws/{symbol.lower()}@kline_5m",
+                on_message=lambda ws, msg, s=symbol: handle_message(s, msg)
+            )
+            threading.Thread(target=ws.run_forever).start()
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
 if __name__ == '__main__':
     try:
         t_main = threading.Thread(target=start_websocket_system)
@@ -181,4 +225,4 @@ if __name__ == '__main__':
         port = int(os.environ.get("PORT", 10000))
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
-        print(f"Main Error: {e}", flush=True)
+        print(f"Main Error: {e}", flusBINANCE
