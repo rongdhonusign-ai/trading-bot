@@ -234,4 +234,4 @@ def start_single_socket(stream_pairs):
 def start_websocket_system():
     pairs = get_top_120_usdt_pairs()
     chunk_size = 40
-    chunks = [pairs[i:i+chunk_size] for i in range(0, len(pairs), chunkBINANCE
+    chunks = [pairs[i:i+chunk_size] for i in range(0, len(pairs), chunk_size)]
