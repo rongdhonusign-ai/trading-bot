@@ -84,7 +84,7 @@ async def watch_position_symbol(symbol):
                 await asyncio.sleep(2)
 
 # ----------------------------------------------------
-# ৪. WebSocket কয়েন অ্যানালাইসিস (Rate-limit safe WebSocket)
+# ৪. instant (Touch/Break) Real-time Buy Analysis
 # ----------------------------------------------------
 async def watch_and_analyze_symbol(symbol):
     print(f"📡 Started Watching & Analyzing: {symbol}", flush=True)
@@ -94,7 +94,7 @@ async def watch_and_analyze_symbol(symbol):
                 await asyncio.sleep(5)
                 continue
 
-            # WebSocket Stream (রেট লিমিট খাবে না)
+            # ১. ওএইচএলসিভি ডাটা থেকে কারেন্ট লোয়ার ব্যান্ড এবং MA20 লেভেল নেওয়া
             ohlcv = await exchange.watch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
             if len(ohlcv) < 26:
                 continue
@@ -109,20 +109,22 @@ async def watch_and_analyze_symbol(symbol):
             last_row = df.iloc[-1]
             five_candles_ago = df.iloc[-6]
 
-            current_close = last_row['close']
+            # ক্যান্ডেল ক্লোজের বদলে রিয়েল টাইম ক্যান্ডেলের লাইভ হাই/লো/ক্লোজ প্রসেস হচ্ছে
+            current_close_price = last_row['close'] 
             current_lower_band = last_row['lower_band']
             current_upper_band = last_row['upper_band']
             current_ma20 = last_row['ma20']
             prev_ma20 = five_candles_ago['ma20']
 
-            # স্ক্যানিং লগ (প্রতিবার টিক আপডেটে দেখাবে)
-            print(f"🔍 Scanning {symbol} | Price: {current_close} | Lower Band: {round(current_lower_band, 4)}", flush=True)
+            # স্ক্যানিং লাইভ ট্রেস লগ
+            print(f"🔍 Scanning {symbol} | Live Price: {current_close_price} | Lower Band: {round(current_lower_band, 4)}", flush=True)
 
-            condition_1 = current_close < current_lower_band
+            # শর্ত ১: ক্যান্ডেল ক্লোজ হওয়ার দরকার নেই, লাইভ প্রাইস লোয়ার ব্যান্ডের নিচে গেলেই ট্র্রিগার
+            condition_1 = current_close_price < current_lower_band
             condition_2 = current_ma20 > prev_ma20
 
             if condition_1 and condition_2:
-                print(f"🎯 [BUY SIGNAL DETECTED] [{symbol}] Price: {current_close}", flush=True)
+                print(f"🎯 [INSTANT BUY SIGNAL DETECTED] [{symbol}] Price Break: {current_close_price} < {current_lower_band}", flush=True)
                 
                 order = await exchange.create_market_buy_order(
                     symbol, 
@@ -131,7 +133,7 @@ async def watch_and_analyze_symbol(symbol):
                 )
                 
                 filled_amount = order['filled']
-                executed_price = order['price'] or current_close
+                executed_price = order['price'] or current_close_price
                 
                 positions[symbol] = {
                     'entry_price': executed_price,
@@ -151,7 +153,7 @@ async def watch_and_analyze_symbol(symbol):
                 await asyncio.sleep(5)
 
 # ----------------------------------------------------
-# ৫. প্রধান লুপ
+# ৫. প্রধান লুপ (Safe Connection Setup)
 # ----------------------------------------------------
 async def main_loop():
     print(f"🚀 Starting Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
