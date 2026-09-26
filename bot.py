@@ -42,11 +42,12 @@ TOP_50_COINS = [
     'ORDI/USDT', 'NOT/USDT', 'WLD/USDT', 'MKR/USDT', 'LDO/USDT'
 ]
 
-# REST exchange setup
+# REST exchange setup (Added timeout & safer rate limits)
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
     'enableRateLimit': True,
+    'timeout': 30000,
     'options': {
         'defaultType': 'spot',
         'adjustForTimeDifference': True
@@ -78,9 +79,10 @@ async def watch_positions():
                         
                         del positions[symbol]
 
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
                 except Exception as e:
                     print(f"Position Error for {symbol}: {e}", flush=True)
+                    await asyncio.sleep(5)
         await asyncio.sleep(5)
 
 # ----------------------------------------------------
@@ -108,7 +110,6 @@ async def analyze_symbol(symbol):
         current_ma20 = last_row['ma20']
         prev_ma20 = five_candles_ago['ma20']
 
-        # লগে MA20 এর বর্তমান ও ৫ ক্যান্ডেল আগের মানসহ বিস্তারিত প্রিন্ট
         print(f"🔍 Scanning {symbol} | Price: {current_price} | Lower: {round(current_lower_band, 4)} | MA20: {round(current_ma20, 4)} (Prev: {round(prev_ma20, 4)})", flush=True)
 
         condition_1 = current_price < current_lower_band
@@ -134,14 +135,15 @@ async def analyze_symbol(symbol):
             print(f"✅ Bought {symbol} at {executed_price} USDT", flush=True)
 
     except Exception as e:
-        if "1003" in str(e) or "418" in str(e):
-            print(f"⚠️ IP Temporarily Blocked or Rate Limit! Pausing 30s...", flush=True)
-            await asyncio.sleep(30)
+        err_msg = str(e)
+        if "1003" in err_msg or "418" in err_msg:
+            print(f"⚠️ IP Blocked by Binance. Waiting 60s for cool-down...", flush=True)
+            await asyncio.sleep(60)
         else:
             print(f"Error on {symbol}: {e}", flush=True)
 
 # ----------------------------------------------------
-# ৫. প্রধান স্ক্যানিং লুপ (Sequential Execution)
+# ৫. প্রধান স্ক্যানিং লুপ (Extra Safety Delays)
 # ----------------------------------------------------
 async def main_loop():
     print(f"🚀 Engine Started for Top {len(TOP_50_COINS)} Coins...", flush=True)
@@ -151,11 +153,11 @@ async def main_loop():
         for symbol in TOP_50_COINS:
             if symbol not in positions:
                 await analyze_symbol(symbol)
-                # প্রতিটি রিকোয়েস্টের মাঝে ২ সেকেন্ড গ্যাপ রাখা হয়েছে যাতে IP Block না খায়
-                await asyncio.sleep(2) 
+                # ৩ সেকেন্ড গ্যাপ রাখা হলো যাতে বাইন্যান্স সার্ভার ওভারলোড না ধরে
+                await asyncio.sleep(3) 
         
-        # ৫০টি কয়েন ১ রাউন্ড স্ক্যান শেষে ১০ সেকেন্ড বিরতি
-        await asyncio.sleep(10)
+        # ৫০টি কয়েন ১ রাউন্ড স্ক্যান শেষে ১৫ সেকেন্ড বিরতি
+        await asyncio.sleep(15)
 
 # ----------------------------------------------------
 # ৬. ব্যাকগ্রাউন্ড থ্রেড ও অ্যাপ স্টার্টআপ
