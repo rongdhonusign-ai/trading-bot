@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance WebSocket Bot is Active & Running!"
+    return "Binance Bot is Active & Running!"
 
 # ----------------------------------------------------
 # ২. কনফিগারেশন
@@ -42,6 +42,7 @@ TOP_50_COINS = [
     'ORDI/USDT', 'NOT/USDT', 'WLD/USDT', 'MKR/USDT', 'LDO/USDT'
 ]
 
+# REST exchange setup for fast & safe fetching
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
@@ -53,12 +54,12 @@ exchange = ccxt.binance({
 })
 
 # ----------------------------------------------------
-# ৩. WebSocket পজিশন মনিটর (Fast Sell Check)
+# ৩. পজিশন মনিটর (Sell Check)
 # ----------------------------------------------------
 async def watch_position_symbol(symbol):
     while symbol in positions:
         try:
-            ticker = await exchange.watch_ticker(symbol)
+            ticker = await exchange.fetch_ticker(symbol)
             current_price = ticker['last']
             
             entry_price = positions[symbol]['entry_price']
@@ -76,15 +77,14 @@ async def watch_position_symbol(symbol):
                 del positions[symbol]
                 break
 
+            await asyncio.sleep(3)
+
         except Exception as e:
-            if "1003" in str(e) or "418" in str(e):
-                await asyncio.sleep(30)
-            else:
-                print(f"WebSocket Ticker Error for {symbol}: {e}", flush=True)
-                await asyncio.sleep(2)
+            print(f"Position Check Error for {symbol}: {e}", flush=True)
+            await asyncio.sleep(5)
 
 # ----------------------------------------------------
-# ৪. instant (Touch/Break) Real-time Buy Analysis
+# ৪. রিয়েল-টাইম কন্টিনিউয়াস স্ক্যানিং
 # ----------------------------------------------------
 async def watch_and_analyze_symbol(symbol):
     print(f"📡 Started Watching & Analyzing: {symbol}", flush=True)
@@ -94,9 +94,10 @@ async def watch_and_analyze_symbol(symbol):
                 await asyncio.sleep(5)
                 continue
 
-            # ১. ওএইচএলসিভি ডাটা থেকে কারেন্ট লোয়ার ব্যান্ড এবং MA20 লেভেল নেওয়া
-            ohlcv = await exchange.watch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
+            # ওএইচএলসিভি ডাটা আনা
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
             if len(ohlcv) < 26:
+                await asyncio.sleep(5)
                 continue
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -109,22 +110,21 @@ async def watch_and_analyze_symbol(symbol):
             last_row = df.iloc[-1]
             five_candles_ago = df.iloc[-6]
 
-            # ক্যান্ডেল ক্লোজের বদলে রিয়েল টাইম ক্যান্ডেলের লাইভ হাই/লো/ক্লোজ প্রসেস হচ্ছে
-            current_close_price = last_row['close'] 
+            current_price = last_row['close']
             current_lower_band = last_row['lower_band']
             current_upper_band = last_row['upper_band']
             current_ma20 = last_row['ma20']
             prev_ma20 = five_candles_ago['ma20']
 
-            # স্ক্যানিং লাইভ ট্রেস লগ
-            print(f"🔍 Scanning {symbol} | Live Price: {current_close_price} | Lower Band: {round(current_lower_band, 4)}", flush=True)
+            # লাইভ স্ক্যানিং প্রিন্ট
+            print(f"🔍 Scanning {symbol} | Price: {current_price} | Lower Band: {round(current_lower_band, 4)}", flush=True)
 
-            # শর্ত ১: ক্যান্ডেল ক্লোজ হওয়ার দরকার নেই, লাইভ প্রাইস লোয়ার ব্যান্ডের নিচে গেলেই ট্র্রিগার
-            condition_1 = current_close_price < current_lower_band
+            # শর্ত: রিয়েল-টাইম প্রাইস লোয়ার ব্যান্ডের নিচে গেলেই সাথে সাথে বাই
+            condition_1 = current_price < current_lower_band
             condition_2 = current_ma20 > prev_ma20
 
             if condition_1 and condition_2:
-                print(f"🎯 [INSTANT BUY SIGNAL DETECTED] [{symbol}] Price Break: {current_close_price} < {current_lower_band}", flush=True)
+                print(f"🎯 [INSTANT BUY SIGNAL] [{symbol}] Price: {current_price} < {current_lower_band}", flush=True)
                 
                 order = await exchange.create_market_buy_order(
                     symbol, 
@@ -133,7 +133,7 @@ async def watch_and_analyze_symbol(symbol):
                 )
                 
                 filled_amount = order['filled']
-                executed_price = order['price'] or current_close_price
+                executed_price = order['price'] or current_price
                 
                 positions[symbol] = {
                     'entry_price': executed_price,
@@ -144,23 +144,27 @@ async def watch_and_analyze_symbol(symbol):
 
                 asyncio.create_task(watch_position_symbol(symbol))
 
+            # প্রতিটি কয়েনের মাঝে ১৫ সেকেন্ড গ্যাপ রাখা হয়েছে যাতে API Rate Limit না খায়
+            await asyncio.sleep(15)
+
         except Exception as e:
             if "1003" in str(e) or "418" in str(e):
-                print(f"⚠️ Rate limit or Ban detected on {symbol}. Waiting 30s...", flush=True)
-                await asyncio.sleep(30)
+                print(f"⚠️ Rate limit warning on {symbol}. Pausing 20s...", flush=True)
+                await asyncio.sleep(20)
             else:
                 print(f"Analysis Error for {symbol}: {e}", flush=True)
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
 
 # ----------------------------------------------------
-# ৫. প্রধান লুপ (Safe Connection Setup)
+# ৫. প্রধান লুপ (Delay controlled execution)
 # ----------------------------------------------------
 async def main_loop():
-    print(f"🚀 Starting Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
+    print(f"🚀 Starting Engine for Top {len(TOP_50_COINS)} Coins...", flush=True)
     
+    # ব্যাকগ্রাউন্ডে কয়েনগুলো ৩ সেকেন্ড পর পর চালু হবে যেন বাইন্যান্স ব্যান না করে
     for symbol in TOP_50_COINS:
         asyncio.create_task(watch_and_analyze_symbol(symbol))
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(3)
 
     while True:
         await asyncio.sleep(3600)
