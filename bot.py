@@ -29,7 +29,7 @@ STOP_LOSS_PCT = 0.03
 
 positions = {}
 
-# ৫০টি পপুলার USDT ট্রেডিং পেয়ার (REST API ছাড়া সরাসরি ব্যবহৃত)
+# ৫০টি পপুলার USDT ট্রেডিং পেয়ার (REST API ছাড়া সরাসরি ব্যবহৃত)
 TOP_50_COINS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
     'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'SHIB/USDT', 'DOT/USDT', 
@@ -86,7 +86,7 @@ async def watch_position_symbol(symbol):
                 await asyncio.sleep(2)
 
 # ----------------------------------------------------
-# ৪. WebSocket দিয়ে কয়েন অ্যানালাইসিস ও বাই সিগন্যাল
+# ৪. WebSocket দিয়ে কয়েন অ্যানালাইসিস ও বাই সিগন্যাল
 # ----------------------------------------------------
 async def watch_and_analyze_symbol(symbol):
     print(f"📡 WebSocket Connected & Watching: {symbol}", flush=True)
@@ -117,6 +117,9 @@ async def watch_and_analyze_symbol(symbol):
             current_ma20 = last_row['ma20']
             prev_ma20 = five_candles_ago['ma20']
 
+            # স্ক্যানিং লাইভ লগ প্রিন্ট
+            print(f"🔍 Scanning {symbol} | Price: {current_close} | Lower Band: {round(current_lower_band, 4)}", flush=True)
+
             condition_1 = current_close < current_lower_band
             condition_2 = current_ma20 > prev_ma20
 
@@ -142,7 +145,7 @@ async def watch_and_analyze_symbol(symbol):
                 asyncio.create_task(watch_position_symbol(symbol))
 
         except Exception as e:
-            # IP Ban বা Rate Limit ধরা পড়লে ৩০ সেকেন্ডের সেফটি পজ
+            # IP Ban বা Rate Limit ধরা পড়লে ৩০ সেকেন্ডের সেফটি পজ
             if "1003" in str(e) or "418" in str(e):
                 print(f"⚠️ Rate limit or Ban detected on {symbol}. Waiting 30s...", flush=True)
                 await asyncio.sleep(30)
@@ -156,7 +159,7 @@ async def watch_and_analyze_symbol(symbol):
 async def main_loop():
     print(f"🚀 Starting WebSocket Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
     
-    # কানেকশনের মধ্যে ২.৫ সেকেন্ডের ডিল দিয়ে ধীরগতিতে চালু হবে
+    # কানেকশনের মধ্যে ২.৫ সেকেন্ডের ডিল দিয়ে ধীরগতিতে চালু হবে
     for symbol in TOP_50_COINS:
         asyncio.create_task(watch_and_analyze_symbol(symbol))
         await asyncio.sleep(2.5)
