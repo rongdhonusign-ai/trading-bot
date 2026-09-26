@@ -29,7 +29,7 @@ STOP_LOSS_PCT = 0.03
 
 positions = {}
 
-# ৫০টি পপুলার USDT ট্রেডিং পেয়ার (REST API ছাড়া সরাসরি ব্যবহৃত)
+# ৫০টি পপুলার USDT ট্রেডিং পেয়ার
 TOP_50_COINS = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
     'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'SHIB/USDT', 'DOT/USDT', 
@@ -43,7 +43,7 @@ TOP_50_COINS = [
     'ORDI/USDT', 'NOT/USDT', 'WLD/USDT', 'MKR/USDT', 'LDO/USDT'
 ]
 
-# CCXT Pro WebSocket Client Setup
+# CCXT Pro Setup
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': SECRET_KEY,
@@ -86,19 +86,20 @@ async def watch_position_symbol(symbol):
                 await asyncio.sleep(2)
 
 # ----------------------------------------------------
-# ৪. WebSocket দিয়ে কয়েন অ্যানালাইসিস ও বাই সিগন্যাল
+# ৪. কয়েন অ্যানালাইসিস ও বাই সিগন্যাল (Fast Fast Scanning)
 # ----------------------------------------------------
 async def watch_and_analyze_symbol(symbol):
-    print(f"📡 WebSocket Connected & Watching: {symbol}", flush=True)
+    print(f"📡 Started Watching & Analyzing: {symbol}", flush=True)
     while True:
         try:
             if symbol in positions:
                 await asyncio.sleep(5)
                 continue
 
-            # WebSocket Stream for OHLCV
-            ohlcv = await exchange.watch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
+            # fetch_ohlcv ব্যবহার করা হয়েছে যেন ক্যান্ডেল আপডেটের জন্য আটকে না থাকে
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
             if len(ohlcv) < 26:
+                await asyncio.sleep(5)
                 continue
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -117,7 +118,7 @@ async def watch_and_analyze_symbol(symbol):
             current_ma20 = last_row['ma20']
             prev_ma20 = five_candles_ago['ma20']
 
-            # স্ক্যানিং লাইভ লগ প্রিন্ট
+            # সাথে সাথেই লগে দেখা যাবে
             print(f"🔍 Scanning {symbol} | Price: {current_close} | Lower Band: {round(current_lower_band, 4)}", flush=True)
 
             condition_1 = current_close < current_lower_band
@@ -144,22 +145,23 @@ async def watch_and_analyze_symbol(symbol):
 
                 asyncio.create_task(watch_position_symbol(symbol))
 
+            # প্রতি ১০ সেকেন্ড পরপর স্ক্যান করবে
+            await asyncio.sleep(10)
+
         except Exception as e:
-            # IP Ban বা Rate Limit ধরা পড়লে ৩০ সেকেন্ডের সেফটি পজ
             if "1003" in str(e) or "418" in str(e):
                 print(f"⚠️ Rate limit or Ban detected on {symbol}. Waiting 30s...", flush=True)
                 await asyncio.sleep(30)
             else:
-                print(f"WebSocket Analysis Error for {symbol}: {e}", flush=True)
+                print(f"Analysis Error for {symbol}: {e}", flush=True)
                 await asyncio.sleep(5)
 
 # ----------------------------------------------------
 # ৫. প্রধান লুপ (Safe Connection Setup)
 # ----------------------------------------------------
 async def main_loop():
-    print(f"🚀 Starting WebSocket Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
+    print(f"🚀 Starting Streams for Top {len(TOP_50_COINS)} Coins...", flush=True)
     
-    # কানেকশনের মধ্যে ২.৫ সেকেন্ডের ডিল দিয়ে ধীরগতিতে চালু হবে
     for symbol in TOP_50_COINS:
         asyncio.create_task(watch_and_analyze_symbol(symbol))
         await asyncio.sleep(2.5)
