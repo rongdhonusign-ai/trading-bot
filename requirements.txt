@@ -1,5 +1,6 @@
-Flask
+python-binance
 ccxt
 pandas
-pandas_ta
-websockets
+requests
+flask
+apscheduler
