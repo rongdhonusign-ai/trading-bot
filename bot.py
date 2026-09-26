@@ -1,178 +1,205 @@
 import os
-import asyncio
+import time
+import logging
 import threading
 from flask import Flask
-import ccxt.pro as ccxt
+from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceOrderException
 import pandas as pd
 import pandas_ta as ta
 
-# ----------------------------------------------------
-# ১. Flask Server (Render Health Check)
-# ----------------------------------------------------
+# Logging Setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Binance API Credentials (Render Environment Variable থেকে নিবে)
+API_KEY = os.environ.get('BINANCE_API_KEY', 'YOUR_API_KEY')
+API_SECRET = os.environ.get('BINANCE_API_SECRET', 'YOUR_API_SECRET')
+
+client = Client(API_KEY, API_SECRET)
+
+# Global Variables
+TRADE_AMOUNT_USDT = 35.0
+CHECK_INTERVAL_SECONDS = 15  # IP Ban রোধে ১৫ সেকেন্ড বিরতি
+active_positions = {}  # {symbol: {'qty': float, 'entry_price': float}}
+
+# Render.com-এ Free Web Service চালু রাখার জন্য Flask Server
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance Bot is Active & Safe!"
+    return "Binance Bollinger Band Trading Bot is Running Smoothly!"
 
-# ----------------------------------------------------
-# ২. কনফিগারেশন
-# ----------------------------------------------------
-API_KEY = os.environ.get('BINANCE_API_KEY', '')
-SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
 
-TRADE_AMOUNT_USDT = 15.0
-TIME_FRAME = '5m'
-BOLLINGER_PERIOD = 20
-BOLLINGER_STD = 2
-STOP_LOSS_PCT = 0.03
-
-positions = {}
-
-TOP_50_COINS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 
-    'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'SHIB/USDT', 'DOT/USDT', 
-    'LINK/USDT', 'NEAR/USDT', 'SUI/USDT', 'LTC/USDT', 'PEPE/USDT', 
-    'FET/USDT', 'APT/USDT', 'ICP/USDT', 'UNI/USDT', 'RENDER/USDT', 
-    'BCH/USDT', 'TIA/USDT', 'FIL/USDT', 'STX/USDT', 'INJ/USDT', 
-    'WIF/USDT', 'GALA/USDT', 'ETC/USDT', 'SEI/USDT', 'ATOM/USDT', 
-    'AR/USDT', 'FLOKI/USDT', 'BONK/USDT', 'FTM/USDT', 'OP/USDT', 
-    'ARB/USDT', 'AAVE/USDT', 'GRT/USDT', 'RUNE/USDT', 'THETA/USDT', 
-    'ALGO/USDT', 'SAND/USDT', 'MANA/USDT', 'ENA/USDT', 'JUP/USDT', 
-    'ORDI/USDT', 'NOT/USDT', 'WLD/USDT', 'MKR/USDT', 'LDO/USDT'
-]
-
-# REST exchange setup (Added timeout & safer rate limits)
-exchange = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-    'enableRateLimit': True,
-    'timeout': 30000,
-    'options': {
-        'defaultType': 'spot',
-        'adjustForTimeDifference': True
-    }
-})
-
-# ----------------------------------------------------
-# ৩. পজিশন মনিটর (Sell Check)
-# ----------------------------------------------------
-async def watch_positions():
-    while True:
-        if positions:
-            for symbol in list(positions.keys()):
-                try:
-                    ticker = await exchange.fetch_ticker(symbol)
-                    current_price = ticker['last']
-                    
-                    entry_price = positions[symbol]['entry_price']
-                    upper_band = positions[symbol]['upper_band']
-                    amount = positions[symbol]['amount']
-                    stop_loss_price = entry_price * (1 - STOP_LOSS_PCT)
-
-                    if current_price >= upper_band or current_price <= stop_loss_price:
-                        reason = "Upper Band Hit" if current_price >= upper_band else "Stop Loss Hit (3%)"
-                        print(f"⚡ [SELL TRIGGERED] [{symbol}] Reason: {reason} | Price: {current_price}", flush=True)
-                        
-                        order = await exchange.create_market_sell_order(symbol, amount)
-                        print(f"✅ Sold {symbol} | Order ID: {order['id']}", flush=True)
-                        
-                        del positions[symbol]
-
-                    await asyncio.sleep(3)
-                except Exception as e:
-                    print(f"Position Error for {symbol}: {e}", flush=True)
-                    await asyncio.sleep(5)
-        await asyncio.sleep(5)
-
-# ----------------------------------------------------
-# ৪. সেফ স্ক্যানার ফাংশন
-# ----------------------------------------------------
-async def analyze_symbol(symbol):
+# ১. IP Ban রোধে একবারে Top 150 USDT Pairs ফিল্টার করার ফাংশন
+def get_top_150_usdt_pairs():
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=TIME_FRAME, limit=30)
-        if len(ohlcv) < 26:
-            return
-
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        bb = ta.bbands(df['close'], length=BOLLINGER_PERIOD, std=BOLLINGER_STD)
+        tickers = client.get_ticker()
+        usdt_pairs = []
+        for t in tickers:
+            symbol = t['symbol']
+            # শুধু USDT স্পট পেয়ার এবং লেভারেজড/কাস্টম টোকেন বাদ দেওয়া (UP/DOWN/BULL/BEAR)
+            if symbol.endswith('USDT') and not any(x in symbol for x in ['UP', 'DOWN', 'BEAR', 'BULL']):
+                usdt_pairs.append({
+                    'symbol': symbol,
+                    'volume': float(t['quoteVolume'])
+                })
         
-        df['lower_band'] = bb.iloc[:, 0]
-        df['ma20'] = bb.iloc[:, 1]
-        df['upper_band'] = bb.iloc[:, 2]
-
-        last_row = df.iloc[-1]
-        five_candles_ago = df.iloc[-6]
-
-        current_price = last_row['close']
-        current_lower_band = last_row['lower_band']
-        current_upper_band = last_row['upper_band']
-        current_ma20 = last_row['ma20']
-        prev_ma20 = five_candles_ago['ma20']
-
-        print(f"🔍 Scanning {symbol} | Price: {current_price} | Lower: {round(current_lower_band, 4)} | MA20: {round(current_ma20, 4)} (Prev: {round(prev_ma20, 4)})", flush=True)
-
-        condition_1 = current_price < current_lower_band
-        condition_2 = current_ma20 > prev_ma20
-
-        if condition_1 and condition_2:
-            print(f"🎯 [BUY SIGNAL] [{symbol}] Price: {current_price} < Lower Band: {current_lower_band}", flush=True)
-            
-            order = await exchange.create_market_buy_order(
-                symbol, 
-                amount=None, 
-                params={'quoteOrderQty': TRADE_AMOUNT_USDT}
-            )
-            
-            filled_amount = order['filled']
-            executed_price = order['price'] or current_price
-            
-            positions[symbol] = {
-                'entry_price': executed_price,
-                'upper_band': current_upper_band,
-                'amount': filled_amount
-            }
-            print(f"✅ Bought {symbol} at {executed_price} USDT", flush=True)
-
+        # 24-hour USDT Volume দিয়ে Sort করে Top 150 নির্বাচন
+        sorted_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
+        top_150 = [p['symbol'] for p in sorted_pairs[:150]]
+        return top_150
     except Exception as e:
-        err_msg = str(e)
-        if "1003" in err_msg or "418" in err_msg:
-            print(f"⚠️ IP Blocked by Binance. Waiting 60s for cool-down...", flush=True)
-            await asyncio.sleep(60)
-        else:
-            print(f"Error on {symbol}: {e}", flush=True)
+        logging.error(f"Error fetching top pairs: {e}")
+        return []
 
-# ----------------------------------------------------
-# ৫. প্রধান স্ক্যানিং লুপ (Extra Safety Delays)
-# ----------------------------------------------------
-async def main_loop():
-    print(f"🚀 Engine Started for Top {len(TOP_50_COINS)} Coins...", flush=True)
-    asyncio.create_task(watch_positions())
-
-    while True:
-        for symbol in TOP_50_COINS:
-            if symbol not in positions:
-                await analyze_symbol(symbol)
-                # ৩ সেকেন্ড গ্যাপ রাখা হলো যাতে বাইন্যান্স সার্ভার ওভারলোড না ধরে
-                await asyncio.sleep(3) 
-        
-        # ৫০টি কয়েন ১ রাউন্ড স্ক্যান শেষে ১৫ সেকেন্ড বিরতি
-        await asyncio.sleep(15)
-
-# ----------------------------------------------------
-# ৬. ব্যাকগ্রাউন্ড থ্রেড ও অ্যাপ স্টার্টআপ
-# ----------------------------------------------------
-def start_async_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+# ২. ক্যান্ডেল ডাটা নিয়ে Bollinger Bands (20,2) গণনা
+def get_klines_and_bb(symbol):
     try:
-        loop.run_until_complete(main_loop())
-    finally:
-        loop.run_until_complete(exchange.close())
+        # ৫ মিনিটের ক্যান্ডেল ডাটা (সর্বশেষ ২৫টি ক্যান্ডেল যথেষ্ট 20 Period BB এর জন্য)
+        klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=25)
+        df = pd.DataFrame(klines, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['close'] = df['close'].astype(float)
 
-bot_thread = threading.Thread(target=start_async_loop, daemon=True)
-bot_thread.start()
+        # Bollinger Bands (20, 2) Calculation
+        bb = ta.bbands(df['close'], length=20, std=2)
+        
+        # dynamic column name handle করা (BBL_20_2.0 & BBU_20_2.0)
+        lower_col = [c for c in bb.columns if c.startswith('BBL')][0]
+        upper_col = [c for c in bb.columns if c.startswith('BBU')][0]
+
+        df['lower_band'] = bb[lower_col]
+        df['upper_band'] = bb[upper_col]
+
+        return df
+    except Exception as e:
+        logging.error(f"Error calculating BB for {symbol}: {e}")
+        return None
+
+# ৩. কাস্টম Precision অনুযায়ী Quantity ঠিক করা (Binance LOT_SIZE rule)
+def get_asset_precision(symbol):
+    try:
+        info = client.get_symbol_info(symbol)
+        for f in info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                step_size = float(f['stepSize'])
+                precision = int(-pd.np.log10(step_size)) if step_size < 1 else 0
+                return precision
+    except:
+        return 6
+
+# ৪. ট্রেডিং বট মেইন লুপ
+def trading_loop():
+    logging.info("Trading Loop Started...")
+    
+    while True:
+        try:
+            # Step 1: Top 150 Pair সংগ্রহ
+            top_symbols = get_top_150_usdt_pairs()
+            logging.info(f"Scanning {len(top_symbols)} symbols...")
+
+            for symbol in top_symbols:
+                # IP Ban 100% এড়াতে প্রতিটি রিকোয়েস্টের মাঝে হালকা Delays (Rate-limiting safe)
+                time.sleep(0.1)
+
+                df = get_klines_and_bb(symbol)
+                if df is None or len(df) < 2:
+                    continue
+
+                # গত সমাপ্ত ক্যান্ডেল (Last Completed Candle)
+                last_candle = df.iloc[-2]
+                current_price = df.iloc[-1]['close'] # বর্তমান ক্যান্ডেলের চলতি প্রাইস
+
+                open_p = last_candle['open']
+                close_p = last_candle['close']
+                lower_b = last_candle['lower_band']
+                upper_b = last_candle['upper_band']
+
+                # ------------------ ১. বাই করার শর্ত ------------------
+                # শর্ত: Open < Lower Band এবং Close > Lower Band
+                if symbol not in active_positions:
+                    if open_p < lower_b and close_p > lower_b:
+                        logging.info(f"BUY SIGNAL FOUND: {symbol} | Open: {open_p}, Close: {close_p}, Lower BB: {lower_b}")
+                        
+                        # Market Buy Execute
+                        try:
+                            order = client.order_market_buy(
+                                symbol=symbol,
+                                quoteOrderQty=TRADE_AMOUNT_USDT
+                            )
+                            
+                            # কতটুকু ফিল হলো তা বের করা
+                            executed_qty = float(order['executedQty'])
+                            active_positions[symbol] = {
+                                'qty': executed_qty,
+                                'entry_price': current_price
+                            }
+                            logging.info(f"SUCCESSFUL BUY: Bought {executed_qty} of {symbol}")
+                        
+                        except BinanceAPIException as e:
+                            logging.error(f"Binance Buy API Error for {symbol}: {e}")
+                        except Exception as e:
+                            logging.error(f"Buy Failed for {symbol}: {e}")
+
+                # ------------------ ২. সেল করার শর্ত (Fail-safe Enabled) ------------------
+                # শর্ত: যদি টোকেন কেনা থাকে এবং প্রাইস Upper Band স্পর্শ/অতিক্রম করে
+                if symbol in active_positions:
+                    if current_price >= upper_b:
+                        logging.info(f"SELL SIGNAL FOUND: {symbol} | Price: {current_price}, Upper BB: {upper_b}")
+                        
+                        qty = active_positions[symbol]['qty']
+                        
+                        # Market Sell 100% Executed
+                        try:
+                            # Sell execution retry loop (যেন আটকে না থাকে)
+                            success = False
+                            for attempt in range(3): # ৩ বার চেষ্টা করবে যেন কোনোভাবে সেল ফিল মিস না হয়
+                                try:
+                                    sell_order = client.order_market_sell(
+                                        symbol=symbol,
+                                        quantity=qty
+                                    )
+                                    logging.info(f"SUCCESSFUL SELL: Sold 100% ({qty}) of {symbol}")
+                                    del active_positions[symbol]
+                                    success = True
+                                    break
+                                except BinanceAPIException as binance_err:
+                                    # যদি LOT_SIZE Precision ইস্যু দেয়
+                                    logging.warning(f"Sell Attempt {attempt+1} failed. Retrying... Error: {binance_err}")
+                                    # Quantity সামান্য কম করে নিখুঁত করার চেষ্টা
+                                    info = client.get_symbol_info(symbol)
+                                    step_size = float([f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'][0])
+                                    qty = float(int(qty / step_size) * step_size)
+                                    time.sleep(1)
+
+                            if not success:
+                                logging.critical(f"ALERT: Could NOT sell {symbol} after 3 attempts! Check manual balance.")
+
+                        except Exception as e:
+                            logging.error(f"Sell Execution Failed for {symbol}: {e}")
+
+            # স্ক্যান শেষে কিছুটা বিরতি যাতে IP Ban 0% সুনিশ্চিত হয়
+            time.sleep(CHECK_INTERVAL_SECONDS)
+
+        except Exception as e:
+            logging.error(f"Global Loop Error: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    # Flask Server আলাদা Thread এ চালু করা (Render.com Keep-Alive এর জন্য)
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # মেইন ট্রেডিং লুপ রান করা
+    trading_loop()
