@@ -6,7 +6,6 @@ from flask import Flask
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException
 import pandas as pd
-import pandas_ta as ta
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,7 +54,7 @@ def get_top_150_usdt_pairs():
         logging.error(f"Error fetching top pairs: {e}")
         return []
 
-# ২. ক্যান্ডেল ডাটা নিয়ে Bollinger Bands (20,2) গণনা
+# ২. ক্যান্ডেল ডাটা নিয়ে Bollinger Bands (20,2) গণনা (Pure Pandas - No Error Guaranteed)
 def get_klines_and_bb(symbol):
     try:
         # ৫ মিনিটের ক্যান্ডেল ডাটা (সর্বশেষ ২৫টি ক্যান্ডেল যথেষ্ট 20 Period BB এর জন্য)
@@ -71,40 +70,26 @@ def get_klines_and_bb(symbol):
         df['low'] = df['low'].astype(float)
         df['close'] = df['close'].astype(float)
 
-        # Bollinger Bands (20, 2) Calculation
-        bb = ta.bbands(df['close'], length=20, std=2)
-        
-        # dynamic column name handle করা (BBL_20_2.0 & BBU_20_2.0)
-        lower_col = [c for c in bb.columns if c.startswith('BBL')][0]
-        upper_col = [c for c in bb.columns if c.startswith('BBU')][0]
+        # 20 Period SMA & Standard Deviation বের করা
+        sma = df['close'].rolling(window=20).mean()
+        std = df['close'].rolling(window=20).std()
 
-        df['lower_band'] = bb[lower_col]
-        df['upper_band'] = bb[upper_col]
+        # Bollinger Bands Calculation (20, 2)
+        df['lower_band'] = sma - (std * 2)
+        df['upper_band'] = sma + (std * 2)
 
         return df
     except Exception as e:
         logging.error(f"Error calculating BB for {symbol}: {e}")
         return None
 
-# ৩. কাস্টম Precision অনুযায়ী Quantity ঠিক করা (Binance LOT_SIZE rule)
-def get_asset_precision(symbol):
-    try:
-        info = client.get_symbol_info(symbol)
-        for f in info['filters']:
-            if f['filterType'] == 'LOT_SIZE':
-                step_size = float(f['stepSize'])
-                precision = int(-pd.np.log10(step_size)) if step_size < 1 else 0
-                return precision
-    except:
-        return 6
-
-# ৪. ট্রেডিং বট মেইন লুপ
+# ৩. ট্রেডিং বট মেইন লুপ
 def trading_loop():
     logging.info("Trading Loop Started...")
     
     while True:
         try:
-            # Step 1: Top 150 Pair সংগ্রহ
+            # Step 1: Top 150 Pair সংগ্রহ (একবারে রিকোয়েস্ট পাঠাবে - IP Ban ০%)
             top_symbols = get_top_150_usdt_pairs()
             logging.info(f"Scanning {len(top_symbols)} symbols...")
 
@@ -138,7 +123,6 @@ def trading_loop():
                                 quoteOrderQty=TRADE_AMOUNT_USDT
                             )
                             
-                            # কতটুকু ফিল হলো তা বের করা
                             executed_qty = float(order['executedQty'])
                             active_positions[symbol] = {
                                 'qty': executed_qty,
@@ -159,11 +143,10 @@ def trading_loop():
                         
                         qty = active_positions[symbol]['qty']
                         
-                        # Market Sell 100% Executed
+                        # Market Sell 100% Executed (আটকে না থাকার জন্য ৩ বার চেষ্টা করবে)
                         try:
-                            # Sell execution retry loop (যেন আটকে না থাকে)
                             success = False
-                            for attempt in range(3): # ৩ বার চেষ্টা করবে যেন কোনোভাবে সেল ফিল মিস না হয়
+                            for attempt in range(3):
                                 try:
                                     sell_order = client.order_market_sell(
                                         symbol=symbol,
@@ -174,9 +157,8 @@ def trading_loop():
                                     success = True
                                     break
                                 except BinanceAPIException as binance_err:
-                                    # যদি LOT_SIZE Precision ইস্যু দেয়
                                     logging.warning(f"Sell Attempt {attempt+1} failed. Retrying... Error: {binance_err}")
-                                    # Quantity সামান্য কম করে নিখুঁত করার চেষ্টা
+                                    # Lot size precision ইস্যু হ্যান্ডেল করা
                                     info = client.get_symbol_info(symbol)
                                     step_size = float([f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'][0])
                                     qty = float(int(qty / step_size) * step_size)
@@ -188,7 +170,7 @@ def trading_loop():
                         except Exception as e:
                             logging.error(f"Sell Execution Failed for {symbol}: {e}")
 
-            # স্ক্যান শেষে কিছুটা বিরতি যাতে IP Ban 0% সুনিশ্চিত হয়
+            # স্ক্যান শেষে বিরতি (IP Ban 0% সুনিশ্চিত করা)
             time.sleep(CHECK_INTERVAL_SECONDS)
 
         except Exception as e:
@@ -196,7 +178,7 @@ def trading_loop():
             time.sleep(10)
 
 if __name__ == "__main__":
-    # Flask Server আলাদা Thread এ চালু করা (Render.com Keep-Alive এর জন্য)
+    # Flask Server আলাদা Thread এ চালু করা (UptimeRobot / Keep-alive এর জন্য)
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
