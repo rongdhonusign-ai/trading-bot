@@ -22,53 +22,29 @@ TRADE_AMOUNT_USDT = 35.0
 active_positions = {}
 
 candles_history = {}
-top_pairs_list = []
+
+# টপ ৫০-৬০টি হাই ভলিউম USDT পেয়ারের স্ট্যাটিক লিস্ট (API Call জিরো রাখতে)
+top_pairs_list = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
+    "AVAXUSDT", "LINKUSDT", "SUIUSDT", "DOTUSDT", "NEARUSDT", "APTUSDT", "LTCUSDT",
+    "BCHUSDT", "FETUSDT", "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "NEARUSDT", "INJUSDT",
+    "TIAUSDT", "RNDRUSDT", "ATOMUSDT", "STXUSDT", "FILUSDT", "TRXUSDT", "ARBUSDT",
+    "OPUSDT", "FTMUSDT", "AAVEUSDT", "GALAUSDT", "THETAUSDT", "ALGOUSDT", "LDOUSDT",
+    "FLOKIUSDT", "KASUSDT", "ORDIUSDT", "SEIUSDT", "DYDXUSDT", "SANDUSDT", "MANAUSDT"
+]
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance WebSocket Trading Bot is Live & Active!"
+    return "Binance Zero-Weight WebSocket Bot is Active!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-def is_stablecoin_or_fiat(symbol):
-    stable_fiat_keywords = [
-        'USD', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'DAI', 'USDE', 'PYUSD', 'USDD', 'FRAX',
-        'EUR', 'GBP', 'BRL', 'TRY', 'RUB', 'AUD', 'CAD', 'CHF', 'JPY', 'AEUR', 'PAX'
-    ]
-    base_asset = symbol.replace('USDT', '')
-    for keyword in stable_fiat_keywords:
-        if base_asset == keyword or base_asset.startswith(keyword):
-            return True
-    return False
-
-def init_top_150_pairs():
-    global top_pairs_list
-    try:
-        logging.info("Initializing Top 150 USDT pairs list...")
-        tickers = client.get_ticker()
-        usdt_pairs = []
-        for t in tickers:
-            symbol = t['symbol']
-            if (symbol.endswith('USDT') and 
-                not any(x in symbol for x in ['UP', 'DOWN', 'BEAR', 'BULL']) and 
-                not is_stablecoin_or_fiat(symbol)):
-                
-                usdt_pairs.append({
-                    'symbol': symbol,
-                    'volume': float(t['quoteVolume'])
-                })
-        
-        sorted_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
-        top_pairs_list = [p['symbol'] for p in sorted_pairs[:150]]
-        logging.info(f"Loaded {len(top_pairs_list)} top pairs successfully!")
-    except Exception as e:
-        logging.error(f"Error fetching top pairs: {e}")
-
 def execute_market_sell(symbol, qty, reason="SELL"):
+    """স্লিপেজ এড়াতে ১০ বার রিট্রাই সহ মার্কেট সেল"""
     try:
         info = client.get_symbol_info(symbol)
         step_size = float([f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'][0])
@@ -98,11 +74,12 @@ def execute_market_sell(symbol, qty, reason="SELL"):
         return False
 
 def process_klines_and_signal(symbol, df, current_close):
+    # ১. কেনা থাকা ট্রেডের স্টপ-লস ও টেক-প্রফিট ট্র্যাকিং
     if symbol in active_positions:
         entry_price = active_positions[symbol]['entry_price']
         qty = active_positions[symbol]['qty']
         
-        stop_loss_trigger = entry_price * (1 - 0.010)
+        stop_loss_trigger = entry_price * (1 - 0.010)  # ১.০% ড্রপ
 
         if current_close <= stop_loss_trigger:
             drop_percent = round(((entry_price - current_close) / entry_price) * 100, 2)
@@ -116,6 +93,7 @@ def process_klines_and_signal(symbol, df, current_close):
             execute_market_sell(symbol, qty, reason="TAKE PROFIT SELL")
             return
 
+    # ২. নতুন বায় সিগন্যাল চেকিং
     if symbol not in active_positions:
         last_closed_candle = df.iloc[-2]
         open_p = last_closed_candle['open']
@@ -124,6 +102,7 @@ def process_klines_and_signal(symbol, df, current_close):
         lower_b = last_closed_candle['lower_band']
         ema5_p = last_closed_candle['ema5']
 
+        # বায় করার শর্তাবলি: Open < Lower BB, Close > Lower BB, High < EMA5
         if (open_p < lower_b) and (close_p > lower_b) and (high_p < ema5_p):
             logging.info(f"BUY SIGNAL FOUND: {symbol} | Open: {open_p}, Close: {close_p}, High: {high_p}, Lower BB: {lower_b}, EMA5: {ema5_p}")
             try:
@@ -145,11 +124,11 @@ def process_klines_and_signal(symbol, df, current_close):
                 logging.error(f"Buy Order Failed for {symbol}: {e}")
 
 async def listen_binance_websocket():
-    """Direct Websockets implementation for Binance Stream"""
-    stream_names = "/".join([f"{symbol.lower()}@kline_5m" for symbol in top_pairs_list[:100]])
+    """বাইনান্স WebSocket থেকে সরাসরি ডাটা স্ট্রিম গ্রহণ"""
+    stream_names = "/".join([f"{symbol.lower()}@kline_5m" for symbol in top_pairs_list])
     url = f"wss://stream.binance.com:9443/ws/{stream_names}"
     
-    logging.info("Connecting directly to Binance WebSocket...")
+    logging.info("Connecting directly to Binance WebSocket Stream (0 API Weight Used)...")
     
     while True:
         try:
@@ -190,7 +169,7 @@ async def listen_binance_websocket():
 
                             process_klines_and_signal(symbol, df, candle['close'])
         except Exception as e:
-            logging.error(f"WebSocket Connection Lost/Error: {e}. Reconnecting in 5 seconds...")
+            logging.error(f"WebSocket Error: {e}. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
 
 def start_async_loop():
@@ -202,8 +181,6 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-
-    init_top_150_pairs()
 
     ws_thread = threading.Thread(target=start_async_loop)
     ws_thread.daemon = True
