@@ -17,7 +17,7 @@ client = Client(API_KEY, API_SECRET)
 
 TRADE_AMOUNT_USDT = 35.0
 CHECK_INTERVAL_SECONDS = 10
-STOP_LOSS_PERCENT = 0.01  # ১% স্টপ লস (0.01)
+STOP_LOSS_PERCENT = 0.01  # ১% ফিক্সড স্টপ লস (0.01)
 active_positions = {}
 
 app = Flask(__name__)
@@ -30,13 +30,39 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
+def is_stablecoin_or_fiat(symbol):
+    """
+    কোনো প্রকার স্টেবলকয়েন বা ফিয়াট কারেন্সি যেন বাই না হয় তা শতভাগ নিশ্চিত করার ফিল্টার
+    """
+    # সকল প্রচলিত স্টেবলকয়েন এবং ফিয়াট কারেন্সির ট্যাগ/নাম
+    stable_fiat_keywords = [
+        'USD', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'DAI', 'USDE', 'PYUSD', 'USDD', 'FRAX',
+        'EUR', 'GBP', 'BRL', 'TRY', 'RUB', 'AUD', 'CAD', 'CHF', 'JPY', 'AEUR', 'PAX'
+    ]
+    
+    # USDT বাদ দিয়ে বেস টোকেনের নাম বের করা (যেমন: USDCUSDT -> USDC)
+    base_asset = symbol.replace('USDT', '')
+    
+    # বেস টোকেনটি যদি কোনো স্টেবলকয়েন বা ফিয়াট কারেন্সি হয়
+    for keyword in stable_fiat_keywords:
+        if base_asset == keyword or base_asset.startswith(keyword):
+            return True
+    return False
+
 def get_top_150_usdt_pairs():
     try:
         tickers = client.get_ticker()
         usdt_pairs = []
         for t in tickers:
             symbol = t['symbol']
-            if symbol.endswith('USDT') and not any(x in symbol for x in ['UP', 'DOWN', 'BEAR', 'BULL']):
+            
+            # ১. USDT পেয়ার হতে হবে
+            # ২. লিভারেজড টোকেন বাদ (UP, DOWN, BEAR, BULL)
+            # ৩. কোনো প্রকার স্টেবলকয়েন বা ফিয়াট কারেন্সি হওয়া যাবে না
+            if (symbol.endswith('USDT') and 
+                not any(x in symbol for x in ['UP', 'DOWN', 'BEAR', 'BULL']) and 
+                not is_stablecoin_or_fiat(symbol)):
+                
                 usdt_pairs.append({
                     'symbol': symbol,
                     'volume': float(t['quoteVolume'])
@@ -50,7 +76,7 @@ def get_top_150_usdt_pairs():
 
 def get_klines_and_bb(symbol):
     try:
-        # IP Ban রোধ করতে কেবল ২০টি ক্যান্ডেল কল করা হচ্ছে
+        # API Weight বাঁচাতে মাত্র ২১টি ক্যান্ডেল ডাটা আনা হচ্ছে
         klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=21)
         df = pd.DataFrame(klines, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -75,19 +101,18 @@ def get_klines_and_bb(symbol):
         return None
 
 def execute_market_sell(symbol, qty, reason="SELL"):
-    """যে কোনো মূল্যে সেল সফল করতে অপটিমাইজড রিট্রাই মেকানিজম"""
+    """সেল মিস না হওয়ার জন্য নিখুঁত লট-সাইজ ফিল্টার ও রিট্রাই ইঞ্জিন"""
     try:
         success = False
         info = client.get_symbol_info(symbol)
         step_size = float([f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'][0])
         
-        # একিউরেট কোয়ান্টিটি ফিল্টারিং
+        # একিউরেট কোয়ান্টিটি অ্যাডজাস্টমেন্ট
         adjusted_qty = float(int(qty / step_size) * step_size)
-        # দশমিকের অতিরিক্ত ঘর বাদ দেওয়া
         precision = len(str(step_size).split('.')[1]) if '.' in str(step_size) else 0
         adjusted_qty = round(adjusted_qty, precision)
 
-        for attempt in range(5): # ৩ বারের জায়গায় ৫ বার রিট্রাই
+        for attempt in range(5): # সর্বোচ্চ ৫ বার রিট্রাই করবে
             try:
                 sell_order = client.order_market_sell(
                     symbol=symbol,
@@ -108,13 +133,12 @@ def execute_market_sell(symbol, qty, reason="SELL"):
         logging.error(f"Sell Execution Failed for {symbol}: {e}")
 
 def check_active_positions():
-    """অ্যাক্টিভ পজিশন দ্রুত মনিটর করা যেন কোনো সেল মিস না হয়"""
+    """চলমান ট্রেডের ১% স্টপ-লস এবং Upper Band টেক-প্রফিট চেকিং"""
     if not active_positions:
         return
 
     for symbol in list(active_positions.keys()):
         try:
-            # লাইভ টিকার দিয়ে প্রাইস চ্যাকিং (অত্যন্ত দ্রুত এবং কম ওয়েট খরচ করে)
             ticker = client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
             
@@ -127,7 +151,7 @@ def check_active_positions():
                 execute_market_sell(symbol, active_positions[symbol]['qty'], reason="STOP LOSS SELL")
                 continue
 
-            # ২. টেক-প্রফিট (Upper Band টপকানো মাত্রই সেল)
+            # ২. টেক-প্রফিট (Bollinger Upper Band পার হলে বা স্পর্শ করলে)
             df = get_klines_and_bb(symbol)
             if df is not None and len(df) > 0:
                 upper_b = df.iloc[-1]['upper_band']
@@ -143,19 +167,16 @@ def trading_loop():
     
     while True:
         try:
-            # প্রথমে কেনা থাকা পজিশন চেক (সেল মিস না হওয়ার নিশ্চয়তা)
+            # লুপের শুরুতে অ্যাক্টিভ ট্রেডগুলোর সেল/স্টপ-লস চেক
             check_active_positions()
 
-            # ১৫০টি টোকেন স্ক্যান করা
+            # ১৫০টি টোকেন ফিল্টার করে স্ক্যান তালিকা প্রস্তুত করা
             top_symbols = get_top_150_usdt_pairs()
             logging.info(f"Scanning {len(top_symbols)} symbols...")
 
             for symbol in top_symbols:
-                # লুপ চলাকালীনও সক্রিয় ট্রেডগুলোর টেক-প্রফিট/স্টপ-লস মনিটর করা
-                check_active_positions()
-
-                # IP Ban রোধের জন্য API রিকোয়েস্ট বিরতি (0.12s pause)
-                time.sleep(0.12)
+                # IP Ban ও Over-polling রোধ করতে প্রতিটি কলের মাঝে নিরাপদ বিরতি (০.৫ সে)
+                time.sleep(0.5)
 
                 df = get_klines_and_bb(symbol)
                 if df is None or len(df) < 20:
@@ -179,10 +200,9 @@ def trading_loop():
                             executed_qty = float(order['executedQty'])
                             cummulative_quote_qty = float(order['cummulativeQuoteQty'])
                             
-                            # আসল এন্ট্রি প্রাইস হিসেব করা
                             actual_entry_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else float(df.iloc[-1]['close'])
                             
-                            # কেনার সাথে সাথেই ১% স্টপ লস প্রাইস ফিক্সড ক্যালকুলেট করে মেমোরিতে রাখা
+                            # বাই সফল হওয়ার সাথে সাথে ফিক্সড ১% স্টপ লস সেট করা
                             calculated_stop_loss = actual_entry_price * (1 - STOP_LOSS_PERCENT)
 
                             active_positions[symbol] = {
@@ -198,7 +218,7 @@ def trading_loop():
 
         except Exception as e:
             logging.error(f"Global Loop Error: {e}")
-            time.sleep(5)
+            time.sleep(10)
 
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
