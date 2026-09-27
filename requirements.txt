@@ -1,6 +1,5 @@
 Flask
-python-binance>=1.0.19
+python-binance
 pandas
 websockets
-websocket-client
 requests
