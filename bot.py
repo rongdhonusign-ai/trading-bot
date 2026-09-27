@@ -2,9 +2,11 @@ import os
 import time
 import logging
 import threading
+import json
 from flask import Flask
 from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceOrderException
+from binance.ws.spot_websocket import SpotWebsocketStreamClient
+from binance.exceptions import BinanceAPIException
 import pandas as pd
 
 # Logging Setup
@@ -16,22 +18,20 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', 'YOUR_API_SECRET')
 client = Client(API_KEY, API_SECRET)
 
 TRADE_AMOUNT_USDT = 35.0
-CHECK_INTERVAL_SECONDS = 10
-STOP_LOSS_PERCENT = 0.01  # ১% ফিক্সড স্টপ লস
 active_positions = {}
 
-# IP Ban সম্পূর্ণ বন্ধ করতে মেমোরি ক্যাশিং
-top_150_cached_pairs = []
-last_top_pairs_fetch_time = 0
+# ক্যান্ডেল হিস্ট্রি ডাটা মেমোরিতে রাখার জন্য ডিকশনারি
+candles_history = {}
+top_pairs_list = []
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Binance Bollinger Band + EMA5 Trading Bot is Running Safely!"
+    return "Binance WebSocket Trading Bot is Live & Running!"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 def is_stablecoin_or_fiat(symbol):
@@ -45,15 +45,11 @@ def is_stablecoin_or_fiat(symbol):
             return True
     return False
 
-def get_top_150_usdt_pairs():
-    global top_150_cached_pairs, last_top_pairs_fetch_time
-    
-    # ১৫ মিনিটে মাত্র ১ বার টপ ১৫০ ফিল্টার ডাটা ফেচ করবে (API Weight সুরক্ষার জন্য)
-    if time.time() - last_top_pairs_fetch_time < 900 and top_150_cached_pairs:
-        return top_150_cached_pairs
-
+def init_top_150_pairs():
+    """বট চালুর সময় মাত্র ১ বার টপ ১৫০ পেয়ার ফিল্টার করবে"""
+    global top_pairs_list
     try:
-        logging.info("Updating Top 150 Volume Pairs Cache (Runs once every 15 mins)...")
+        logging.info("Initializing Top 150 USDT pairs list...")
         tickers = client.get_ticker()
         usdt_pairs = []
         for t in tickers:
@@ -68,45 +64,14 @@ def get_top_150_usdt_pairs():
                 })
         
         sorted_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
-        top_150_cached_pairs = [p['symbol'] for p in sorted_pairs[:150]]
-        last_top_pairs_fetch_time = time.time()
-        return top_150_cached_pairs
+        top_pairs_list = [p['symbol'] for p in sorted_pairs[:150]]
+        logging.info(f"Loaded {len(top_pairs_list)} top pairs successfully!")
     except Exception as e:
         logging.error(f"Error fetching top pairs: {e}")
-        return top_150_cached_pairs
-
-def get_klines_bb_and_ema(symbol):
-    try:
-        # Bollinger Band (20) এবং EMA (5) হিসেব করতে ২৫টি ক্যান্ডেল ডাটা আনা হচ্ছে
-        klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=25)
-        df = pd.DataFrame(klines, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'number_of_trades',
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ])
-        
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['close'] = df['close'].astype(float)
-
-        # Bollinger Bands (20, 2)
-        sma = df['close'].rolling(window=20).mean()
-        std = df['close'].rolling(window=20).std()
-        df['lower_band'] = sma - (std * 2)
-        df['upper_band'] = sma + (std * 2)
-
-        # EMA 5 Calculation
-        df['ema5'] = df['close'].ewm(span=5, adjust=False).mean()
-
-        return df
-    except Exception as e:
-        logging.error(f"Error calculating Indicators for {symbol}: {e}")
-        return None
 
 def execute_market_sell(symbol, qty, reason="SELL"):
+    """স্লিপেজ এড়াতে ১০ বার দ্রুত রিট্রাই সহ মার্কেট সেল"""
     try:
-        success = False
         info = client.get_symbol_info(symbol)
         step_size = float([f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'][0])
         
@@ -114,125 +79,150 @@ def execute_market_sell(symbol, qty, reason="SELL"):
         precision = len(str(step_size).split('.')[1]) if '.' in str(step_size) else 0
         adjusted_qty = round(adjusted_qty, precision)
 
-        for attempt in range(5):
+        # স্লিপেজে অর্ডার আটকে না থাকার জন্য ১০ বার দ্রুত ০.২ সেকেন্ড পর পর রিট্রাই করবে
+        for attempt in range(10):
             try:
                 sell_order = client.order_market_sell(
                     symbol=symbol,
                     quantity=adjusted_qty
                 )
-                logging.info(f"SUCCESSFUL {reason}: Sold {adjusted_qty} of {symbol}")
+                logging.info(f"SUCCESSFUL {reason}: Sold {adjusted_qty} of {symbol} (Attempt {attempt+1})")
                 if symbol in active_positions:
                     del active_positions[symbol]
-                success = True
-                break
+                return True
             except BinanceAPIException as binance_err:
-                logging.warning(f"Sell Attempt {attempt+1} failed. Retrying... Error: {binance_err}")
-                time.sleep(1)
+                logging.warning(f"Sell Attempt {attempt+1} failed for {symbol}: {binance_err}")
+                time.sleep(0.2)
 
-        if not success:
-            logging.critical(f"ALERT: Could NOT sell {symbol} after 5 attempts!")
+        logging.critical(f"ALERT: Could NOT sell {symbol} after 10 attempts!")
+        return False
     except Exception as e:
-        logging.error(f"Sell Execution Failed for {symbol}: {e}")
+        logging.error(f"Sell Execution Error for {symbol}: {e}")
+        return False
 
-def check_active_positions(all_tickers_dict):
-    """একত্রে মাত্র ১টি কলেই সমস্ত অ্যাক্টিভ ট্রেডের স্টপ-লস ও টেক-প্রফিট ট্র্যাকিং"""
-    if not active_positions:
-        return
-
-    for symbol in list(active_positions.keys()):
-        try:
-            if symbol not in all_tickers_dict:
-                continue
-                
-            current_price = all_tickers_dict[symbol]
-            entry_price = active_positions[symbol]['entry_price']
-            stop_loss_price = active_positions[symbol]['stop_loss_price']
-
-            # ১. ১% স্টপ-লস ট্রিগার
-            if current_price <= stop_loss_price:
-                logging.warning(f"STOP LOSS HIT (1%): {symbol} | Current: {current_price} <= Stop: {stop_loss_price}")
-                execute_market_sell(symbol, active_positions[symbol]['qty'], reason="STOP LOSS SELL")
-                continue
-
-            # ২. টেক-প্রফিট (Bollinger Upper Band পার হলে)
-            df = get_klines_bb_and_ema(symbol)
-            if df is not None and len(df) > 0:
-                upper_b = df.iloc[-1]['upper_band']
-                if current_price >= upper_b:
-                    logging.info(f"TAKE PROFIT SIGNAL: {symbol} | Current: {current_price} >= Upper BB: {upper_b}")
-                    execute_market_sell(symbol, active_positions[symbol]['qty'], reason="TAKE PROFIT SELL")
-
-        except Exception as e:
-            logging.error(f"Error checking position for {symbol}: {e}")
-
-def trading_loop():
-    logging.info("Safe Trading Loop Started...")
+def process_klines_and_signal(symbol, df, current_close):
+    """Bollinger Band (20,2) এবং EMA (5) দিয়ে বায় ও সেলের সিগন্যাল প্রসেস"""
     
-    while True:
-        try:
-            # ১টি কলেই পুরো মার্কেটের লাইভ দাম নিয়ে আসা (API Weight = 2)
-            all_tickers = client.get_all_tickers()
-            all_tickers_dict = {t['symbol']: float(t['price']) for t in all_tickers}
+    # ১. কেনা থাকা পজিশনের স্টপ-লস ও টেক-প্রফিট ট্র্যাকিং
+    if symbol in active_positions:
+        entry_price = active_positions[symbol]['entry_price']
+        qty = active_positions[symbol]['qty']
+        
+        # ১.০% থেকে ১.১% স্লিপেজ উইন্ডো হিসেব
+        stop_loss_trigger = entry_price * (1 - 0.010)  # ১.০% ড্রপ হলে সেল শুরু
 
-            # ১. কেনা থাকা টোকেনের ১% স্টপ-লস ও টেক-প্রফিট চেক
-            check_active_positions(all_tickers_dict)
+        # ১.০% ড্রপ করা মাত্রই মার্কেট সেল হিট করবে
+        if current_close <= stop_loss_trigger:
+            drop_percent = round(((entry_price - current_close) / entry_price) * 100, 2)
+            logging.warning(f"STOP LOSS TRIGGERED ({drop_percent}% drop): {symbol} | Current: {current_close} | Entry: {entry_price}")
+            
+            execute_market_sell(symbol, qty, reason=f"STOP LOSS SELL ({drop_percent}%)")
+            return
 
-            # ২. স্ক্যান করার পেয়ার লিস্ট
-            top_symbols = get_top_150_usdt_pairs()
+        # Bollinger Upper Band হিট করলে (টেক-প্রফিট)
+        upper_b = df.iloc[-1]['upper_band']
+        if current_close >= upper_b:
+            logging.info(f"TAKE PROFIT HIT: {symbol} | Current: {current_close} >= Upper BB: {upper_b}")
+            execute_market_sell(symbol, qty, reason="TAKE PROFIT SELL")
+            return
 
-            for symbol in top_symbols:
-                # IP Ban সুরক্ষার জন্য প্রতি রিকোয়েস্টের মাঝে ০.৮ সেকেন্ডের বিরতি
-                time.sleep(0.8)
+    # ২. নতুন বায় সিগন্যাল চেকিং
+    if symbol not in active_positions:
+        last_closed_candle = df.iloc[-2]  # আগের বন্ধ হওয়া ৫ মিনিটের ক্যান্ডেল
+        open_p = last_closed_candle['open']
+        close_p = last_closed_candle['close']
+        high_p = last_closed_candle['high']
+        lower_b = last_closed_candle['lower_band']
+        ema5_p = last_closed_candle['ema5']
 
-                df = get_klines_bb_and_ema(symbol)
-                if df is None or len(df) < 20:
-                    continue
+        # বায় করার ৩টি শর্তাবলি:
+        # ১. Open < Lower Band
+        # ২. Close > Lower Band
+        # ৩. High < EMA5 (EMA5 না স্পর্শ করে সম্পূর্ণ নিচে থাকতে হবে)
+        if (open_p < lower_b) and (close_p > lower_b) and (high_p < ema5_p):
+            logging.info(f"BUY SIGNAL FOUND: {symbol} | Open: {open_p}, Close: {close_p}, High: {high_p}, Lower BB: {lower_b}, EMA5: {ema5_p}")
+            try:
+                order = client.order_market_buy(
+                    symbol=symbol,
+                    quoteOrderQty=TRADE_AMOUNT_USDT
+                )
+                executed_qty = float(order['executedQty'])
+                cummulative_quote_qty = float(order['cummulativeQuoteQty'])
+                
+                actual_entry_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else current_close
 
-                last_candle = df.iloc[-2]
-                open_p = last_candle['open']
-                close_p = last_candle['close']
-                high_p = last_candle['high']
-                lower_b = last_candle['lower_band']
-                ema5_p = last_candle['ema5']
+                active_positions[symbol] = {
+                    'qty': executed_qty,
+                    'entry_price': actual_entry_price
+                }
+                logging.info(f"SUCCESSFUL BUY: {symbol} | Entry Price: {actual_entry_price}")
+            except Exception as e:
+                logging.error(f"Buy Order Failed for {symbol}: {e}")
 
-                # বায় করার শর্তাবলি:
-                # ১. Open < Lower Band
-                # ২. Close > Lower Band
-                # ৩. ক্যান্ডেল EMA5 এর নিচে থাকতে হবে এবং High প্রাইস EMA5 টাচ করতে পারবে না (high_p < ema5_p)
-                if symbol not in active_positions:
-                    if (open_p < lower_b) and (close_p > lower_b) and (high_p < ema5_p):
-                        logging.info(f"BUY SIGNAL FOUND: {symbol} | Open: {open_p}, Close: {close_p}, High: {high_p}, Lower BB: {lower_b}, EMA5: {ema5_p}")
-                        
-                        try:
-                            order = client.order_market_buy(
-                                symbol=symbol,
-                                quoteOrderQty=TRADE_AMOUNT_USDT
-                            )
-                            executed_qty = float(order['executedQty'])
-                            cummulative_quote_qty = float(order['cummulativeQuoteQty'])
-                            
-                            actual_entry_price = cummulative_quote_qty / executed_qty if executed_qty > 0 else float(df.iloc[-1]['close'])
-                            calculated_stop_loss = actual_entry_price * (1 - STOP_LOSS_PERCENT)
+def handle_socket_message(ws_client, message):
+    """WebSocket থেকে লাইভ ক্যান্ডেল ডাটা পাওয়ার সাথে সাথে প্রসেসিং"""
+    try:
+        data = json.loads(message)
+        if 'data' in data and 'k' in data['data']:
+            kline = data['data']['k']
+            symbol = kline['s']
+            
+            candle = {
+                'timestamp': kline['t'],
+                'open': float(kline['o']),
+                'high': float(kline['h']),
+                'low': float(kline['l']),
+                'close': float(kline['c']),
+                'is_closed': kline['x']
+            }
 
-                            active_positions[symbol] = {
-                                'qty': executed_qty,
-                                'entry_price': actual_entry_price,
-                                'stop_loss_price': calculated_stop_loss
-                            }
-                            logging.info(f"SUCCESSFUL BUY: Bought {executed_qty} of {symbol} at avg price: {actual_entry_price} | 1% Stop Loss: {calculated_stop_loss}")
-                        except Exception as e:
-                            logging.error(f"Buy Failed for {symbol}: {e}")
+            if symbol not in candles_history:
+                candles_history[symbol] = []
 
-            # লুপ শেষে ১০ সেকেন্ড বিরতি
-            time.sleep(CHECK_INTERVAL_SECONDS)
+            # মেমোরিতে ক্যান্ডেল ডাটা স্টোর রাখা
+            if candle['is_closed']:
+                candles_history[symbol].append(candle)
+                if len(candles_history[symbol]) > 25:
+                    candles_history[symbol].pop(0)
 
-        except Exception as e:
-            logging.error(f"Global Loop Error: {e}")
-            time.sleep(15)
+            # যথেষ্ট ক্যান্ডেল ডাটা থাকলে ইন্ডিকেটর হিসেব করা
+            if len(candles_history[symbol]) >= 20:
+                df = pd.DataFrame(candles_history[symbol])
+                sma = df['close'].rolling(window=20).mean()
+                std = df['close'].rolling(window=20).std()
+                df['lower_band'] = sma - (std * 2)
+                df['upper_band'] = sma + (std * 2)
+                df['ema5'] = df['close'].ewm(span=5, adjust=False).mean()
+
+                process_klines_and_signal(symbol, df, candle['close'])
+
+    except Exception as e:
+        logging.error(f"Error handling websocket msg: {e}")
+
+def start_websocket_listener():
+    """সবগুলো টোকেনের জন্য WebSocket Stream সাবস্ক্রাইব করা"""
+    ws_client = SpotWebsocketStreamClient(on_message=handle_socket_message)
+    
+    # 5-minute kline stream subscription for top 150 symbols
+    streams = [f"{symbol.lower()}@kline_5m" for symbol in top_pairs_list]
+    
+    # ১৫০টি পেয়ারকে ছোট ব্যাচে ভাগ করে সাবস্ক্রাইব করানো
+    batch_size = 50
+    for i in range(0, len(streams), batch_size):
+        sub_streams = streams[i:i + batch_size]
+        ws_client.subscribe(stream=sub_streams)
+        time.sleep(1)
+
+    logging.info("WebSocket Stream Successfully Connected and Listening...")
 
 if __name__ == "__main__":
+    # ১. পোর্ট বাইন্ডিংয়ের জন্য Flask থ্রেড চালু
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    trading_loop()
+    # ২. টপ ১৫০ পেয়ার লিস্ট প্রস্তুত করা
+    init_top_150_pairs()
+
+    # ৩. WebSocket দিয়ে রিয়েল-টাইম ডাটা ট্র্যাকিং চালু
+    start_websocket_listener()
