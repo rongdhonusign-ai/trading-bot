@@ -5,9 +5,17 @@ import threading
 import json
 from flask import Flask
 from binance.client import Client
-from binance.ws.spot_websocket import SpotWebsocketStreamClient
 from binance.exceptions import BinanceAPIException
 import pandas as pd
+
+# WebSocket Import Error সমাধান করার ফ্রেমওয়ার্ক
+try:
+    from binance.ws.spot_websocket import SpotWebsocketStreamClient
+except ImportError:
+    try:
+        from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+    except ImportError:
+        from binance.spot import SpotWebsocketStreamClient
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -79,7 +87,7 @@ def execute_market_sell(symbol, qty, reason="SELL"):
         precision = len(str(step_size).split('.')[1]) if '.' in str(step_size) else 0
         adjusted_qty = round(adjusted_qty, precision)
 
-        # স্লিপেজে অর্ডার আটকে না থাকার জন্য ১০ বার দ্রুত ০.২ সেকেন্ড পর পর রিট্রাই করবে
+        # স্লিপেজে অর্ডার আটকে না থাকার জন্য ১০ বার ব্যাক-টু-ব্যাক রিট্রাই করবে
         for attempt in range(10):
             try:
                 sell_order = client.order_market_sell(
@@ -109,7 +117,7 @@ def process_klines_and_signal(symbol, df, current_close):
         qty = active_positions[symbol]['qty']
         
         # ১.০% থেকে ১.১% স্লিপেজ উইন্ডো হিসেব
-        stop_loss_trigger = entry_price * (1 - 0.010)  # ১.০% ড্রপ হলে সেল শুরু
+        stop_loss_trigger = entry_price * (1 - 0.010)
 
         # ১.০% ড্রপ করা মাত্রই মার্কেট সেল হিট করবে
         if current_close <= stop_loss_trigger:
@@ -135,10 +143,10 @@ def process_klines_and_signal(symbol, df, current_close):
         lower_b = last_closed_candle['lower_band']
         ema5_p = last_closed_candle['ema5']
 
-        # বায় করার ৩টি শর্তাবলি:
+        # বায় করার শর্তাবলি:
         # ১. Open < Lower Band
         # ২. Close > Lower Band
-        # ৩. High < EMA5 (EMA5 না স্পর্শ করে সম্পূর্ণ নিচে থাকতে হবে)
+        # ৩. High < EMA5 (EMA5 স্পর্শ না করে সম্পূর্ণ নিচে অবস্থান)
         if (open_p < lower_b) and (close_p > lower_b) and (high_p < ema5_p):
             logging.info(f"BUY SIGNAL FOUND: {symbol} | Open: {open_p}, Close: {close_p}, High: {high_p}, Lower BB: {lower_b}, EMA5: {ema5_p}")
             try:
@@ -160,7 +168,7 @@ def process_klines_and_signal(symbol, df, current_close):
                 logging.error(f"Buy Order Failed for {symbol}: {e}")
 
 def handle_socket_message(ws_client, message):
-    """WebSocket থেকে লাইভ ক্যান্ডেল ডাটা পাওয়ার সাথে সাথে প্রসেসিং"""
+    """WebSocket থেকে লাইভ ক্যান্ডেল ডাটা প্রসেসিং"""
     try:
         data = json.loads(message)
         if 'data' in data and 'k' in data['data']:
@@ -206,7 +214,7 @@ def start_websocket_listener():
     # 5-minute kline stream subscription for top 150 symbols
     streams = [f"{symbol.lower()}@kline_5m" for symbol in top_pairs_list]
     
-    # ১৫০টি পেয়ারকে ছোট ব্যাচে ভাগ করে সাবস্ক্রাইব করানো
+    # ১৫০টি পেয়ারকে ছোট ছোট ব্যাচে ভাগ করে সাবস্ক্রাইব করা
     batch_size = 50
     for i in range(0, len(streams), batch_size):
         sub_streams = streams[i:i + batch_size]
@@ -224,5 +232,5 @@ if __name__ == "__main__":
     # ২. টপ ১৫০ পেয়ার লিস্ট প্রস্তুত করা
     init_top_150_pairs()
 
-    # ৩. WebSocket দিয়ে রিয়েল-টাইম ডাটা ট্র্যাকিং চালু
+    # ৩. WebSocket চালু
     start_websocket_listener()
