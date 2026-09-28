@@ -1,5 +1,5 @@
-Flask
 python-binance
-pandas
 websockets
+pandas
+numpy
 requests
