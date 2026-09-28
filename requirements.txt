@@ -1,5 +1,4 @@
 python-binance
 pandas
-Flask
-requests
+flask
 websocket-client
