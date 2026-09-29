@@ -34,6 +34,7 @@ BB_PERIOD = 20
 BB_STD = 2.0
 
 EMA_PERIOD = 5
+SMA_PERIOD = 20
 
 # 1% STOP LOSS
 STOP_LOSS_PCT = 0.010
@@ -618,6 +619,10 @@ def calculate_indicators(df):
         adjust=False
     ).mean()
 
+    sma20 = close.rolling(
+        SMA_PERIOD
+    ).mean()
+
     df["bb_middle"] = middle
 
     df["bb_upper"] = upper
@@ -625,6 +630,7 @@ def calculate_indicators(df):
     df["bb_lower"] = lower
 
     df["ema5"] = ema5
+    df["sma20"] = sma20
 
     return df
 
@@ -946,7 +952,9 @@ def buy_symbol(symbol):
 
                 "buy_order_id": order["orderId"],
 
-                "buy_time": time.time()
+                "buy_time": time.time(),
+                "sma20_touched": False,
+                "sma20_touch_price": None
             }
 
         log.info(
@@ -1304,7 +1312,8 @@ def sell_symbol(
 def check_position(
     symbol,
     current_price,
-    upper_band
+    upper_band,
+    sma20
 ):
 
     with state_lock:
@@ -1340,6 +1349,54 @@ def check_position(
         )
 
         return
+
+    # --------------------------------------------------------
+    # SMA20 TOUCH -> 1% DROP EXIT
+    # --------------------------------------------------------
+    # After BUY, wait until live price touches/crosses SMA20.
+    # The first live price at the touch is saved.
+    # If price then drops 1% from that touch price,
+    # execute a MARKET SELL immediately.
+
+    if sma20 is not None:
+
+        sma20 = float(sma20)
+
+        if not position.get("sma20_touched", False):
+
+            # The entry strategy buys below SMA20 in normal conditions.
+            # Therefore a touch/cross is detected when live price
+            # reaches or moves above SMA20.
+            if current_price >= sma20:
+
+                with state_lock:
+                    if symbol in positions:
+                        positions[symbol]["sma20_touched"] = True
+                        positions[symbol]["sma20_touch_price"] = current_price
+
+                log.warning(
+                    "SMA20 TOUCHED -> %s | sma20=%.12f | touch_price=%.12f",
+                    symbol,
+                    sma20,
+                    current_price
+                )
+
+        else:
+
+            touch_price = position.get("sma20_touch_price")
+
+            if touch_price is not None:
+
+                sma20_drop_price = float(touch_price) * 0.99
+
+                if current_price <= sma20_drop_price:
+
+                    sell_symbol(
+                        symbol,
+                        "SMA20 TOUCH THEN 1% DROP"
+                    )
+
+                    return
 
     # --------------------------------------------------------
     # UPPER BB EXIT
@@ -1579,6 +1636,7 @@ def process_ticker(
         return
 
     upper_band = None
+    sma20 = None
 
     if (
         df is not None
@@ -1598,6 +1656,14 @@ def process_ticker(
                     last["bb_upper"]
                 )
 
+            if not pd.isna(
+                last["sma20"]
+            ):
+
+                sma20 = float(
+                    last["sma20"]
+                )
+
         except Exception:
 
             pass
@@ -1605,7 +1671,8 @@ def process_ticker(
     check_position(
         symbol,
         price,
-        upper_band
+        upper_band,
+        sma20
     )
 
 
@@ -1893,6 +1960,7 @@ def position_safety_loop():
                         )
 
                     upper = None
+                    sma20 = None
 
                     if (
                         df is not None
@@ -1912,6 +1980,14 @@ def position_safety_loop():
                                     last["bb_upper"]
                                 )
 
+                            if not pd.isna(
+                                last["sma20"]
+                            ):
+
+                                sma20 = float(
+                                    last["sma20"]
+                                )
+
                         except Exception:
 
                             pass
@@ -1919,7 +1995,8 @@ def position_safety_loop():
                     check_position(
                         symbol,
                         price,
-                        upper
+                        upper,
+                        sma20
                     )
 
                 except Exception as e:
