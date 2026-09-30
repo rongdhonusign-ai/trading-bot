@@ -30,13 +30,25 @@ TRADE_AMOUNT_USDT = 35.0
 
 TIMEFRAME = "5m"
 
-BB_PERIOD = 20
+
+# ============================================================
+# BOLLINGER BAND SETTINGS
+# ============================================================
+
+BB_PERIOD = 49
 BB_STD = 2.0
-EMA_PERIOD = 5
 
 
 # ============================================================
-# NEW SELL SETTINGS
+# RSI SETTINGS
+# ============================================================
+
+RSI_PERIOD = 3
+RSI_BUY_LEVEL = 10.0
+
+
+# ============================================================
+# SELL SETTINGS
 # ============================================================
 
 # BUY price থেকে 0.30% নিচে গেলে initial stop loss
@@ -144,9 +156,15 @@ def home():
 
     return jsonify({
         "status": "running",
-        "bot": "BB20 EMA5 Spot Bot",
+        "bot": "BB49(2) + RSI3 Spot Bot",
         "timeframe": TIMEFRAME,
         "trade_amount": TRADE_AMOUNT_USDT,
+
+        "bollinger_period": BB_PERIOD,
+        "bollinger_std": BB_STD,
+
+        "rsi_period": RSI_PERIOD,
+        "rsi_buy_level": RSI_BUY_LEVEL,
 
         "initial_stop_loss":
             f"{INITIAL_STOP_LOSS_PCT * 100:.2f}%",
@@ -604,6 +622,10 @@ def calculate_indicators(df):
 
     close = df["close"]
 
+    # --------------------------------------------------------
+    # Bollinger Band 49,2
+    # --------------------------------------------------------
+
     middle = close.rolling(
         BB_PERIOD
     ).mean()
@@ -624,18 +646,56 @@ def calculate_indicators(df):
         (BB_STD * std)
     )
 
-    ema5 = close.ewm(
-        span=EMA_PERIOD,
-        adjust=False
-    ).mean()
-
     df["bb_middle"] = middle
 
     df["bb_upper"] = upper
 
     df["bb_lower"] = lower
 
-    df["ema5"] = ema5
+    # --------------------------------------------------------
+    # RSI 3
+    # --------------------------------------------------------
+
+    delta = close.diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False,
+        min_periods=RSI_PERIOD
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False,
+        min_periods=RSI_PERIOD
+    ).mean()
+
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            float("nan")
+        )
+    )
+
+    rsi = 100 - (
+        100 / (1 + rs)
+    )
+
+    # Handle cases where loss is zero
+    rsi = rsi.fillna(
+        100
+    )
+
+    df["rsi3"] = rsi
 
     return df
 
@@ -656,8 +716,7 @@ def entry_signal(df):
 
     required = [
         "bb_lower",
-        "bb_upper",
-        "ema5"
+        "rsi3"
     ]
 
     if any(
@@ -665,14 +724,6 @@ def entry_signal(df):
         for x in required
     ):
         return False
-
-    candle_open = float(
-        candle["open"]
-    )
-
-    candle_high = float(
-        candle["high"]
-    )
 
     candle_close = float(
         candle["close"]
@@ -682,41 +733,52 @@ def entry_signal(df):
         candle["bb_lower"]
     )
 
-    ema5 = float(
-        candle["ema5"]
+    rsi3 = float(
+        candle["rsi3"]
     )
 
-    # Candle OPEN below Lower BB
+    # --------------------------------------------------------
+    # BUY CONDITION 1
+    #
+    # Closed candle CLOSE must be below
+    # Bollinger Band (49,2) Lower Band
+    # --------------------------------------------------------
 
     condition_1 = (
-        candle_open < lower_bb
+        candle_close < lower_bb
     )
 
-    # Candle CLOSE above Lower BB
+    # --------------------------------------------------------
+    # BUY CONDITION 2
+    #
+    # RSI(3) must be below 10
+    # --------------------------------------------------------
 
     condition_2 = (
-        candle_close > lower_bb
+        rsi3 < RSI_BUY_LEVEL
     )
 
-    # Candle CLOSE below EMA5
+    # --------------------------------------------------------
+    # BOTH CONDITIONS MUST BE TRUE
+    # --------------------------------------------------------
 
-    condition_3 = (
-        candle_close < ema5
-    )
-
-    # Candle HIGH below EMA5
-    # Candle must not touch EMA5
-
-    condition_4 = (
-        candle_high < ema5
-    )
-
-    return (
+    signal = (
         condition_1
         and condition_2
-        and condition_3
-        and condition_4
     )
+
+    if signal:
+
+        log.warning(
+            "BUY SIGNAL CONFIRMED → %s | "
+            "Close=%.12f | BB49 Lower=%.12f | RSI3=%.4f",
+            df.iloc[-1].get("symbol", ""),
+            candle_close,
+            lower_bb,
+            rsi3
+        )
+
+    return signal
 
 
 # ============================================================
@@ -741,7 +803,7 @@ def load_initial_candles():
             klines = client.get_klines(
                 symbol=symbol,
                 interval=Client.KLINE_INTERVAL_5MINUTE,
-                limit=60
+                limit=100
             )
 
             rows = []
@@ -833,7 +895,7 @@ def buy_symbol(symbol):
 
     try:
 
-        log.info(
+        log.warning(
             "BUY SIGNAL → %s | $%.2f",
             symbol,
             TRADE_AMOUNT_USDT
@@ -936,10 +998,6 @@ def buy_symbol(symbol):
 
         # ----------------------------------------------------
         # POSITION
-        #
-        # highest_price = entry price initially
-        #
-        # trailing_active = False
         # ----------------------------------------------------
 
         with state_lock:
@@ -963,8 +1021,13 @@ def buy_symbol(symbol):
                 "buy_time": time.time()
             }
 
-        log.info(
-            "BUY FILLED → %s | qty=%.12f | entry=%.12f | initial_stop=%.12f | trailing_activation=%.12f | order=%s",
+        log.warning(
+            "BUY FILLED → %s | "
+            "qty=%.12f | "
+            "entry=%.12f | "
+            "initial_stop=%.12f | "
+            "trailing_activation=%.12f | "
+            "order=%s",
 
             symbol,
 
@@ -1010,10 +1073,6 @@ def sell_symbol(
     symbol,
     reason
 ):
-
-    # --------------------------------------------------------
-    # Lock position before REST requests.
-    # --------------------------------------------------------
 
     with state_lock:
 
@@ -1153,7 +1212,8 @@ def sell_symbol(
             ):
 
                 log.error(
-                    "SELL notional too small → %s | value=%.8f | minimum=%.8f",
+                    "SELL notional too small → %s | "
+                    "value=%.8f | minimum=%.8f",
                     symbol,
                     notional,
                     min_notional
@@ -1207,7 +1267,8 @@ def sell_symbol(
         )
 
         log.warning(
-            "SELL ORDER RESULT → %s | status=%s | executed=%.12f | order=%s",
+            "SELL ORDER RESULT → %s | "
+            "status=%s | executed=%.12f | order=%s",
             symbol,
             status,
             executed_qty,
@@ -1253,7 +1314,8 @@ def sell_symbol(
                     )
 
             log.warning(
-                "PARTIAL SELL → %s | sold=%.12f | remaining=%.12f",
+                "PARTIAL SELL → %s | "
+                "sold=%.12f | remaining=%.12f",
                 symbol,
                 executed_qty,
                 remaining
@@ -1413,7 +1475,11 @@ def check_position(
                     ] = trailing_stop
 
             log.warning(
-                "TRAILING ACTIVATED → %s | entry=%.12f | current=%.12f | highest=%.12f | trailing_stop=%.12f",
+                "TRAILING ACTIVATED → %s | "
+                "entry=%.12f | "
+                "current=%.12f | "
+                "highest=%.12f | "
+                "trailing_stop=%.12f",
 
                 symbol,
 
@@ -1463,7 +1529,8 @@ def check_position(
                     ] = trailing_stop
 
             log.info(
-                "TRAILING UPDATE → %s | highest=%.12f | stop=%.12f",
+                "TRAILING UPDATE → %s | "
+                "highest=%.12f | stop=%.12f",
 
                 symbol,
 
@@ -1673,6 +1740,21 @@ def process_kline(
 
             if entry_signal(df):
 
+                # Extra log for BUY values
+
+                last = df.iloc[-1]
+
+                log.warning(
+                    "BUY CONDITIONS → %s | "
+                    "Close=%.12f | "
+                    "BB49 Lower=%.12f | "
+                    "RSI3=%.4f",
+                    symbol,
+                    float(last["close"]),
+                    float(last["bb_lower"]),
+                    float(last["rsi3"])
+                )
+
                 buy_symbol(
                     symbol
                 )
@@ -1721,9 +1803,7 @@ def process_ticker(
         return
 
     # ========================================================
-    # IMPORTANT:
-    #
-    # SELL conditions use LIVE market price.
+    # SELL CONDITIONS USE LIVE MARKET PRICE
     #
     # No need to wait for 5m candle close.
     # ========================================================
@@ -1931,10 +2011,17 @@ def recover_positions():
                     recovered += 1
 
             log.warning(
-                "RECOVERED BALANCE → %s | free=%.12f | price=%.12f | value=%.2f",
+                "RECOVERED BALANCE → %s | "
+                "free=%.12f | "
+                "price=%.12f | "
+                "value=%.2f",
+
                 symbol,
+
                 free,
+
                 current_price,
+
                 value
             )
 
@@ -2061,11 +2148,20 @@ def start_bot():
     )
 
     log.info(
-        "BB20 + EMA5 BINANCE SPOT BOT STARTING"
+        "BB49(2) + RSI3 BINANCE SPOT BOT STARTING"
     )
 
     log.info(
         "=" * 70
+    )
+
+    log.info(
+        "BUY RULE → CLOSE BELOW BB49 LOWER + RSI3 < 10"
+    )
+
+    log.info(
+        "TRADE AMOUNT = %.2f USDT",
+        TRADE_AMOUNT_USDT
     )
 
     log.info(
