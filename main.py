@@ -51,12 +51,12 @@ RSI_BUY_LEVEL = 10.0
 # SELL SETTINGS
 # ============================================================
 
-# BUY price থেকে 0.30% নিচে গেলে initial stop loss
-INITIAL_STOP_LOSS_PCT = 0.003
+# BUY price থেকে 1.00% নিচে গেলে initial stop loss
+INITIAL_STOP_LOSS_PCT = 0.01
 
 
-# BUY price থেকে 1.50% উপরে গেলে trailing stop চালু হবে
-TRAILING_ACTIVATION_PCT = 0.015
+# BUY price থেকে 2.00% উপরে গেলে trailing stop চালু হবে
+TRAILING_ACTIVATION_PCT = 0.02
 
 
 # Highest price থেকে 0.30% নিচে গেলে SELL
@@ -1394,7 +1394,7 @@ def check_position(
         )
 
     # ========================================================
-    # 1. INITIAL STOP LOSS
+    # 1. INITIAL STOP LOSS = 1.00%
     # ========================================================
 
     initial_stop_price = (
@@ -1406,7 +1406,7 @@ def check_position(
     )
 
     # ========================================================
-    # 2. TRAILING ACTIVATION PRICE
+    # 2. TRAILING ACTIVATION = 2.00%
     # ========================================================
 
     trailing_activation_price = (
@@ -1440,7 +1440,7 @@ def check_position(
             return
 
         # ----------------------------------------------------
-        # Activate trailing at +1.50%
+        # Activate trailing at +2.00%
         # ----------------------------------------------------
 
         if current_price >= trailing_activation_price:
@@ -1740,8 +1740,6 @@ def process_kline(
 
             if entry_signal(df):
 
-                # Extra log for BUY values
-
                 last = df.iloc[-1]
 
                 log.warning(
@@ -1749,9 +1747,13 @@ def process_kline(
                     "Close=%.12f | "
                     "BB49 Lower=%.12f | "
                     "RSI3=%.4f",
+
                     symbol,
+
                     float(last["close"]),
+
                     float(last["bb_lower"]),
+
                     float(last["rsi3"])
                 )
 
