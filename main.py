@@ -44,23 +44,12 @@ BB_STD = 2.0
 # ============================================================
 
 RSI_PERIOD = 3
+
+# BUY যখন RSI3 10-এর নিচে
 RSI_BUY_LEVEL = 10.0
 
-
-# ============================================================
-# SELL SETTINGS
-# ============================================================
-
-# BUY price থেকে 1.00% নিচে গেলে initial stop loss
-INITIAL_STOP_LOSS_PCT = 0.01
-
-
-# BUY price থেকে 2.00% উপরে গেলে trailing stop চালু হবে
-TRAILING_ACTIVATION_PCT = 0.02
-
-
-# Highest price থেকে 0.30% নিচে গেলে SELL
-TRAILING_STOP_PCT = 0.003
+# SELL যখন RSI3 80-এর উপরে CROSS করবে
+RSI_SELL_LEVEL = 80.0
 
 
 # ============================================================
@@ -157,23 +146,28 @@ def home():
     return jsonify({
         "status": "running",
         "bot": "BB49(2) + RSI3 Spot Bot",
+
         "timeframe": TIMEFRAME,
+
         "trade_amount": TRADE_AMOUNT_USDT,
 
         "bollinger_period": BB_PERIOD,
         "bollinger_std": BB_STD,
 
         "rsi_period": RSI_PERIOD,
-        "rsi_buy_level": RSI_BUY_LEVEL,
 
-        "initial_stop_loss":
-            f"{INITIAL_STOP_LOSS_PCT * 100:.2f}%",
+        "rsi_buy_level":
+            f"{RSI_BUY_LEVEL:.2f}",
 
-        "trailing_activation":
-            f"{TRAILING_ACTIVATION_PCT * 100:.2f}%",
+        "rsi_sell_cross_level":
+            f"{RSI_SELL_LEVEL:.2f}",
 
-        "trailing_stop":
-            f"{TRAILING_STOP_PCT * 100:.2f}%"
+        "stop_loss": "DISABLED",
+
+        "trailing_stop": "DISABLED",
+
+        "sell_rule":
+            "CLOSED 5m CANDLE RSI3 CROSS ABOVE 80"
     })
 
 
@@ -372,22 +366,27 @@ def load_exchange_info():
 
             "max_qty": max_qty,
 
-            "market_step_size": market_step_size,
+            "market_step_size":
+                market_step_size,
 
-            "market_min_qty": market_min_qty,
+            "market_min_qty":
+                market_min_qty,
 
-            "market_max_qty": market_max_qty,
+            "market_max_qty":
+                market_max_qty,
 
-            "tick_size": float(
-                price_filter.get(
-                    "tickSize",
-                    0
+            "tick_size":
+                float(
+                    price_filter.get(
+                        "tickSize",
+                        0
+                    )
                 )
-            )
-            if price_filter
-            else 0.000001,
+                if price_filter
+                else 0.000001,
 
-            "min_notional": min_notional
+            "min_notional":
+                min_notional
         }
 
     symbol_info = temp
@@ -691,6 +690,7 @@ def calculate_indicators(df):
     )
 
     # Handle cases where loss is zero
+
     rsi = rsi.fillna(
         100
     )
@@ -701,7 +701,7 @@ def calculate_indicators(df):
 
 
 # ============================================================
-# ENTRY SIGNAL
+# BUY SIGNAL
 # ============================================================
 
 def entry_signal(df):
@@ -771,11 +771,83 @@ def entry_signal(df):
 
         log.warning(
             "BUY SIGNAL CONFIRMED → %s | "
-            "Close=%.12f | BB49 Lower=%.12f | RSI3=%.4f",
-            df.iloc[-1].get("symbol", ""),
+            "Close=%.12f | "
+            "BB49 Lower=%.12f | "
+            "RSI3=%.4f",
+
+            df.iloc[-1].get(
+                "symbol",
+                ""
+            ),
+
             candle_close,
+
             lower_bb,
+
             rsi3
+        )
+
+    return signal
+
+
+# ============================================================
+# SELL SIGNAL
+# ============================================================
+
+def sell_signal(df):
+
+    if df is None:
+        return False
+
+    if len(df) < 2:
+        return False
+
+    previous = df.iloc[-2]
+    current = df.iloc[-1]
+
+    if pd.isna(previous["rsi3"]):
+        return False
+
+    if pd.isna(current["rsi3"]):
+        return False
+
+    previous_rsi = float(
+        previous["rsi3"]
+    )
+
+    current_rsi = float(
+        current["rsi3"]
+    )
+
+    # --------------------------------------------------------
+    # SELL CONDITION
+    #
+    # Previous CLOSED candle RSI3 <= 80
+    # AND
+    # Current CLOSED candle RSI3 > 80
+    #
+    # This means RSI3 CROSS ABOVE 80
+    # --------------------------------------------------------
+
+    signal = (
+        previous_rsi <= RSI_SELL_LEVEL
+        and
+        current_rsi > RSI_SELL_LEVEL
+    )
+
+    if signal:
+
+        log.warning(
+            "SELL SIGNAL CONFIRMED → "
+            "RSI3 CROSS ABOVE %.2f | "
+            "Previous RSI3=%.4f | "
+            "Current RSI3=%.4f",
+
+            RSI_SELL_LEVEL,
+
+            previous_rsi,
+
+            current_rsi
         )
 
     return signal
@@ -812,19 +884,26 @@ def load_initial_candles():
 
                 rows.append({
 
-                    "open_time": int(k[0]),
+                    "open_time":
+                        int(k[0]),
 
-                    "open": float(k[1]),
+                    "open":
+                        float(k[1]),
 
-                    "high": float(k[2]),
+                    "high":
+                        float(k[2]),
 
-                    "low": float(k[3]),
+                    "low":
+                        float(k[3]),
 
-                    "close": float(k[4]),
+                    "close":
+                        float(k[4]),
 
-                    "volume": float(k[5]),
+                    "volume":
+                        float(k[5]),
 
-                    "close_time": int(k[6])
+                    "close_time":
+                        int(k[6])
                 })
 
             df = pd.DataFrame(
@@ -840,7 +919,8 @@ def load_initial_candles():
                 )
 
                 df = df[
-                    df["close_time"] <= current_ms
+                    df["close_time"]
+                    <= current_ms
                 ]
 
             df = calculate_indicators(
@@ -1004,29 +1084,27 @@ def buy_symbol(symbol):
 
             positions[symbol] = {
 
-                "symbol": symbol,
+                "symbol":
+                    symbol,
 
-                "quantity": actual_balance,
+                "quantity":
+                    actual_balance,
 
-                "entry_price": entry_price,
+                "entry_price":
+                    entry_price,
 
-                "highest_price": entry_price,
+                "buy_order_id":
+                    order["orderId"],
 
-                "trailing_active": False,
-
-                "trailing_stop_price": None,
-
-                "buy_order_id": order["orderId"],
-
-                "buy_time": time.time()
+                "buy_time":
+                    time.time()
             }
 
         log.warning(
             "BUY FILLED → %s | "
             "qty=%.12f | "
             "entry=%.12f | "
-            "initial_stop=%.12f | "
-            "trailing_activation=%.12f | "
+            "SELL RULE = RSI3 CROSS ABOVE 80 | "
             "order=%s",
 
             symbol,
@@ -1034,16 +1112,6 @@ def buy_symbol(symbol):
             actual_balance,
 
             entry_price,
-
-            entry_price * (
-                1.0 -
-                INITIAL_STOP_LOSS_PCT
-            ),
-
-            entry_price * (
-                1.0 +
-                TRAILING_ACTIVATION_PCT
-            ),
 
             order.get("orderId")
         )
@@ -1139,9 +1207,14 @@ def sell_symbol(
         )
 
         log.info(
-            "SELL BALANCE → %s | stored=%.12f | free=%.12f",
+            "SELL BALANCE → %s | "
+            "stored=%.12f | "
+            "free=%.12f",
+
             symbol,
+
             stored_quantity,
+
             free_balance
         )
 
@@ -1172,8 +1245,11 @@ def sell_symbol(
         if quantity <= 0:
 
             log.error(
-                "Valid SELL quantity is zero → %s | free=%s",
+                "Valid SELL quantity is zero → "
+                "%s | free=%s",
+
                 symbol,
+
                 free_balance
             )
 
@@ -1213,9 +1289,13 @@ def sell_symbol(
 
                 log.error(
                     "SELL notional too small → %s | "
-                    "value=%.8f | minimum=%.8f",
+                    "value=%.8f | "
+                    "minimum=%.8f",
+
                     symbol,
+
                     notional,
+
                     min_notional
                 )
 
@@ -1230,9 +1310,14 @@ def sell_symbol(
             )
 
         log.warning(
-            "SELL SIGNAL → %s | reason=%s | qty=%.12f",
+            "SELL SIGNAL → %s | "
+            "reason=%s | "
+            "qty=%.12f",
+
             symbol,
+
             reason,
+
             quantity
         )
 
@@ -1268,10 +1353,16 @@ def sell_symbol(
 
         log.warning(
             "SELL ORDER RESULT → %s | "
-            "status=%s | executed=%.12f | order=%s",
+            "status=%s | "
+            "executed=%.12f | "
+            "order=%s",
+
             symbol,
+
             status,
+
             executed_qty,
+
             order_id
         )
 
@@ -1315,17 +1406,24 @@ def sell_symbol(
 
             log.warning(
                 "PARTIAL SELL → %s | "
-                "sold=%.12f | remaining=%.12f",
+                "sold=%.12f | "
+                "remaining=%.12f",
+
                 symbol,
+
                 executed_qty,
+
                 remaining
             )
 
         else:
 
             log.warning(
-                "SELL not filled → %s | status=%s",
+                "SELL not filled → %s | "
+                "status=%s",
+
                 symbol,
+
                 status
             )
 
@@ -1355,219 +1453,6 @@ def sell_symbol(
 
 
 # ============================================================
-# CHECK POSITION
-# ============================================================
-
-def check_position(
-    symbol,
-    current_price
-):
-
-    with state_lock:
-
-        position = positions.get(
-            symbol
-        )
-
-        if not position:
-            return
-
-        if symbol in selling_symbols:
-            return
-
-        entry_price = float(
-            position["entry_price"]
-        )
-
-        highest_price = float(
-            position.get(
-                "highest_price",
-                entry_price
-            )
-        )
-
-        trailing_active = bool(
-            position.get(
-                "trailing_active",
-                False
-            )
-        )
-
-    # ========================================================
-    # 1. INITIAL STOP LOSS = 1.00%
-    # ========================================================
-
-    initial_stop_price = (
-        entry_price *
-        (
-            1.0 -
-            INITIAL_STOP_LOSS_PCT
-        )
-    )
-
-    # ========================================================
-    # 2. TRAILING ACTIVATION = 2.00%
-    # ========================================================
-
-    trailing_activation_price = (
-        entry_price *
-        (
-            1.0 +
-            TRAILING_ACTIVATION_PCT
-        )
-    )
-
-    # ========================================================
-    # IF TRAILING NOT ACTIVE
-    # ========================================================
-
-    if not trailing_active:
-
-        # ----------------------------------------------------
-        # Initial SL
-        # ----------------------------------------------------
-
-        if current_price <= initial_stop_price:
-
-            sell_symbol(
-                symbol,
-                (
-                    f"INITIAL STOP LOSS "
-                    f"{INITIAL_STOP_LOSS_PCT * 100:.2f}%"
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Activate trailing at +2.00%
-        # ----------------------------------------------------
-
-        if current_price >= trailing_activation_price:
-
-            new_highest = max(
-                highest_price,
-                current_price
-            )
-
-            trailing_stop = (
-                new_highest *
-                (
-                    1.0 -
-                    TRAILING_STOP_PCT
-                )
-            )
-
-            with state_lock:
-
-                if symbol in positions:
-
-                    positions[symbol][
-                        "highest_price"
-                    ] = new_highest
-
-                    positions[symbol][
-                        "trailing_active"
-                    ] = True
-
-                    positions[symbol][
-                        "trailing_stop_price"
-                    ] = trailing_stop
-
-            log.warning(
-                "TRAILING ACTIVATED → %s | "
-                "entry=%.12f | "
-                "current=%.12f | "
-                "highest=%.12f | "
-                "trailing_stop=%.12f",
-
-                symbol,
-
-                entry_price,
-
-                current_price,
-
-                new_highest,
-
-                trailing_stop
-            )
-
-            return
-
-    # ========================================================
-    # TRAILING STOP ACTIVE
-    # ========================================================
-
-    if trailing_active:
-
-        # ----------------------------------------------------
-        # Update highest price
-        # ----------------------------------------------------
-
-        if current_price > highest_price:
-
-            highest_price = current_price
-
-            trailing_stop = (
-                highest_price *
-                (
-                    1.0 -
-                    TRAILING_STOP_PCT
-                )
-            )
-
-            with state_lock:
-
-                if symbol in positions:
-
-                    positions[symbol][
-                        "highest_price"
-                    ] = highest_price
-
-                    positions[symbol][
-                        "trailing_stop_price"
-                    ] = trailing_stop
-
-            log.info(
-                "TRAILING UPDATE → %s | "
-                "highest=%.12f | stop=%.12f",
-
-                symbol,
-
-                highest_price,
-
-                trailing_stop
-            )
-
-        else:
-
-            trailing_stop = (
-                highest_price *
-                (
-                    1.0 -
-                    TRAILING_STOP_PCT
-                )
-            )
-
-        # ----------------------------------------------------
-        # TRAILING STOP HIT
-        # ----------------------------------------------------
-
-        if current_price <= trailing_stop:
-
-            sell_symbol(
-                symbol,
-                (
-                    f"TRAILING STOP "
-                    f"{TRAILING_STOP_PCT * 100:.2f}% "
-                    f"FROM HIGH"
-                )
-            )
-
-            return
-
-
-# ============================================================
 # WEBSOCKET URL
 # ============================================================
 
@@ -1583,9 +1468,8 @@ def make_stream_url(
             f"{symbol.lower()}@kline_5m"
         )
 
-        streams.append(
-            f"{symbol.lower()}@miniTicker"
-        )
+        # MiniTicker no longer used for SELL.
+        # Kept for price monitoring if needed later.
 
     stream_string = "/".join(
         streams
@@ -1627,12 +1511,6 @@ def process_ws_message(
                 data
             )
 
-        elif "@miniticker" in stream.lower():
-
-            process_ticker(
-                data
-            )
-
     except Exception as e:
 
         log.warning(
@@ -1660,7 +1538,9 @@ def process_kline(
 
     candle_closed = k["x"]
 
-    # Only CLOSED candles are used for entry.
+    # ========================================================
+    # ONLY CLOSED CANDLES ARE USED
+    # ========================================================
 
     if not candle_closed:
         return
@@ -1669,19 +1549,26 @@ def process_kline(
 
         row = {
 
-            "open_time": int(k["t"]),
+            "open_time":
+                int(k["t"]),
 
-            "open": float(k["o"]),
+            "open":
+                float(k["o"]),
 
-            "high": float(k["h"]),
+            "high":
+                float(k["h"]),
 
-            "low": float(k["l"]),
+            "low":
+                float(k["l"]),
 
-            "close": float(k["c"]),
+            "close":
+                float(k["c"]),
 
-            "volume": float(k["v"]),
+            "volume":
+                float(k["v"]),
 
-            "close_time": int(k["T"])
+            "close_time":
+                int(k["T"])
         }
 
         with state_lock:
@@ -1733,7 +1620,47 @@ def process_kline(
             )
 
         # ====================================================
-        # ENTRY
+        # SELL
+        # ====================================================
+
+        if already_in_position:
+
+            if sell_signal(df):
+
+                last = df.iloc[-1]
+
+                previous = df.iloc[-2]
+
+                log.warning(
+                    "SELL CONDITIONS → %s | "
+                    "Previous RSI3=%.4f | "
+                    "Current RSI3=%.4f | "
+                    "Close=%.12f",
+
+                    symbol,
+
+                    float(
+                        previous["rsi3"]
+                    ),
+
+                    float(
+                        last["rsi3"]
+                    ),
+
+                    float(
+                        last["close"]
+                    )
+                )
+
+                sell_symbol(
+                    symbol,
+                    "RSI3 CROSS ABOVE 80"
+                )
+
+            return
+
+        # ====================================================
+        # BUY
         # ====================================================
 
         if not already_in_position:
@@ -1750,11 +1677,17 @@ def process_kline(
 
                     symbol,
 
-                    float(last["close"]),
+                    float(
+                        last["close"]
+                    ),
 
-                    float(last["bb_lower"]),
+                    float(
+                        last["bb_lower"]
+                    ),
 
-                    float(last["rsi3"])
+                    float(
+                        last["rsi3"]
+                    )
                 )
 
                 buy_symbol(
@@ -1771,56 +1704,20 @@ def process_kline(
 
 
 # ============================================================
-# TICKER PROCESSING
+# POSITION SAFETY MONITOR
 # ============================================================
 
-def process_ticker(
-    data
-):
+def position_safety_loop():
 
-    symbol = data.get(
-        "s"
-    )
+    """
+    Backup monitor.
 
-    if not symbol:
-        return
+    Checks CLOSED 5m candles for the RSI3
+    crossing above 80.
 
-    try:
-
-        price = float(
-            data["c"]
-        )
-
-    except Exception:
-
-        return
-
-    with state_lock:
-
-        position_exists = (
-            symbol in positions
-        )
-
-    if not position_exists:
-        return
-
-    # ========================================================
-    # SELL CONDITIONS USE LIVE MARKET PRICE
-    #
-    # No need to wait for 5m candle close.
-    # ========================================================
-
-    check_position(
-        symbol,
-        price
-    )
-
-
-# ============================================================
-# WEBSOCKET LOOP
-# ============================================================
-
-def websocket_loop():
+    No price-based stop loss.
+    No trailing stop.
+    """
 
     while True:
 
@@ -1828,66 +1725,133 @@ def websocket_loop():
 
             with state_lock:
 
-                symbols = list(
-                    top_symbols
+                current_positions = list(
+                    positions.items()
                 )
 
-            if not symbols:
+            for symbol, position in current_positions:
 
-                log.warning(
-                    "No symbols available for WebSocket"
-                )
+                with state_lock:
+
+                    if symbol in selling_symbols:
+                        continue
+
+                try:
+
+                    klines = client.get_klines(
+                        symbol=symbol,
+                        interval=Client.KLINE_INTERVAL_5MINUTE,
+                        limit=100
+                    )
+
+                    rows = []
+
+                    for k in klines:
+
+                        rows.append({
+
+                            "open_time":
+                                int(k[0]),
+
+                            "open":
+                                float(k[1]),
+
+                            "high":
+                                float(k[2]),
+
+                            "low":
+                                float(k[3]),
+
+                            "close":
+                                float(k[4]),
+
+                            "volume":
+                                float(k[5]),
+
+                            "close_time":
+                                int(k[6])
+                        })
+
+                    df = pd.DataFrame(
+                        rows
+                    )
+
+                    if len(df) > 0:
+
+                        current_ms = int(
+                            time.time() * 1000
+                        )
+
+                        df = df[
+                            df["close_time"]
+                            <= current_ms
+                        ]
+
+                    df = calculate_indicators(
+                        df
+                    )
+
+                    if df is None:
+                        continue
+
+                    with state_lock:
+
+                        candles[symbol] = df
+
+                    if sell_signal(df):
+
+                        sell_symbol(
+                            symbol,
+                            "RSI3 CROSS ABOVE 80"
+                        )
+
+                except Exception as e:
+
+                    log.warning(
+                        "Safety check failed %s: %s",
+                        symbol,
+                        e
+                    )
 
                 time.sleep(
-                    10
+                    0.5
                 )
-
-                continue
-
-            url = make_stream_url(
-                symbols
-            )
-
-            log.info(
-                "Opening combined WebSocket for %s symbols",
-                len(symbols)
-            )
-
-            ws = websocket.WebSocketApp(
-
-                url,
-
-                on_message=lambda ws, msg:
-                    process_ws_message(msg),
-
-                on_error=lambda ws, error:
-                    log.error(
-                        "WebSocket error: %s",
-                        error
-                    ),
-
-                on_close=lambda ws, code, msg:
-                    log.warning(
-                        "WebSocket closed: %s %s",
-                        code,
-                        msg
-                    )
-            )
-
-            ws.run_forever(
-                ping_interval=60,
-                ping_timeout=20
-            )
 
         except Exception as e:
 
             log.exception(
-                "WebSocket loop error: %s",
+                "Safety monitor error: %s",
                 e
             )
 
         time.sleep(
-            5
+            3
+        )
+
+
+# ============================================================
+# SYMBOL REFRESH
+# ============================================================
+
+def symbol_refresh_loop():
+
+    while True:
+
+        try:
+
+            update_top_symbols()
+
+        except Exception as e:
+
+            log.exception(
+                "Symbol refresh error: %s",
+                e
+            )
+
+        # Refresh every 30 minutes
+
+        time.sleep(
+            1800
         )
 
 
@@ -1978,11 +1942,10 @@ def recover_positions():
                 continue
 
             # ------------------------------------------------
-            # Recovery position.
+            # Recovery position
             #
-            # Historical entry price is unknown after restart.
-            # Therefore current price is used as temporary
-            # entry price.
+            # Historical entry price is unknown.
+            # Current price is used only as temporary reference.
             # ------------------------------------------------
 
             with state_lock:
@@ -1991,23 +1954,23 @@ def recover_positions():
 
                     positions[symbol] = {
 
-                        "symbol": symbol,
+                        "symbol":
+                            symbol,
 
-                        "quantity": free,
+                        "quantity":
+                            free,
 
-                        "entry_price": current_price,
+                        "entry_price":
+                            current_price,
 
-                        "highest_price": current_price,
+                        "buy_order_id":
+                            None,
 
-                        "trailing_active": False,
+                        "buy_time":
+                            time.time(),
 
-                        "trailing_stop_price": None,
-
-                        "buy_order_id": None,
-
-                        "buy_time": time.time(),
-
-                        "recovered": True
+                        "recovered":
+                            True
                     }
 
                     recovered += 1
@@ -2028,7 +1991,9 @@ def recover_positions():
             )
 
         log.info(
-            "Position recovery complete → %s positions recovered",
+            "Position recovery complete → "
+            "%s positions recovered",
+
             recovered
         )
 
@@ -2037,105 +2002,6 @@ def recover_positions():
         log.exception(
             "Position recovery error: %s",
             e
-        )
-
-
-# ============================================================
-# POSITION SAFETY MONITOR
-# ============================================================
-
-def position_safety_loop():
-
-    """
-    Backup monitor.
-
-    Checks current open positions.
-
-    Protects against:
-    - WebSocket disconnect
-    - missed ticker
-    - temporary WebSocket failure
-    """
-
-    while True:
-
-        try:
-
-            with state_lock:
-
-                current_positions = list(
-                    positions.items()
-                )
-
-            for symbol, position in current_positions:
-
-                with state_lock:
-
-                    if symbol in selling_symbols:
-                        continue
-
-                try:
-
-                    ticker = client.get_symbol_ticker(
-                        symbol=symbol
-                    )
-
-                    price = float(
-                        ticker["price"]
-                    )
-
-                    check_position(
-                        symbol,
-                        price
-                    )
-
-                except Exception as e:
-
-                    log.warning(
-                        "Safety check failed %s: %s",
-                        symbol,
-                        e
-                    )
-
-                time.sleep(
-                    0.5
-                )
-
-        except Exception as e:
-
-            log.exception(
-                "Safety monitor error: %s",
-                e
-            )
-
-        time.sleep(
-            3
-        )
-
-
-# ============================================================
-# SYMBOL REFRESH
-# ============================================================
-
-def symbol_refresh_loop():
-
-    while True:
-
-        try:
-
-            update_top_symbols()
-
-        except Exception as e:
-
-            log.exception(
-                "Symbol refresh error: %s",
-                e
-            )
-
-        # Refresh every 30 minutes
-
-        time.sleep(
-            1800
         )
 
 
@@ -2162,23 +2028,25 @@ def start_bot():
     )
 
     log.info(
+        "SELL RULE → CLOSED 5m RSI3 CROSS ABOVE 80"
+    )
+
+    log.info(
         "TRADE AMOUNT = %.2f USDT",
         TRADE_AMOUNT_USDT
     )
 
     log.info(
-        "INITIAL STOP LOSS = %.2f%%",
-        INITIAL_STOP_LOSS_PCT * 100
+        "STOP LOSS = DISABLED"
     )
 
     log.info(
-        "TRAILING ACTIVATION = %.2f%%",
-        TRAILING_ACTIVATION_PCT * 100
+        "TRAILING STOP = DISABLED"
     )
 
     log.info(
-        "TRAILING STOP = %.2f%% FROM HIGHEST PRICE",
-        TRAILING_STOP_PCT * 100
+        "RSI SELL CROSS LEVEL = %.2f",
+        RSI_SELL_LEVEL
     )
 
     # --------------------------------------------------------
