@@ -34,8 +34,6 @@ BB_PERIOD = 20
 BB_STD = 2.0
 
 EMA_PERIOD = 5
-
-# Additional entry filters
 EMA_TREND_PERIOD = 50
 
 RSI_PERIOD = 14
@@ -48,11 +46,17 @@ VOLUME_MULTIPLIER = 1.20
 # 1% STOP LOSS
 STOP_LOSS_PCT = 0.010
 
-# Top ALT/USDT pairs
+# Number of top ALT/USDT symbols
 TOP_SYMBOLS = 150
 
-# Safety margin for SELL quantity
+# Safety margin when selling
 SELL_BALANCE_BUFFER = 0.999
+
+# Refresh top symbols every 30 minutes
+SYMBOL_REFRESH_SECONDS = 1800
+
+# WebSocket reconnect interval
+WEBSOCKET_RECONNECT_SECONDS = 5
 
 
 # ============================================================
@@ -116,7 +120,7 @@ log = logging.getLogger("BB_BOT")
 
 
 # ============================================================
-# BINANCE
+# BINANCE CLIENT
 # ============================================================
 
 client = Client(
@@ -139,7 +143,9 @@ def home():
         "bot": "BB20 EMA5 EMA50 RSI14 Volume Spot Bot",
         "timeframe": TIMEFRAME,
         "trade_amount": TRADE_AMOUNT_USDT,
-        "stop_loss": f"{STOP_LOSS_PCT * 100:.2f}%"
+        "stop_loss": f"{STOP_LOSS_PCT * 100:.2f}%",
+        "symbols": len(top_symbols),
+        "positions": len(positions)
     })
 
 
@@ -178,16 +184,17 @@ candles = {}
 
 positions = {}
 
-# Symbols currently being sold
 selling_symbols = set()
 
 state_lock = threading.RLock()
 
 last_top_symbol_update = 0
 
+websocket_restart_event = threading.Event()
+
 
 # ============================================================
-# LOAD EXCHANGE INFORMATION
+# LOAD BINANCE EXCHANGE INFORMATION
 # ============================================================
 
 def load_exchange_info():
@@ -201,17 +208,17 @@ def load_exchange_info():
 
     temp = {}
 
-    for s in info["symbols"]:
+    for s in info.get("symbols", []):
 
-        symbol = s["symbol"]
+        symbol = s.get("symbol")
 
-        if s["status"] != "TRADING":
+        if s.get("status") != "TRADING":
             continue
 
-        if s["quoteAsset"] != "USDT":
+        if s.get("quoteAsset") != "USDT":
             continue
 
-        base = s["baseAsset"]
+        base = s.get("baseAsset")
 
         if base in STABLECOINS:
             continue
@@ -224,28 +231,18 @@ def load_exchange_info():
 
         filters = {
             f["filterType"]: f
-            for f in s["filters"]
+            for f in s.get("filters", [])
         }
 
-        lot_filter = filters.get(
-            "LOT_SIZE"
-        )
+        lot_filter = filters.get("LOT_SIZE")
+        market_lot_filter = filters.get("MARKET_LOT_SIZE")
+        price_filter = filters.get("PRICE_FILTER")
+        min_notional_filter = filters.get("MIN_NOTIONAL")
+        notional_filter = filters.get("NOTIONAL")
 
-        market_lot_filter = filters.get(
-            "MARKET_LOT_SIZE"
-        )
-
-        price_filter = filters.get(
-            "PRICE_FILTER"
-        )
-
-        min_notional_filter = filters.get(
-            "MIN_NOTIONAL"
-        )
-
-        notional_filter = filters.get(
-            "NOTIONAL"
-        )
+        # ----------------------------------------------------
+        # LOT SIZE
+        # ----------------------------------------------------
 
         step_size = 0.000001
         min_qty = 0.0
@@ -274,6 +271,10 @@ def load_exchange_info():
                 )
             )
 
+        # ----------------------------------------------------
+        # MARKET LOT SIZE
+        # ----------------------------------------------------
+
         market_step_size = 0.0
         market_min_qty = 0.0
         market_max_qty = 0.0
@@ -301,6 +302,10 @@ def load_exchange_info():
                 )
             )
 
+        # ----------------------------------------------------
+        # MIN NOTIONAL
+        # ----------------------------------------------------
+
         min_notional = 0.0
 
         if min_notional_filter:
@@ -324,6 +329,10 @@ def load_exchange_info():
                 )
             )
 
+        # ----------------------------------------------------
+        # PRICE TICK
+        # ----------------------------------------------------
+
         tick_size = 0.000001
 
         if price_filter:
@@ -336,21 +345,15 @@ def load_exchange_info():
             )
 
         temp[symbol] = {
-
             "base": base,
-
             "quote": "USDT",
 
             "step_size": step_size,
-
             "min_qty": min_qty,
-
             "max_qty": max_qty,
 
             "market_step_size": market_step_size,
-
             "market_min_qty": market_min_qty,
-
             "market_max_qty": market_max_qty,
 
             "tick_size": tick_size,
@@ -367,7 +370,7 @@ def load_exchange_info():
 
 
 # ============================================================
-# TOP SYMBOLS
+# UPDATE TOP SYMBOLS
 # ============================================================
 
 def update_top_symbols():
@@ -387,7 +390,7 @@ def update_top_symbols():
 
         for ticker in tickers:
 
-            symbol = ticker["symbol"]
+            symbol = ticker.get("symbol")
 
             if symbol not in symbol_info:
                 continue
@@ -395,11 +398,13 @@ def update_top_symbols():
             try:
 
                 quote_volume = float(
-                    ticker["quoteVolume"]
+                    ticker.get(
+                        "quoteVolume",
+                        0
+                    )
                 )
 
             except Exception:
-
                 continue
 
             if quote_volume <= 0:
@@ -419,11 +424,11 @@ def update_top_symbols():
 
         selected = [
             symbol
-            for symbol, volume
-            in candidates[:TOP_SYMBOLS]
+            for symbol, volume in candidates[:TOP_SYMBOLS]
         ]
 
         with state_lock:
+            old_symbols = set(top_symbols)
             top_symbols = selected
 
         last_top_symbol_update = time.time()
@@ -437,6 +442,18 @@ def update_top_symbols():
             "First symbols: %s",
             selected[:15]
         )
+
+        # ----------------------------------------------------
+        # Force WebSocket to refresh if symbols changed
+        # ----------------------------------------------------
+
+        if set(selected) != old_symbols:
+
+            websocket_restart_event.set()
+
+            log.info(
+                "Top symbols changed -> WebSocket refresh requested"
+            )
 
     except Exception as e:
 
@@ -481,7 +498,7 @@ def round_step_quantity(
 
 
 # ============================================================
-# GET VALID MARKET SELL QUANTITY
+# VALID MARKET SELL QUANTITY
 # ============================================================
 
 def get_valid_sell_quantity(
@@ -489,9 +506,7 @@ def get_valid_sell_quantity(
     free_balance
 ):
 
-    info = symbol_info.get(
-        symbol
-    )
+    info = symbol_info.get(symbol)
 
     if not info:
         return 0.0
@@ -542,13 +557,10 @@ def get_valid_sell_quantity(
             market_step
         )
 
-        if market_min > 0:
-
-            if quantity < market_min:
-                return 0.0
+        if market_min > 0 and quantity < market_min:
+            return 0.0
 
         if market_max > 0:
-
             quantity = min(
                 quantity,
                 market_max
@@ -565,13 +577,10 @@ def get_valid_sell_quantity(
             lot_step
         )
 
-        if lot_min > 0:
-
-            if quantity < lot_min:
-                return 0.0
+        if lot_min > 0 and quantity < lot_min:
+            return 0.0
 
         if lot_max > 0:
-
             quantity = min(
                 quantity,
                 lot_max
@@ -601,7 +610,7 @@ def calculate_indicators(df):
     close = df["close"]
 
     # --------------------------------------------------------
-    # Bollinger Bands 20, 2
+    # BOLLINGER BAND 20,2
     # --------------------------------------------------------
 
     middle = close.rolling(
@@ -616,12 +625,12 @@ def calculate_indicators(df):
 
     upper = (
         middle +
-        (BB_STD * std)
+        BB_STD * std
     )
 
     lower = (
         middle -
-        (BB_STD * std)
+        BB_STD * std
     )
 
     # --------------------------------------------------------
@@ -680,7 +689,7 @@ def calculate_indicators(df):
     rsi14 = rsi14.fillna(100)
 
     # --------------------------------------------------------
-    # Volume SMA20
+    # VOLUME SMA20
     # --------------------------------------------------------
 
     volume_sma20 = df["volume"].rolling(
@@ -690,8 +699,10 @@ def calculate_indicators(df):
     df["bb_middle"] = middle
     df["bb_upper"] = upper
     df["bb_lower"] = lower
+
     df["ema5"] = ema5
     df["ema50"] = ema50
+
     df["rsi14"] = rsi14
     df["volume_sma20"] = volume_sma20
 
@@ -770,9 +781,9 @@ def entry_signal(df):
         candle["volume_sma20"]
     )
 
-    # --------------------------------------------------------
-    # ENTRY CONDITIONS
-    # --------------------------------------------------------
+    # ========================================================
+    # BUY CONDITIONS
+    # ========================================================
 
     # 1. Candle OPEN below Lower BB
     condition_1 = (
@@ -790,12 +801,12 @@ def entry_signal(df):
     )
 
     # 4. Candle HIGH below EMA5
-    #    Candle must NOT touch EMA5
+    #    EMA5 must NOT be touched
     condition_4 = (
         candle_high < ema5
     )
 
-    # 5. Price above EMA50
+    # 5. Candle CLOSE above EMA50
     condition_5 = (
         candle_close > ema50
     )
@@ -805,13 +816,10 @@ def entry_signal(df):
         RSI_MIN < rsi14 < RSI_MAX
     )
 
-    # 7. Volume at least 20% above Volume SMA20
+    # 7. Volume 20% above Volume SMA20
     condition_7 = (
         candle_volume >
-        (
-            volume_sma20 *
-            VOLUME_MULTIPLIER
-        )
+        volume_sma20 * VOLUME_MULTIPLIER
     )
 
     all_conditions = (
@@ -866,26 +874,31 @@ def entry_signal(df):
 
 
 # ============================================================
-# INITIAL CANDLES
+# LOAD INITIAL CANDLES
 # ============================================================
 
 def load_initial_candles():
 
     global candles
 
+    with state_lock:
+        symbols = list(top_symbols)
+
     log.info(
         "Loading initial 5m candle data for %s symbols...",
-        len(top_symbols)
+        len(symbols)
     )
 
-    for index, symbol in enumerate(top_symbols):
+    loaded = 0
+
+    for symbol in symbols:
 
         try:
 
             klines = client.get_klines(
                 symbol=symbol,
                 interval=Client.KLINE_INTERVAL_5MINUTE,
-                limit=60
+                limit=100
             )
 
             rows = []
@@ -909,11 +922,12 @@ def load_initial_candles():
                     "close_time": int(k[6])
                 })
 
-            df = pd.DataFrame(
-                rows
-            )
+            df = pd.DataFrame(rows)
 
+            # ------------------------------------------------
             # Remove currently open candle
+            # ------------------------------------------------
+
             if len(df) > 0:
 
                 current_ms = int(
@@ -924,15 +938,14 @@ def load_initial_candles():
                     df["close_time"] <= current_ms
                 ]
 
-            df = calculate_indicators(
-                df
-            )
+            df = calculate_indicators(df)
 
             if df is not None:
 
                 with state_lock:
-
                     candles[symbol] = df
+
+                loaded += 1
 
         except BinanceAPIException as e:
 
@@ -942,9 +955,7 @@ def load_initial_candles():
                 e
             )
 
-            time.sleep(
-                0.15
-            )
+            time.sleep(0.15)
 
         except Exception as e:
 
@@ -956,8 +967,124 @@ def load_initial_candles():
 
     log.info(
         "Initial candle loading complete: %s symbols",
-        len(candles)
+        loaded
     )
+
+
+# ============================================================
+# GET ACTUAL BUY FILL PRICE
+# ============================================================
+
+def get_buy_fill_price(
+    order,
+    symbol,
+    executed_qty
+):
+
+    fills = order.get(
+        "fills",
+        []
+    )
+
+    total_cost = 0.0
+    total_qty = 0.0
+
+    if fills:
+
+        for fill in fills:
+
+            fill_price = float(
+                fill.get(
+                    "price",
+                    0
+                )
+            )
+
+            fill_qty = float(
+                fill.get(
+                    "qty",
+                    0
+                )
+            )
+
+            total_cost += (
+                fill_price *
+                fill_qty
+            )
+
+            total_qty += fill_qty
+
+    if total_qty > 0:
+
+        return (
+            total_cost /
+            total_qty
+        )
+
+    try:
+
+        trades = client.get_my_trades(
+            symbol=symbol,
+            limit=20
+        )
+
+        buy_trades = [
+            t for t in trades
+            if (
+                t.get("isBuyer") is True
+                and
+                float(t.get("qty", 0)) > 0
+            )
+        ]
+
+        if buy_trades:
+
+            total_cost = 0.0
+            total_qty = 0.0
+
+            for trade in buy_trades:
+
+                qty = float(
+                    trade["qty"]
+                )
+
+                price = float(
+                    trade["price"]
+                )
+
+                total_qty += qty
+                total_cost += (
+                    qty * price
+                )
+
+            if total_qty > 0:
+
+                return (
+                    total_cost /
+                    total_qty
+                )
+
+    except Exception as e:
+
+        log.warning(
+            "Could not obtain trade fill price %s: %s",
+            symbol,
+            e
+        )
+
+    try:
+
+        ticker = client.get_symbol_ticker(
+            symbol=symbol
+        )
+
+        return float(
+            ticker["price"]
+        )
+
+    except Exception:
+
+        return 0.0
 
 
 # ============================================================
@@ -976,7 +1103,7 @@ def buy_symbol(symbol):
 
     try:
 
-        log.info(
+        log.warning(
             "BUY SIGNAL -> %s | $%.2f",
             symbol,
             TRADE_AMOUNT_USDT
@@ -993,6 +1120,10 @@ def buy_symbol(symbol):
             quoteOrderQty=TRADE_AMOUNT_USDT
         )
 
+        status = order.get(
+            "status"
+        )
+
         executed_qty = float(
             order.get(
                 "executedQty",
@@ -1000,49 +1131,48 @@ def buy_symbol(symbol):
             )
         )
 
+        order_id = order.get(
+            "orderId"
+        )
+
+        log.info(
+            "BUY ORDER RESULT -> %s | status=%s | executed=%.12f | order=%s",
+            symbol,
+            status,
+            executed_qty,
+            order_id
+        )
+
         if executed_qty <= 0:
 
             log.error(
-                "BUY returned zero quantity: %s",
-                order
+                "BUY returned zero quantity -> %s",
+                symbol
             )
 
             return
 
-        fills = order.get(
-            "fills",
-            []
+        # ----------------------------------------------------
+        # Actual weighted average fill price
+        # ----------------------------------------------------
+
+        entry_price = get_buy_fill_price(
+            order,
+            symbol,
+            executed_qty
         )
 
-        total_cost = 0.0
+        if entry_price <= 0:
 
-        if fills:
-
-            for fill in fills:
-
-                total_cost += (
-                    float(fill["price"])
-                    *
-                    float(fill["qty"])
-                )
-
-        if total_cost > 0:
-
-            entry_price = (
-                total_cost /
-                executed_qty
+            log.error(
+                "Could not determine entry price -> %s",
+                symbol
             )
 
-        else:
-
-            entry_price = float(
-                client.get_symbol_ticker(
-                    symbol=symbol
-                )["price"]
-            )
+            return
 
         # ----------------------------------------------------
-        # Get actual balance after BUY
+        # Get actual free balance
         # ----------------------------------------------------
 
         info = symbol_info.get(
@@ -1065,18 +1195,29 @@ def buy_symbol(symbol):
                         balance["free"]
                     )
 
-                    actual_balance = min(
-                        executed_qty,
-                        free_balance
-                    )
+                    if free_balance > 0:
+
+                        actual_balance = min(
+                            executed_qty,
+                            free_balance
+                        )
 
             except Exception as e:
 
                 log.warning(
-                    "Could not verify post-buy balance %s: %s",
+                    "Post-buy balance check failed %s: %s",
                     symbol,
                     e
                 )
+
+        if actual_balance <= 0:
+
+            log.error(
+                "Actual balance is zero after BUY -> %s",
+                symbol
+            )
+
+            return
 
         with state_lock:
 
@@ -1088,17 +1229,23 @@ def buy_symbol(symbol):
 
                 "entry_price": entry_price,
 
-                "buy_order_id": order["orderId"],
+                "buy_order_id": order_id,
 
                 "buy_time": time.time()
             }
 
-        log.info(
-            "BUY FILLED -> %s | qty=%.12f | entry=%.12f | order=%s",
+        stop_price = (
+            entry_price *
+            (1.0 - STOP_LOSS_PCT)
+        )
+
+        log.warning(
+            "BUY FILLED -> %s | qty=%.12f | entry=%.12f | stop=%.12f | order=%s",
             symbol,
             actual_balance,
             entry_price,
-            order.get("orderId")
+            stop_price,
+            order_id
         )
 
     except BinanceAPIException as e:
@@ -1128,7 +1275,7 @@ def sell_symbol(
 ):
 
     # --------------------------------------------------------
-    # Lock position before REST requests
+    # Lock position
     # --------------------------------------------------------
 
     with state_lock:
@@ -1171,7 +1318,7 @@ def sell_symbol(
         asset = info["base"]
 
         # ----------------------------------------------------
-        # GET REAL BINANCE FREE BALANCE
+        # REAL BINANCE BALANCE
         # ----------------------------------------------------
 
         balance = client.get_asset_balance(
@@ -1205,13 +1352,13 @@ def sell_symbol(
         if free_balance <= 0:
 
             log.error(
-                "No free balance available -> %s",
+                "No free balance -> %s",
                 symbol
             )
 
             return
 
-        # Never sell more than real balance
+        # Never sell more than actual free balance
         quantity_source = min(
             stored_quantity,
             free_balance
@@ -1221,10 +1368,6 @@ def sell_symbol(
             quantity_source *
             SELL_BALANCE_BUFFER
         )
-
-        # ----------------------------------------------------
-        # Correct Binance quantity
-        # ----------------------------------------------------
 
         quantity = get_valid_sell_quantity(
             symbol,
@@ -1241,7 +1384,7 @@ def sell_symbol(
             return
 
         # ----------------------------------------------------
-        # NOTIONAL CHECK
+        # MIN NOTIONAL CHECK
         # ----------------------------------------------------
 
         try:
@@ -1348,7 +1491,7 @@ def sell_symbol(
                 )
 
             log.warning(
-                "POSITION CLOSED -> %s | %s",
+                "POSITION CLOSED -> %s | reason=%s",
                 symbol,
                 reason
             )
@@ -1367,13 +1510,17 @@ def sell_symbol(
 
             with state_lock:
 
-                if remaining > 0:
+                if (
+                    symbol in positions
+                    and
+                    remaining > 0
+                ):
 
                     positions[symbol][
                         "quantity"
                     ] = remaining
 
-                else:
+                elif symbol in positions:
 
                     positions.pop(
                         symbol,
@@ -1390,7 +1537,7 @@ def sell_symbol(
         else:
 
             log.warning(
-                "SELL not filled -> %s | status=%s",
+                "SELL NOT FILLED -> %s | status=%s",
                 symbol,
                 status
             )
@@ -1421,7 +1568,7 @@ def sell_symbol(
 
 
 # ============================================================
-# CHECK POSITION
+# CHECK OPEN POSITION
 # ============================================================
 
 def check_position(
@@ -1446,9 +1593,9 @@ def check_position(
         position["entry_price"]
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # 1% STOP LOSS
-    # --------------------------------------------------------
+    # ========================================================
 
     stop_price = (
         entry_price *
@@ -1464,9 +1611,9 @@ def check_position(
 
         return
 
-    # --------------------------------------------------------
-    # UPPER BB EXIT
-    # --------------------------------------------------------
+    # ========================================================
+    # UPPER BB TOUCH / CROSS
+    # ========================================================
 
     if upper_band is not None:
 
@@ -1477,14 +1624,14 @@ def check_position(
                 "UPPER BB TOUCH"
             )
 
+            return
+
 
 # ============================================================
-# WEBSOCKET URL
+# MAKE WEBSOCKET URL
 # ============================================================
 
-def make_stream_url(
-    symbols
-):
+def make_stream_url(symbols):
 
     streams = []
 
@@ -1512,9 +1659,7 @@ def make_stream_url(
 # WEBSOCKET MESSAGE
 # ============================================================
 
-def process_ws_message(
-    message
-):
+def process_ws_message(message):
 
     try:
 
@@ -1556,22 +1701,21 @@ def process_ws_message(
 # KLINE PROCESSING
 # ============================================================
 
-def process_kline(
-    data
-):
+def process_kline(data):
 
-    k = data.get(
-        "k"
-    )
+    k = data.get("k")
 
     if not k:
         return
 
-    symbol = k["s"]
+    symbol = k.get("s")
 
-    candle_closed = k["x"]
+    if not symbol:
+        return
 
-    # Only closed candles are used for entry
+    candle_closed = k.get("x")
+
+    # Only closed candles are used for BUY
     if not candle_closed:
         return
 
@@ -1623,9 +1767,7 @@ def process_kline(
                 keep="last"
             )
 
-            df = df.tail(
-                100
-            )
+            df = df.tail(100)
 
         df = calculate_indicators(
             df
@@ -1642,9 +1784,9 @@ def process_kline(
                 symbol in positions
             )
 
-        # ----------------------------------------------------
-        # ENTRY
-        # ----------------------------------------------------
+        # ====================================================
+        # BUY
+        # ====================================================
 
         if not already_in_position:
 
@@ -1667,13 +1809,9 @@ def process_kline(
 # TICKER PROCESSING
 # ============================================================
 
-def process_ticker(
-    data
-):
+def process_ticker(data):
 
-    symbol = data.get(
-        "s"
-    )
+    symbol = data.get("s")
 
     if not symbol:
         return
@@ -1722,7 +1860,6 @@ def process_ticker(
                 )
 
         except Exception:
-
             pass
 
     check_position(
@@ -1760,6 +1897,8 @@ def websocket_loop():
 
                 continue
 
+            websocket_restart_event.clear()
+
             url = make_stream_url(
                 symbols
             )
@@ -1769,26 +1908,68 @@ def websocket_loop():
                 len(symbols)
             )
 
+            def on_message(
+                ws,
+                message
+            ):
+                process_ws_message(
+                    message
+                )
+
+            def on_error(
+                ws,
+                error
+            ):
+                log.error(
+                    "WebSocket error: %s",
+                    error
+                )
+
+            def on_close(
+                ws,
+                close_status_code,
+                close_msg
+            ):
+                log.warning(
+                    "WebSocket closed: %s %s",
+                    close_status_code,
+                    close_msg
+                )
+
             ws = websocket.WebSocketApp(
 
                 url,
 
-                on_message=lambda ws, msg:
-                    process_ws_message(msg),
+                on_message=on_message,
 
-                on_error=lambda ws, error:
-                    log.error(
-                        "WebSocket error: %s",
-                        error
-                    ),
+                on_error=on_error,
 
-                on_close=lambda ws, code, msg:
-                    log.warning(
-                        "WebSocket closed: %s %s",
-                        code,
-                        msg
-                    )
+                on_close=on_close
             )
+
+            # ------------------------------------------------
+            # Automatic WebSocket refresh
+            # ------------------------------------------------
+
+            def force_restart():
+
+                time.sleep(
+                    SYMBOL_REFRESH_SECONDS
+                )
+
+                if not websocket_restart_event.is_set():
+
+                    websocket_restart_event.set()
+
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+            threading.Thread(
+                target=force_restart,
+                daemon=True
+            ).start()
 
             ws.run_forever(
                 ping_interval=60,
@@ -1803,7 +1984,7 @@ def websocket_loop():
             )
 
         time.sleep(
-            5
+            WEBSOCKET_RECONNECT_SECONDS
         )
 
 
@@ -1830,17 +2011,28 @@ def recover_positions():
 
         for balance_item in balances:
 
-            asset = balance_item["asset"]
+            asset = balance_item.get(
+                "asset"
+            )
+
+            if not asset:
+                continue
 
             if asset in STABLECOINS:
                 continue
 
             free = float(
-                balance_item["free"]
+                balance_item.get(
+                    "free",
+                    0
+                )
             )
 
             locked = float(
-                balance_item["locked"]
+                balance_item.get(
+                    "locked",
+                    0
+                )
             )
 
             total = (
@@ -1861,17 +2053,16 @@ def recover_positions():
 
             with state_lock:
 
-                is_monitored = (
-                    symbol in top_symbols
-                )
-
-            if not is_monitored:
-                continue
+                if symbol not in top_symbols:
+                    continue
 
             if free <= 0:
                 continue
 
+            # ------------------------------------------------
             # Current price
+            # ------------------------------------------------
+
             try:
 
                 ticker = client.get_symbol_ticker(
@@ -1891,12 +2082,62 @@ def recover_positions():
                 current_price
             )
 
-            # Ignore tiny dust
+            # Ignore dust
             if value < 5.0:
                 continue
 
             # ------------------------------------------------
-            # Position recovery
+            # Try to find recent BUY price
+            # ------------------------------------------------
+
+            entry_price = current_price
+
+            try:
+
+                trades = client.get_my_trades(
+                    symbol=symbol,
+                    limit=50
+                )
+
+                buy_trades = [
+                    t for t in trades
+                    if (
+                        t.get("isBuyer") is True
+                        and
+                        float(
+                            t.get(
+                                "qty",
+                                0
+                            )
+                        ) > 0
+                    )
+                ]
+
+                if buy_trades:
+
+                    # Most recent BUY trade
+                    latest_buy = buy_trades[-1]
+
+                    latest_buy_price = float(
+                        latest_buy["price"]
+                    )
+
+                    if latest_buy_price > 0:
+
+                        entry_price = (
+                            latest_buy_price
+                        )
+
+            except Exception as e:
+
+                log.warning(
+                    "Could not recover historical BUY price %s: %s",
+                    symbol,
+                    e
+                )
+
+            # ------------------------------------------------
+            # Recover position
             # ------------------------------------------------
 
             with state_lock:
@@ -1909,7 +2150,7 @@ def recover_positions():
 
                         "quantity": free,
 
-                        "entry_price": current_price,
+                        "entry_price": entry_price,
 
                         "buy_order_id": None,
 
@@ -1920,11 +2161,17 @@ def recover_positions():
 
                     recovered += 1
 
+            stop_price = (
+                entry_price *
+                (1.0 - STOP_LOSS_PCT)
+            )
+
             log.warning(
-                "RECOVERED BALANCE -> %s | free=%.12f | price=%.12f | value=%.2f",
+                "RECOVERED BALANCE -> %s | qty=%.12f | entry=%.12f | stop=%.12f | value=%.2f",
                 symbol,
                 free,
-                current_price,
+                entry_price,
+                stop_price,
                 value
             )
 
@@ -1948,14 +2195,15 @@ def recover_positions():
 def position_safety_loop():
 
     """
-    Backup monitor.
+    Backup REST monitor.
 
-    Checks only current open positions.
+    Checks open positions every few seconds.
 
     Protects against:
     - WebSocket disconnect
     - missed ticker
     - temporary WebSocket failure
+    - missed 1% stop loss
     """
 
     while True:
@@ -2012,7 +2260,6 @@ def position_safety_loop():
                                 )
 
                         except Exception:
-
                             pass
 
                     check_position(
@@ -2046,7 +2293,7 @@ def position_safety_loop():
 
 
 # ============================================================
-# SYMBOL REFRESH
+# SYMBOL REFRESH LOOP
 # ============================================================
 
 def symbol_refresh_loop():
@@ -2054,6 +2301,10 @@ def symbol_refresh_loop():
     while True:
 
         try:
+
+            time.sleep(
+                SYMBOL_REFRESH_SECONDS
+            )
 
             update_top_symbols()
 
@@ -2063,11 +2314,6 @@ def symbol_refresh_loop():
                 "Symbol refresh error: %s",
                 e
             )
-
-        # Refresh every 30 minutes
-        time.sleep(
-            1800
-        )
 
 
 # ============================================================
@@ -2089,31 +2335,31 @@ def start_bot():
     )
 
     # --------------------------------------------------------
-    # EXCHANGE INFORMATION
+    # Exchange information
     # --------------------------------------------------------
 
     load_exchange_info()
 
     # --------------------------------------------------------
-    # TOP SYMBOLS
+    # Top symbols
     # --------------------------------------------------------
 
     update_top_symbols()
 
     # --------------------------------------------------------
-    # HISTORICAL CANDLES
+    # Initial candle data
     # --------------------------------------------------------
 
     load_initial_candles()
 
     # --------------------------------------------------------
-    # RECOVER POSITIONS
+    # Recover positions
     # --------------------------------------------------------
 
     recover_positions()
 
     # --------------------------------------------------------
-    # FLASK
+    # Flask
     # --------------------------------------------------------
 
     threading.Thread(
@@ -2122,7 +2368,7 @@ def start_bot():
     ).start()
 
     # --------------------------------------------------------
-    # WEBSOCKET
+    # WebSocket
     # --------------------------------------------------------
 
     threading.Thread(
@@ -2131,7 +2377,7 @@ def start_bot():
     ).start()
 
     # --------------------------------------------------------
-    # SYMBOL REFRESH
+    # Symbol refresh
     # --------------------------------------------------------
 
     threading.Thread(
@@ -2140,7 +2386,7 @@ def start_bot():
     ).start()
 
     # --------------------------------------------------------
-    # SAFETY MONITOR
+    # Safety monitor
     # --------------------------------------------------------
 
     threading.Thread(
