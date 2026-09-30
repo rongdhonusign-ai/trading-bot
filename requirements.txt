@@ -1,5 +1,4 @@
 python-binance
 pandas
-flask
 websocket-client
-gunicorn
+Flask
