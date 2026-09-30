@@ -32,18 +32,33 @@ TIMEFRAME = "5m"
 
 BB_PERIOD = 20
 BB_STD = 2.0
-
 EMA_PERIOD = 5
 
-# 1% STOP LOSS
-STOP_LOSS_PCT = 0.005
 
-# Top ALT/USDT pairs
+# ============================================================
+# NEW SELL SETTINGS
+# ============================================================
+
+# BUY price থেকে 0.30% নিচে গেলে initial stop loss
+INITIAL_STOP_LOSS_PCT = 0.003
+
+
+# BUY price থেকে 1.50% উপরে গেলে trailing stop চালু হবে
+TRAILING_ACTIVATION_PCT = 0.015
+
+
+# Highest price থেকে 0.30% নিচে গেলে SELL
+TRAILING_STOP_PCT = 0.003
+
+
+# ============================================================
+# TOP ALT/USDT PAIRS
+# ============================================================
+
 TOP_SYMBOLS = 150
 
-# Safety margin for SELL quantity.
-# This prevents insufficient balance caused by commission
-# or tiny balance differences.
+
+# Safety margin for SELL quantity
 SELL_BALANCE_BUFFER = 0.999
 
 
@@ -132,7 +147,15 @@ def home():
         "bot": "BB20 EMA5 Spot Bot",
         "timeframe": TIMEFRAME,
         "trade_amount": TRADE_AMOUNT_USDT,
-        "stop_loss": f"{STOP_LOSS_PCT * 100:.2f}%"
+
+        "initial_stop_loss":
+            f"{INITIAL_STOP_LOSS_PCT * 100:.2f}%",
+
+        "trailing_activation":
+            f"{TRAILING_ACTIVATION_PCT * 100:.2f}%",
+
+        "trailing_stop":
+            f"{TRAILING_STOP_PCT * 100:.2f}%"
     })
 
 
@@ -173,9 +196,6 @@ candles = {}
 
 positions = {}
 
-# Symbols currently being sold.
-# Prevents WebSocket and safety monitor from
-# selling the same position simultaneously.
 selling_symbols = set()
 
 state_lock = threading.RLock()
@@ -246,9 +266,7 @@ def load_exchange_info():
         )
 
         step_size = 0.000001
-
         min_qty = 0.0
-
         max_qty = 0.0
 
         if lot_filter:
@@ -275,9 +293,7 @@ def load_exchange_info():
             )
 
         market_step_size = 0.0
-
         market_min_qty = 0.0
-
         market_max_qty = 0.0
 
         if market_lot_filter:
@@ -500,7 +516,6 @@ def get_valid_sell_quantity(
         SELL_BALANCE_BUFFER
     )
 
-    # Prefer MARKET_LOT_SIZE when available.
     market_step = info.get(
         "market_step_size",
         0
@@ -531,9 +546,7 @@ def get_valid_sell_quantity(
         0
     )
 
-    # -----------------------------------------
     # MARKET LOT SIZE
-    # -----------------------------------------
 
     if market_step > 0:
 
@@ -554,9 +567,7 @@ def get_valid_sell_quantity(
                 market_max
             )
 
-    # -----------------------------------------
     # LOT SIZE
-    # -----------------------------------------
 
     if lot_step > 0:
 
@@ -675,45 +686,29 @@ def entry_signal(df):
         candle["ema5"]
     )
 
-    # --------------------------------------------------------
-    # USER STRATEGY
-    # --------------------------------------------------------
+    # Candle OPEN below Lower BB
 
-    # Candle OPEN below lower BB
     condition_1 = (
         candle_open < lower_bb
     )
 
-    # Candle CLOSE back above lower BB
+    # Candle CLOSE above Lower BB
+
     condition_2 = (
         candle_close > lower_bb
     )
 
     # Candle CLOSE below EMA5
+
     condition_3 = (
         candle_close < ema5
     )
 
-    # Candle HIGH must stay below EMA5
-    # Therefore candle does not touch EMA5
+    # Candle HIGH below EMA5
+    # Candle must not touch EMA5
+
     condition_4 = (
         candle_high < ema5
-    )
-
-    # Current candle CLOSE must be above the previous candle's BODY.
-    # "Previous candle body" is defined by the higher of previous OPEN/CLOSE.
-    if len(df) < 2:
-        return False
-
-    previous_candle = df.iloc[-2]
-
-    previous_body_high = max(
-        float(previous_candle["open"]),
-        float(previous_candle["close"])
-    )
-
-    condition_5 = (
-        candle_close > previous_body_high
     )
 
     return (
@@ -721,7 +716,6 @@ def entry_signal(df):
         and condition_2
         and condition_3
         and condition_4
-        and condition_5
     )
 
 
@@ -754,12 +748,6 @@ def load_initial_candles():
 
             for k in klines:
 
-                # IMPORTANT:
-                # Ignore currently open candle.
-                #
-                # Binance kline response's final candle
-                # may still be forming.
-
                 rows.append({
 
                     "open_time": int(k[0]),
@@ -782,6 +770,7 @@ def load_initial_candles():
             )
 
             # Remove currently open candle
+
             if len(df) > 0:
 
                 current_ms = int(
@@ -909,7 +898,7 @@ def buy_symbol(symbol):
             )
 
         # ----------------------------------------------------
-        # Get actual balance after BUY
+        # GET ACTUAL BALANCE AFTER BUY
         # ----------------------------------------------------
 
         info = symbol_info.get(
@@ -932,12 +921,6 @@ def buy_symbol(symbol):
                         balance["free"]
                     )
 
-                    # Do not allow actual balance to be
-                    # greater than executed quantity.
-                    #
-                    # This is mainly to keep internal state
-                    # conservative.
-
                     actual_balance = min(
                         executed_qty,
                         free_balance
@@ -951,6 +934,14 @@ def buy_symbol(symbol):
                     e
                 )
 
+        # ----------------------------------------------------
+        # POSITION
+        #
+        # highest_price = entry price initially
+        #
+        # trailing_active = False
+        # ----------------------------------------------------
+
         with state_lock:
 
             positions[symbol] = {
@@ -961,16 +952,36 @@ def buy_symbol(symbol):
 
                 "entry_price": entry_price,
 
+                "highest_price": entry_price,
+
+                "trailing_active": False,
+
+                "trailing_stop_price": None,
+
                 "buy_order_id": order["orderId"],
 
                 "buy_time": time.time()
             }
 
         log.info(
-            "BUY FILLED → %s | qty=%.12f | entry=%.12f | order=%s",
+            "BUY FILLED → %s | qty=%.12f | entry=%.12f | initial_stop=%.12f | trailing_activation=%.12f | order=%s",
+
             symbol,
+
             actual_balance,
+
             entry_price,
+
+            entry_price * (
+                1.0 -
+                INITIAL_STOP_LOSS_PCT
+            ),
+
+            entry_price * (
+                1.0 +
+                TRAILING_ACTIVATION_PCT
+            ),
+
             order.get("orderId")
         )
 
@@ -1001,14 +1012,7 @@ def sell_symbol(
 ):
 
     # --------------------------------------------------------
-    # Lock the position BEFORE doing REST requests.
-    #
-    # This is extremely important.
-    #
-    # WebSocket and safety monitor can both detect STOP LOSS
-    # almost at the same time.
-    #
-    # Only ONE of them is allowed to execute SELL.
+    # Lock position before REST requests.
     # --------------------------------------------------------
 
     with state_lock:
@@ -1091,26 +1095,15 @@ def sell_symbol(
 
             return
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Never try to sell more than actual Binance balance.
-        # ----------------------------------------------------
-
         quantity_source = min(
             stored_quantity,
             free_balance
         )
 
-        # Safety buffer for commission / precision
         quantity = (
             quantity_source *
             SELL_BALANCE_BUFFER
         )
-
-        # ----------------------------------------------------
-        # Correct Binance quantity
-        # ----------------------------------------------------
 
         quantity = get_valid_sell_quantity(
             symbol,
@@ -1221,10 +1214,6 @@ def sell_symbol(
             order_id
         )
 
-        # ----------------------------------------------------
-        # FILLED
-        # ----------------------------------------------------
-
         if status == "FILLED":
 
             with state_lock:
@@ -1239,10 +1228,6 @@ def sell_symbol(
                 symbol,
                 reason
             )
-
-        # ----------------------------------------------------
-        # PARTIALLY FILLED
-        # ----------------------------------------------------
 
         elif status == "PARTIALLY_FILLED":
 
@@ -1300,13 +1285,6 @@ def sell_symbol(
 
     finally:
 
-        # ----------------------------------------------------
-        # Unlock SELL.
-        #
-        # If it failed, the position remains in positions,
-        # so the next safety cycle can try again.
-        # ----------------------------------------------------
-
         with state_lock:
 
             selling_symbols.discard(
@@ -1320,8 +1298,7 @@ def sell_symbol(
 
 def check_position(
     symbol,
-    current_price,
-    upper_band
+    current_price
 ):
 
     with state_lock:
@@ -1336,40 +1313,191 @@ def check_position(
         if symbol in selling_symbols:
             return
 
-    entry_price = float(
-        position["entry_price"]
-    )
-
-    stop_price = (
-        entry_price *
-        (1.0 - STOP_LOSS_PCT)
-    )
-
-    # --------------------------------------------------------
-    # STOP LOSS
-    # --------------------------------------------------------
-
-    if current_price <= stop_price:
-
-        sell_symbol(
-            symbol,
-            f"STOP LOSS {STOP_LOSS_PCT * 100:.2f}%"
+        entry_price = float(
+            position["entry_price"]
         )
 
-        return
+        highest_price = float(
+            position.get(
+                "highest_price",
+                entry_price
+            )
+        )
 
-    # --------------------------------------------------------
-    # UPPER BB EXIT
-    # --------------------------------------------------------
+        trailing_active = bool(
+            position.get(
+                "trailing_active",
+                False
+            )
+        )
 
-    if upper_band is not None:
+    # ========================================================
+    # 1. INITIAL STOP LOSS
+    # ========================================================
 
-        if current_price >= upper_band:
+    initial_stop_price = (
+        entry_price *
+        (
+            1.0 -
+            INITIAL_STOP_LOSS_PCT
+        )
+    )
+
+    # ========================================================
+    # 2. TRAILING ACTIVATION PRICE
+    # ========================================================
+
+    trailing_activation_price = (
+        entry_price *
+        (
+            1.0 +
+            TRAILING_ACTIVATION_PCT
+        )
+    )
+
+    # ========================================================
+    # IF TRAILING NOT ACTIVE
+    # ========================================================
+
+    if not trailing_active:
+
+        # ----------------------------------------------------
+        # Initial SL
+        # ----------------------------------------------------
+
+        if current_price <= initial_stop_price:
 
             sell_symbol(
                 symbol,
-                "UPPER BB TOUCH"
+                (
+                    f"INITIAL STOP LOSS "
+                    f"{INITIAL_STOP_LOSS_PCT * 100:.2f}%"
+                )
             )
+
+            return
+
+        # ----------------------------------------------------
+        # Activate trailing at +1.50%
+        # ----------------------------------------------------
+
+        if current_price >= trailing_activation_price:
+
+            new_highest = max(
+                highest_price,
+                current_price
+            )
+
+            trailing_stop = (
+                new_highest *
+                (
+                    1.0 -
+                    TRAILING_STOP_PCT
+                )
+            )
+
+            with state_lock:
+
+                if symbol in positions:
+
+                    positions[symbol][
+                        "highest_price"
+                    ] = new_highest
+
+                    positions[symbol][
+                        "trailing_active"
+                    ] = True
+
+                    positions[symbol][
+                        "trailing_stop_price"
+                    ] = trailing_stop
+
+            log.warning(
+                "TRAILING ACTIVATED → %s | entry=%.12f | current=%.12f | highest=%.12f | trailing_stop=%.12f",
+
+                symbol,
+
+                entry_price,
+
+                current_price,
+
+                new_highest,
+
+                trailing_stop
+            )
+
+            return
+
+    # ========================================================
+    # TRAILING STOP ACTIVE
+    # ========================================================
+
+    if trailing_active:
+
+        # ----------------------------------------------------
+        # Update highest price
+        # ----------------------------------------------------
+
+        if current_price > highest_price:
+
+            highest_price = current_price
+
+            trailing_stop = (
+                highest_price *
+                (
+                    1.0 -
+                    TRAILING_STOP_PCT
+                )
+            )
+
+            with state_lock:
+
+                if symbol in positions:
+
+                    positions[symbol][
+                        "highest_price"
+                    ] = highest_price
+
+                    positions[symbol][
+                        "trailing_stop_price"
+                    ] = trailing_stop
+
+            log.info(
+                "TRAILING UPDATE → %s | highest=%.12f | stop=%.12f",
+
+                symbol,
+
+                highest_price,
+
+                trailing_stop
+            )
+
+        else:
+
+            trailing_stop = (
+                highest_price *
+                (
+                    1.0 -
+                    TRAILING_STOP_PCT
+                )
+            )
+
+        # ----------------------------------------------------
+        # TRAILING STOP HIT
+        # ----------------------------------------------------
+
+        if current_price <= trailing_stop:
+
+            sell_symbol(
+                symbol,
+                (
+                    f"TRAILING STOP "
+                    f"{TRAILING_STOP_PCT * 100:.2f}% "
+                    f"FROM HIGH"
+                )
+            )
+
+            return
 
 
 # ============================================================
@@ -1466,6 +1594,7 @@ def process_kline(
     candle_closed = k["x"]
 
     # Only CLOSED candles are used for entry.
+
     if not candle_closed:
         return
 
@@ -1536,9 +1665,9 @@ def process_kline(
                 symbol in positions
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # ENTRY
-        # ----------------------------------------------------
+        # ====================================================
 
         if not already_in_position:
 
@@ -1588,41 +1717,20 @@ def process_ticker(
             symbol in positions
         )
 
-        df = candles.get(
-            symbol
-        )
-
     if not position_exists:
         return
 
-    upper_band = None
-
-    if (
-        df is not None
-        and
-        len(df) > 0
-    ):
-
-        try:
-
-            last = df.iloc[-1]
-
-            if not pd.isna(
-                last["bb_upper"]
-            ):
-
-                upper_band = float(
-                    last["bb_upper"]
-                )
-
-        except Exception:
-
-            pass
+    # ========================================================
+    # IMPORTANT:
+    #
+    # SELL conditions use LIVE market price.
+    #
+    # No need to wait for 5m candle close.
+    # ========================================================
 
     check_position(
         symbol,
-        price,
-        upper_band
+        price
     )
 
 
@@ -1753,12 +1861,6 @@ def recover_positions():
             if symbol not in symbol_info:
                 continue
 
-            # Only recover balances that are part of
-            # our currently monitored TOP symbols.
-            #
-            # This avoids automatically treating every
-            # random wallet balance as a bot position.
-
             with state_lock:
 
                 is_monitored = (
@@ -1768,17 +1870,9 @@ def recover_positions():
             if not is_monitored:
                 continue
 
-            # ------------------------------------------------
-            # Conservative recovery.
-            #
-            # We use FREE balance as sellable quantity.
-            # Locked balance is not immediately sellable.
-            # ------------------------------------------------
-
             if free <= 0:
                 continue
 
-            # Current price
             try:
 
                 ticker = client.get_symbol_ticker(
@@ -1798,23 +1892,15 @@ def recover_positions():
                 current_price
             )
 
-            # Ignore tiny dust.
             if value < 5.0:
                 continue
 
             # ------------------------------------------------
-            # We do not know the exact original entry price
-            # after a Render restart.
+            # Recovery position.
             #
-            # Use current price temporarily.
-            #
-            # IMPORTANT:
-            # This prevents a recovered position from being
-            # immediately sold due to an unknown historical
+            # Historical entry price is unknown after restart.
+            # Therefore current price is used as temporary
             # entry price.
-            #
-            # The next strategy/monitor cycle will continue
-            # monitoring it.
             # ------------------------------------------------
 
             with state_lock:
@@ -1828,6 +1914,12 @@ def recover_positions():
                         "quantity": free,
 
                         "entry_price": current_price,
+
+                        "highest_price": current_price,
+
+                        "trailing_active": False,
+
+                        "trailing_stop_price": None,
 
                         "buy_order_id": None,
 
@@ -1868,9 +1960,9 @@ def position_safety_loop():
     """
     Backup monitor.
 
-    Checks ONLY current open positions.
+    Checks current open positions.
 
-    This protects against:
+    Protects against:
     - WebSocket disconnect
     - missed ticker
     - temporary WebSocket failure
@@ -1903,40 +1995,9 @@ def position_safety_loop():
                         ticker["price"]
                     )
 
-                    with state_lock:
-
-                        df = candles.get(
-                            symbol
-                        )
-
-                    upper = None
-
-                    if (
-                        df is not None
-                        and
-                        len(df) > 0
-                    ):
-
-                        try:
-
-                            last = df.iloc[-1]
-
-                            if not pd.isna(
-                                last["bb_upper"]
-                            ):
-
-                                upper = float(
-                                    last["bb_upper"]
-                                )
-
-                        except Exception:
-
-                            pass
-
                     check_position(
                         symbol,
-                        price,
-                        upper
+                        price
                     )
 
                 except Exception as e:
@@ -1983,6 +2044,7 @@ def symbol_refresh_loop():
             )
 
         # Refresh every 30 minutes
+
         time.sleep(
             1800
         )
@@ -2004,6 +2066,21 @@ def start_bot():
 
     log.info(
         "=" * 70
+    )
+
+    log.info(
+        "INITIAL STOP LOSS = %.2f%%",
+        INITIAL_STOP_LOSS_PCT * 100
+    )
+
+    log.info(
+        "TRAILING ACTIVATION = %.2f%%",
+        TRAILING_ACTIVATION_PCT * 100
+    )
+
+    log.info(
+        "TRAILING STOP = %.2f%% FROM HIGHEST PRICE",
+        TRAILING_STOP_PCT * 100
     )
 
     # --------------------------------------------------------
