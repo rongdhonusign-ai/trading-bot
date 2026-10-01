@@ -5,6 +5,7 @@ import threading
 import logging
 from decimal import Decimal, ROUND_DOWN
 
+import numpy as np
 import pandas as pd
 import websocket
 
@@ -671,17 +672,17 @@ def calculate_indicators(df):
         high = pd.to_numeric(
             df["high"],
             errors="coerce"
-        )
+        ).astype("float64")
 
         low = pd.to_numeric(
             df["low"],
             errors="coerce"
-        )
+        ).astype("float64")
 
         close = pd.to_numeric(
             df["close"],
             errors="coerce"
-        )
+        ).astype("float64")
 
         prev_close = close.shift(1)
 
@@ -704,31 +705,23 @@ def calculate_indicators(df):
         # before aggregation.
         # ====================================================
 
-        tr_df = pd.DataFrame(
-            {
-                "tr1": pd.to_numeric(
-                    tr1,
-                    errors="coerce"
-                ),
-                "tr2": pd.to_numeric(
-                    tr2,
-                    errors="coerce"
-                ),
-                "tr3": pd.to_numeric(
-                    tr3,
-                    errors="coerce"
-                )
-            }
-        )
+        tr_df = pd.concat(
+            [
+                pd.to_numeric(tr1, errors="coerce"),
+                pd.to_numeric(tr2, errors="coerce"),
+                pd.to_numeric(tr3, errors="coerce")
+            ],
+            axis=1
+        ).astype("float64")
 
-        tr_df = tr_df.astype(
-            "float64"
-        )
+        tr_df.columns = ["tr1", "tr2", "tr3"]
 
+        # All three columns are guaranteed float64 before max().
         tr = tr_df.max(
             axis=1,
-            skipna=True
-        )
+            skipna=True,
+            numeric_only=True
+        ).astype("float64")
 
         # ====================================================
         # Directional Movement
@@ -801,10 +794,18 @@ def calculate_indicators(df):
             .mean()
         )
 
-        atr_safe = atr.replace(
-            0,
-            pd.NA
-        )
+        # Keep the entire ADX calculation strictly float64.
+        # Do NOT use pd.NA here because it can promote numeric
+        # Series to object dtype and trigger pandas aggregation errors.
+        atr = pd.to_numeric(
+            atr,
+            errors="coerce"
+        ).astype("float64")
+
+        atr_safe = atr.mask(
+            atr == 0,
+            np.nan
+        ).astype("float64")
 
         plus_di = (
             100.0
@@ -823,10 +824,15 @@ def calculate_indicators(df):
             + minus_di
         )
 
-        di_sum = di_sum.replace(
-            0,
-            pd.NA
-        )
+        di_sum = pd.to_numeric(
+            di_sum,
+            errors="coerce"
+        ).astype("float64")
+
+        di_sum = di_sum.mask(
+            di_sum == 0,
+            np.nan
+        ).astype("float64")
 
         dx = (
             100.0
@@ -2484,14 +2490,29 @@ def process_ws_message(
 
 
 # ============================================================
-# WEBSOCKET URL
+# WEBSOCKET SETTINGS / URL
 # ============================================================
 
-def make_stream_url():
+# One connection carrying 300 streams (150 symbols x 2 streams)
+# can become unstable on some hosts.  Keep each connection small.
+WS_SYMBOLS_PER_CONNECTION = 40
+
+
+def make_stream_url(symbol_chunk):
+    """
+    Build one combined Binance WebSocket URL for a small chunk
+    of symbols.
+
+    Each symbol uses:
+      1) @kline_5m
+      2) @miniTicker
+
+    With 40 symbols this is 80 streams per connection.
+    """
 
     streams = []
 
-    for symbol in symbols:
+    for symbol in symbol_chunk:
 
         lower = symbol.lower()
 
@@ -2502,6 +2523,9 @@ def make_stream_url():
         streams.append(
             f"{lower}@miniTicker"
         )
+
+    if not streams:
+        return None
 
     stream_string = "/".join(
         streams
@@ -2515,10 +2539,16 @@ def make_stream_url():
 
 
 # ============================================================
-# WEBSOCKET LOOP
+# WEBSOCKET WORKER
 # ============================================================
 
-def websocket_loop():
+def websocket_worker(symbol_chunk, worker_id):
+    """
+    Dedicated reconnecting WebSocket worker.
+
+    Keeping 40 symbols per connection greatly reduces the chance
+    of ping/pong timeout compared with one 300-stream connection.
+    """
 
     while True:
 
@@ -2526,10 +2556,11 @@ def websocket_loop():
 
         try:
 
-            if not symbols:
+            if not symbol_chunk:
 
                 logger.warning(
-                    "No symbols available"
+                    "WS WORKER %d | No symbols available",
+                    worker_id
                 )
 
                 time.sleep(
@@ -2538,41 +2569,51 @@ def websocket_loop():
 
                 continue
 
-            url = make_stream_url()
-
-            logger.info(
-                "Connecting WebSocket with %d symbols...",
-                len(symbols)
+            url = make_stream_url(
+                symbol_chunk
             )
 
-            # =================================================
-            # CALLBACKS
-            # =================================================
+            logger.info(
+                "WS WORKER %d | Connecting | symbols=%d | streams=%d",
+                worker_id,
+                len(symbol_chunk),
+                len(symbol_chunk) * 2
+            )
 
-            def on_open(
-                ws_app
-            ):
+            # ----------------------------------------------------
+            # CALLBACKS
+            # ----------------------------------------------------
+
+            def on_open(ws_app):
 
                 logger.info(
-                    "WebSocket connected successfully"
+                    "WS WORKER %d | Connected successfully",
+                    worker_id
                 )
 
-            def on_message(
-                ws_app,
-                message
-            ):
+            def on_message(ws_app, message):
 
-                process_ws_message(
-                    message
-                )
+                try:
 
-            def on_error(
-                ws_app,
-                error
-            ):
+                    process_ws_message(
+                        message
+                    )
+
+                except Exception as e:
+
+                    # A bad message must not kill the entire
+                    # WebSocket worker.
+                    logger.error(
+                        "WS WORKER %d | Message processing error: %s",
+                        worker_id,
+                        e
+                    )
+
+            def on_error(ws_app, error):
 
                 logger.error(
-                    "WebSocket error: %s",
+                    "WS WORKER %d | WebSocket error: %s",
+                    worker_id,
                     error
                 )
 
@@ -2583,8 +2624,9 @@ def websocket_loop():
             ):
 
                 logger.warning(
-                    "WebSocket closed | "
+                    "WS WORKER %d | WebSocket closed | "
                     "Code=%s Message=%s",
+                    worker_id,
                     close_status_code,
                     close_msg
                 )
@@ -2597,9 +2639,13 @@ def websocket_loop():
                 on_close=on_close
             )
 
-            # =================================================
-            # MORE TOLERANT HEARTBEAT
-            # =================================================
+            # ----------------------------------------------------
+            # HEARTBEAT
+            # ----------------------------------------------------
+            #
+            # Keep timeout comfortably below Binance's server
+            # heartbeat interval, while allowing network jitter.
+            # ----------------------------------------------------
 
             ws.run_forever(
                 ping_interval=WS_PING_INTERVAL,
@@ -2610,18 +2656,91 @@ def websocket_loop():
         except Exception as e:
 
             logger.error(
-                "WebSocket loop exception: %s",
+                "WS WORKER %d | Loop exception: %s",
+                worker_id,
                 e
             )
 
+        finally:
+
+            try:
+
+                if ws is not None:
+
+                    ws.close()
+
+            except Exception:
+
+                pass
+
         logger.warning(
-            "WebSocket reconnecting in %d seconds...",
+            "WS WORKER %d | Reconnecting in %d seconds...",
+            worker_id,
             RECONNECT_DELAY
         )
 
         time.sleep(
             RECONNECT_DELAY
         )
+
+
+# ============================================================
+# WEBSOCKET LOOP
+# ============================================================
+
+def websocket_loop():
+
+    if not symbols:
+
+        logger.warning(
+            "WebSocket loop started with no symbols"
+        )
+
+        return
+
+    # Split 150 symbols into several independent connections.
+    chunks = [
+        symbols[i:i + WS_SYMBOLS_PER_CONNECTION]
+        for i in range(
+            0,
+            len(symbols),
+            WS_SYMBOLS_PER_CONNECTION
+        )
+    ]
+
+    logger.info(
+        "WebSocket architecture | "
+        "symbols=%d | connections=%d | symbols/connection<=%d",
+        len(symbols),
+        len(chunks),
+        WS_SYMBOLS_PER_CONNECTION
+    )
+
+    for worker_id, chunk in enumerate(
+        chunks,
+        start=1
+    ):
+
+        thread = threading.Thread(
+            target=websocket_worker,
+            args=(
+                chunk,
+                worker_id
+            ),
+            name=f"BinanceWS-{worker_id}",
+            daemon=True
+        )
+
+        thread.start()
+
+        # Small stagger prevents all connections from opening
+        # at exactly the same moment.
+        time.sleep(0.5)
+
+    # Keep this manager thread alive.
+    while True:
+
+        time.sleep(60)
 
 
 # ============================================================
@@ -2722,6 +2841,16 @@ def startup():
     logger.info(
         "TOP SYMBOLS = %d",
         TOP_SYMBOLS
+    )
+
+    logger.info(
+        "WEBSOCKET CONNECTION SIZE = %d symbols",
+        WS_SYMBOLS_PER_CONNECTION
+    )
+
+    logger.info(
+        "WEBSOCKET STREAMS PER CONNECTION <= %d",
+        WS_SYMBOLS_PER_CONNECTION * 2
     )
 
     logger.info(
