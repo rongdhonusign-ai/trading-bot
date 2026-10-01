@@ -26,9 +26,9 @@ if not API_KEY or not API_SECRET:
     )
 
 
-# ------------------------------------------------------------
-# Trading settings
-# ------------------------------------------------------------
+# ============================================================
+# TRADING SETTINGS
+# ============================================================
 
 TRADE_AMOUNT_USDT = 35.0
 
@@ -36,20 +36,50 @@ TIMEFRAME = Client.KLINE_INTERVAL_5MINUTE
 
 TOP_SYMBOLS = 150
 
-# BUY
+
+# ============================================================
+# BUY FILTER
+# ============================================================
+
 ADX_MIN = 20.0
 
+
+# ============================================================
 # STOP LOSS
-STOP_LOSS_PCT = 0.0100          # 1.00%
+# ============================================================
 
-# TRAILING
-TRAILING_ACTIVATION_PCT = 0.0100  # +1.00%
-TRAILING_STOP_PCT = 0.0050        # 0.50%
+STOP_LOSS_PCT = 0.0100
+# 1.00% below entry
 
 
-# ------------------------------------------------------------
-# Binance
-# ------------------------------------------------------------
+# ============================================================
+# TRAILING STOP
+# ============================================================
+
+TRAILING_ACTIVATION_PCT = 0.0100
+# +1.00% from entry
+
+TRAILING_STOP_PCT = 0.0050
+# 0.50% below highest price
+
+
+# ============================================================
+# API / REQUEST SAFETY
+# ============================================================
+
+# Minimum time between REST kline requests for the same symbol
+KLINE_REQUEST_COOLDOWN = 2.0
+
+# Prevent duplicate BUY attempts on same symbol
+BUY_COOLDOWN_SECONDS = 60
+
+# Small delay between REST kline requests
+KLINE_REQUEST_DELAY = 0.05
+
+
+# ============================================================
+# BINANCE CLIENT
+# ============================================================
 
 client = Client(
     API_KEY,
@@ -78,15 +108,19 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "BB20 + EMA5 + ADX14 BINANCE SPOT BOT STARTING"
+    return "BB20 + ADX14 + DI BINANCE SPOT BOT RUNNING"
 
 
 @app.route("/health")
 def health():
+
+    with positions_lock:
+        position_count = len(positions)
+
     return jsonify({
         "status": "running",
         "symbols": len(symbols),
-        "positions": len(positions)
+        "positions": position_count
     })
 
 
@@ -103,11 +137,18 @@ positions = {}
 selling_symbols = set()
 
 positions_lock = threading.Lock()
+
 selling_lock = threading.Lock()
+
+buy_lock = threading.Lock()
+
+last_kline_request = {}
+
+last_buy_attempt = {}
 
 
 # ============================================================
-# CONSTANTS
+# STABLECOINS
 # ============================================================
 
 STABLECOINS = {
@@ -126,7 +167,7 @@ STABLECOINS = {
 
 
 # ============================================================
-# EXCHANGE INFO
+# LOAD BINANCE EXCHANGE INFO
 # ============================================================
 
 def load_exchange_info():
@@ -160,15 +201,23 @@ def load_exchange_info():
                 filter_type = f.get("filterType")
 
                 if filter_type == "LOT_SIZE":
-                    filters["stepSize"] = f.get("stepSize")
-                    filters["minQty"] = f.get("minQty")
+
+                    filters["stepSize"] = f.get(
+                        "stepSize"
+                    )
+
+                    filters["minQty"] = f.get(
+                        "minQty"
+                    )
 
                 elif filter_type == "MIN_NOTIONAL":
+
                     filters["minNotional"] = f.get(
                         "minNotional"
                     )
 
                 elif filter_type == "NOTIONAL":
+
                     filters["minNotional"] = f.get(
                         "minNotional"
                     )
@@ -180,6 +229,7 @@ def load_exchange_info():
             }
 
         except Exception:
+
             continue
 
     symbol_info = temp
@@ -190,7 +240,7 @@ def load_exchange_info():
 
 
 # ============================================================
-# TOP SYMBOLS
+# LOAD TOP SYMBOLS
 # ============================================================
 
 def load_top_symbols():
@@ -209,7 +259,10 @@ def load_top_symbols():
 
         for ticker in tickers:
 
-            symbol = ticker.get("symbol", "")
+            symbol = ticker.get(
+                "symbol",
+                ""
+            )
 
             if not symbol.endswith("USDT"):
                 continue
@@ -222,7 +275,10 @@ def load_top_symbols():
             if base in STABLECOINS:
                 continue
 
-            if base in {"BTC", "ETH"}:
+            if base in {
+                "BTC",
+                "ETH"
+            }:
                 continue
 
             try:
@@ -252,17 +308,17 @@ def load_top_symbols():
                 )
 
             except Exception:
+
                 continue
 
-        # Volume অনুযায়ী sort
         candidates.sort(
             key=lambda x: x[1],
             reverse=True
         )
 
         symbols = [
-            x[0]
-            for x in candidates[:TOP_SYMBOLS]
+            item[0]
+            for item in candidates[:TOP_SYMBOLS]
         ]
 
         logger.info(
@@ -270,6 +326,7 @@ def load_top_symbols():
         )
 
         if symbols:
+
             logger.info(
                 "First symbols: "
                 + ", ".join(symbols[:20])
@@ -289,6 +346,7 @@ def load_top_symbols():
 def get_step_size(symbol):
 
     try:
+
         return Decimal(
             str(
                 symbol_info[symbol]["filters"].get(
@@ -299,12 +357,14 @@ def get_step_size(symbol):
         )
 
     except Exception:
+
         return Decimal("0.000001")
 
 
 def get_min_qty(symbol):
 
     try:
+
         return Decimal(
             str(
                 symbol_info[symbol]["filters"].get(
@@ -315,12 +375,14 @@ def get_min_qty(symbol):
         )
 
     except Exception:
+
         return Decimal("0")
 
 
 def get_min_notional(symbol):
 
     try:
+
         return Decimal(
             str(
                 symbol_info[symbol]["filters"].get(
@@ -331,6 +393,7 @@ def get_min_notional(symbol):
         )
 
     except Exception:
+
         return Decimal("0")
 
 
@@ -338,13 +401,12 @@ def round_quantity(symbol, quantity):
 
     try:
 
-        qty = Decimal(
-            str(quantity)
-        )
+        qty = Decimal(str(quantity))
 
         step = get_step_size(symbol)
 
         if step <= 0:
+
             return float(qty)
 
         rounded = (
@@ -365,7 +427,8 @@ def round_quantity(symbol, quantity):
 
 
 # ============================================================
-# CURRENT PRICE
+# REST PRICE
+# ONLY USED FOR BUY ORDER / RECOVERY
 # ============================================================
 
 def get_current_price(symbol):
@@ -393,10 +456,27 @@ def get_current_price(symbol):
 # GET CLOSED KLINES
 # ============================================================
 
-def get_closed_klines(
-    symbol,
-    limit=100
-):
+def get_closed_klines(symbol, limit=100):
+
+    # --------------------------------------------------------
+    # Request cooldown protection
+    # --------------------------------------------------------
+
+    now = time.time()
+
+    last_request = last_kline_request.get(
+        symbol,
+        0
+    )
+
+    if (
+        now - last_request
+        < KLINE_REQUEST_COOLDOWN
+    ):
+
+        return None
+
+    last_kline_request[symbol] = now
 
     try:
 
@@ -407,6 +487,7 @@ def get_closed_klines(
         )
 
         if not klines:
+
             return None
 
         rows = []
@@ -426,21 +507,24 @@ def get_closed_klines(
                 })
 
             except Exception:
+
                 continue
 
         if len(rows) < 50:
+
             return None
 
         df = pd.DataFrame(rows)
 
-        # Force numeric dtype
-        for col in [
+        numeric_cols = [
             "open",
             "high",
             "low",
             "close",
             "volume"
-        ]:
+        ]
+
+        for col in numeric_cols:
 
             df[col] = pd.to_numeric(
                 df[col],
@@ -448,21 +532,24 @@ def get_closed_klines(
             ).astype("float64")
 
         df = df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume"
-            ]
+            subset=numeric_cols
         ).reset_index(
             drop=True
         )
 
         if len(df) < 50:
+
             return None
 
         return df
+
+    except BinanceAPIException as e:
+
+        logger.error(
+            f"{symbol} | Binance Kline API error: {e}"
+        )
+
+        return None
 
     except Exception as e:
 
@@ -487,17 +574,15 @@ def calculate_indicators(df):
         if len(df) < 50:
             return None
 
-        # ----------------------------------------------------
-        # Force numeric
-        # ----------------------------------------------------
-
-        for col in [
+        numeric_cols = [
             "open",
             "high",
             "low",
             "close",
             "volume"
-        ]:
+        ]
+
+        for col in numeric_cols:
 
             df[col] = pd.to_numeric(
                 df[col],
@@ -516,45 +601,33 @@ def calculate_indicators(df):
         if len(df) < 50:
             return None
 
-        # ----------------------------------------------------
-        # Convert to pure float64 Series
-        # ----------------------------------------------------
-
-        close_values = df[
-            "close"
-        ].to_numpy(
-            dtype="float64"
-        )
-
-        high_values = df[
-            "high"
-        ].to_numpy(
-            dtype="float64"
-        )
-
-        low_values = df[
-            "low"
-        ].to_numpy(
-            dtype="float64"
-        )
+        # ====================================================
+        # FLOAT64 SERIES
+        # ====================================================
 
         close = pd.Series(
-            close_values,
+            df["close"].to_numpy(
+                dtype="float64"
+            ),
             dtype="float64"
         )
 
         high = pd.Series(
-            high_values,
+            df["high"].to_numpy(
+                dtype="float64"
+            ),
             dtype="float64"
         )
 
         low = pd.Series(
-            low_values,
+            df["low"].to_numpy(
+                dtype="float64"
+            ),
             dtype="float64"
         )
 
         # ====================================================
-        # EMA 5
+        # EMA5
         # ====================================================
 
         ema5 = close.ewm(
@@ -564,7 +637,7 @@ def calculate_indicators(df):
         ).mean()
 
         # ====================================================
-        # BOLLINGER BAND 20
+        # BB20
         # ====================================================
 
         bb_middle = close.rolling(
@@ -590,15 +663,17 @@ def calculate_indicators(df):
         )
 
         # ====================================================
-        # ADX 14
+        # ADX14
         # ====================================================
 
         prev_close = close.shift(1)
+
         prev_high = high.shift(1)
+
         prev_low = low.shift(1)
 
         # ----------------------------------------------------
-        # True Range
+        # TRUE RANGE
         # ----------------------------------------------------
 
         tr1 = high - low
@@ -613,21 +688,26 @@ def calculate_indicators(df):
             prev_close
         ).abs()
 
-        # IMPORTANT:
-        # Do not use pd.concat(...).max(...)
-        # This avoids "No numeric types to aggregate"
-        # type of aggregation issue.
-
         tr = tr1.copy()
 
-        mask_tr2 = tr2 > tr
-        tr.loc[mask_tr2] = tr2.loc[mask_tr2]
+        mask2 = tr2 > tr
 
-        mask_tr3 = tr3 > tr
-        tr.loc[mask_tr3] = tr3.loc[mask_tr3]
+        tr.loc[
+            mask2
+        ] = tr2.loc[
+            mask2
+        ]
+
+        mask3 = tr3 > tr
+
+        tr.loc[
+            mask3
+        ] = tr3.loc[
+            mask3
+        ]
 
         # ----------------------------------------------------
-        # Directional Movement
+        # DIRECTIONAL MOVEMENT
         # ----------------------------------------------------
 
         up_move = (
@@ -675,7 +755,7 @@ def calculate_indicators(df):
         ]
 
         # ----------------------------------------------------
-        # Wilder smoothing
+        # WILDER SMOOTHING
         # ----------------------------------------------------
 
         atr = tr.ewm(
@@ -696,15 +776,15 @@ def calculate_indicators(df):
             min_periods=14
         ).mean()
 
-        # ----------------------------------------------------
-        # DI
-        # ----------------------------------------------------
-
         atr_safe = atr.copy()
 
         atr_safe.loc[
             atr_safe == 0
         ] = float("nan")
+
+        # ----------------------------------------------------
+        # +DI / -DI
+        # ----------------------------------------------------
 
         plus_di = (
             100.0 *
@@ -783,6 +863,22 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
+        df["PLUS_DI"] = pd.Series(
+            plus_di.to_numpy(
+                dtype="float64"
+            ),
+            index=df.index,
+            dtype="float64"
+        )
+
+        df["MINUS_DI"] = pd.Series(
+            minus_di.to_numpy(
+                dtype="float64"
+            ),
+            index=df.index,
+            dtype="float64"
+        )
+
         df["ADX14"] = pd.Series(
             adx14.to_numpy(
                 dtype="float64"
@@ -791,19 +887,26 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        # Final numeric cleanup
+        # ====================================================
+        # CLEANUP
+        # ====================================================
+
         for col in [
             "EMA5",
             "BB_MIDDLE",
             "BB_UPPER",
             "BB_LOWER",
+            "PLUS_DI",
+            "MINUS_DI",
             "ADX14"
         ]:
 
             df[col] = pd.to_numeric(
                 df[col],
                 errors="coerce"
-            ).astype("float64")
+            ).astype(
+                "float64"
+            )
 
         return df
 
@@ -828,10 +931,6 @@ def entry_signal(candle):
             candle["open"]
         )
 
-        high_price = float(
-            candle["high"]
-        )
-
         close_price = float(
             candle["close"]
         )
@@ -840,55 +939,58 @@ def entry_signal(candle):
             candle["BB_LOWER"]
         )
 
-        ema5 = float(
-            candle["EMA5"]
-        )
-
         adx14 = float(
             candle["ADX14"]
         )
 
-        # Invalid indicator
+        plus_di = float(
+            candle["PLUS_DI"]
+        )
+
+        minus_di = float(
+            candle["MINUS_DI"]
+        )
+
         if any([
             pd.isna(open_price),
-            pd.isna(high_price),
             pd.isna(close_price),
             pd.isna(bb_lower),
-            pd.isna(ema5),
-            pd.isna(adx14)
+            pd.isna(adx14),
+            pd.isna(plus_di),
+            pd.isna(minus_di)
         ]):
+
             return False
 
-        # ----------------------------------------------------
+        # ====================================================
         # BUY CONDITIONS
-        # ----------------------------------------------------
+        # ====================================================
 
+        # 1. Candle opened below BB20 Lower
         condition_1 = (
             open_price < bb_lower
         )
 
+        # 2. Candle closed back above BB20 Lower
         condition_2 = (
             close_price > bb_lower
         )
 
+        # 3. ADX must show sufficient trend strength
         condition_3 = (
-            close_price < ema5
-        )
-
-        condition_4 = (
-            high_price < ema5
-        )
-
-        condition_5 = (
             adx14 > ADX_MIN
+        )
+
+        # 4. Bullish directional filter
+        condition_4 = (
+            plus_di > minus_di
         )
 
         return (
             condition_1 and
             condition_2 and
             condition_3 and
-            condition_4 and
-            condition_5
+            condition_4
         )
 
     except Exception as e:
@@ -901,28 +1003,51 @@ def entry_signal(candle):
 
 
 # ============================================================
-# BUY
+# BUY ORDER
 # ============================================================
 
 def buy_symbol(symbol):
+
+    # --------------------------------------------------------
+    # Duplicate BUY protection
+    # --------------------------------------------------------
+
+    with buy_lock:
+
+        now = time.time()
+
+        last_attempt = last_buy_attempt.get(
+            symbol,
+            0
+        )
+
+        if (
+            now - last_attempt
+            < BUY_COOLDOWN_SECONDS
+        ):
+
+            return False
+
+        last_buy_attempt[symbol] = now
 
     try:
 
         with positions_lock:
 
             if symbol in positions:
+
                 return False
 
         price = get_current_price(
             symbol
         )
 
-        if price is None or price <= 0:
-            return False
+        if (
+            price is None or
+            price <= 0
+        ):
 
-        # ----------------------------------------------------
-        # Quantity
-        # ----------------------------------------------------
+            return False
 
         quantity = (
             TRADE_AMOUNT_USDT /
@@ -935,9 +1060,11 @@ def buy_symbol(symbol):
         )
 
         if quantity <= 0:
+
             logger.warning(
                 f"{symbol} | Quantity too small."
             )
+
             return False
 
         min_qty = float(
@@ -945,14 +1072,12 @@ def buy_symbol(symbol):
         )
 
         if quantity < min_qty:
+
             logger.warning(
                 f"{symbol} | Quantity below minQty."
             )
-            return False
 
-        # ----------------------------------------------------
-        # MIN NOTIONAL
-        # ----------------------------------------------------
+            return False
 
         min_notional = float(
             get_min_notional(symbol)
@@ -962,14 +1087,16 @@ def buy_symbol(symbol):
             quantity * price
             < min_notional
         ):
+
             logger.warning(
-                f"{symbol} | "
-                f"Notional below minimum."
+                f"{symbol} | Notional below minimum."
             )
+
             return False
 
         logger.info(
-            f"{symbol} | BUY MARKET | "
+            f"{symbol} | "
+            f"BUY MARKET | "
             f"Qty={quantity}"
         )
 
@@ -977,10 +1104,6 @@ def buy_symbol(symbol):
             symbol=symbol,
             quantity=quantity
         )
-
-        # ----------------------------------------------------
-        # Actual fill price
-        # ----------------------------------------------------
 
         executed_qty = float(
             order.get(
@@ -1017,38 +1140,43 @@ def buy_symbol(symbol):
                 )
 
             if total_qty > 0:
+
                 entry_price = (
                     total_value /
                     total_qty
                 )
+
             else:
+
                 entry_price = price
 
         else:
-            entry_price = price
 
-        # ----------------------------------------------------
-        # Save position
-        # ----------------------------------------------------
+            entry_price = price
 
         with positions_lock:
 
             positions[symbol] = {
-                "entry_price": float(
-                    entry_price
-                ),
-                "quantity": float(
-                    executed_qty
-                ),
-                "highest_price": float(
-                    entry_price
-                ),
-                "trailing_active": False,
-                "buy_time": time.time()
+
+                "entry_price":
+                    float(entry_price),
+
+                "quantity":
+                    float(executed_qty),
+
+                "highest_price":
+                    float(entry_price),
+
+                "trailing_active":
+                    False,
+
+                "buy_time":
+                    time.time()
             }
 
         logger.info(
-            f"{symbol} | BUY SUCCESS | "
+            f"{symbol} | "
+            f"BUY SUCCESS | "
             f"Entry={entry_price:.10f} | "
             f"Qty={executed_qty}"
         )
@@ -1073,7 +1201,7 @@ def buy_symbol(symbol):
 
 
 # ============================================================
-# SELL
+# SELL ORDER
 # ============================================================
 
 def sell_symbol(
@@ -1084,6 +1212,7 @@ def sell_symbol(
     with selling_lock:
 
         if symbol in selling_symbols:
+
             return False
 
         selling_symbols.add(
@@ -1099,6 +1228,7 @@ def sell_symbol(
             )
 
         if not position:
+
             return False
 
         quantity = float(
@@ -1111,6 +1241,7 @@ def sell_symbol(
         )
 
         if quantity <= 0:
+
             return False
 
         logger.info(
@@ -1133,7 +1264,8 @@ def sell_symbol(
             )
 
         logger.info(
-            f"{symbol} | SELL SUCCESS | "
+            f"{symbol} | "
+            f"SELL SUCCESS | "
             f"Reason={reason}"
         )
 
@@ -1309,16 +1441,14 @@ def check_position(
 # PROCESS CLOSED CANDLE
 # ============================================================
 
-def process_closed_candle(
-    symbol
-):
+def process_closed_candle(symbol):
 
     try:
 
-        # Already holding position
         with positions_lock:
 
             if symbol in positions:
+
                 return
 
         df = get_closed_klines(
@@ -1339,29 +1469,33 @@ def process_closed_candle(
         if len(df) < 50:
             return
 
-        # Last candle = possibly still forming
-        # So use previous candle
+        # ----------------------------------------------------
+        # PREVIOUS CANDLE = CLOSED CANDLE
+        # ----------------------------------------------------
+
         candle = df.iloc[-2]
 
         # ----------------------------------------------------
-        # Debug information
+        # LOG INDICATORS
         # ----------------------------------------------------
 
         try:
 
             logger.info(
                 f"{symbol} | "
+                f"Open={float(candle['open']):.10f} | "
                 f"Close={float(candle['close']):.10f} | "
                 f"BBL={float(candle['BB_LOWER']):.10f} | "
-                f"EMA5={float(candle['EMA5']):.10f} | "
-                f"ADX={float(candle['ADX14']):.2f}"
+                f"ADX={float(candle['ADX14']):.2f} | "
+                f"+DI={float(candle['PLUS_DI']):.2f} | "
+                f"-DI={float(candle['MINUS_DI']):.2f}"
             )
 
         except Exception:
             pass
 
         # ----------------------------------------------------
-        # BUY SIGNAL
+        # BUY
         # ----------------------------------------------------
 
         if entry_signal(candle):
@@ -1370,11 +1504,11 @@ def process_closed_candle(
                 f"{symbol} | "
                 f"BUY SIGNAL | "
                 f"Open={float(candle['open']):.10f} | "
-                f"High={float(candle['high']):.10f} | "
                 f"Close={float(candle['close']):.10f} | "
                 f"BBL={float(candle['BB_LOWER']):.10f} | "
-                f"EMA5={float(candle['EMA5']):.10f} | "
-                f"ADX={float(candle['ADX14']):.2f}"
+                f"ADX={float(candle['ADX14']):.2f} | "
+                f"+DI={float(candle['PLUS_DI']):.2f} | "
+                f"-DI={float(candle['MINUS_DI']):.2f}"
             )
 
             buy_symbol(
@@ -1384,8 +1518,7 @@ def process_closed_candle(
     except Exception as e:
 
         logger.exception(
-            f"{symbol} | "
-            f"Candle processing error: {e}"
+            f"{symbol} | Candle processing error: {e}"
         )
 
 
@@ -1393,31 +1526,25 @@ def process_closed_candle(
 # WEBSOCKET MESSAGE
 # ============================================================
 
-def process_ws_message(
-    message
-):
+def process_ws_message(message):
 
     try:
 
-        data = json.loads(
-            message
-        )
+        data = json.loads(message)
 
         # ----------------------------------------------------
-        # Combined stream
+        # Combined stream wrapper
         # ----------------------------------------------------
 
         if "data" in data:
 
             data = data["data"]
 
-        event_type = data.get(
-            "e"
-        )
+        event_type = data.get("e")
 
-        # ----------------------------------------------------
+        # ====================================================
         # KLINE
-        # ----------------------------------------------------
+        # ====================================================
 
         if event_type == "kline":
 
@@ -1426,9 +1553,7 @@ def process_ws_message(
                 {}
             )
 
-            symbol = kline.get(
-                "s"
-            )
+            symbol = kline.get("s")
 
             is_closed = kline.get(
                 "x",
@@ -1444,38 +1569,42 @@ def process_ws_message(
                     symbol
                 )
 
-        # ----------------------------------------------------
+        # ====================================================
         # MINI TICKER
-        # ----------------------------------------------------
+        # ====================================================
 
         elif event_type == "24hrMiniTicker":
 
-            symbol = data.get(
-                "s"
-            )
+            symbol = data.get("s")
 
-            price = data.get(
-                "c"
-            )
+            close_price = data.get("c")
 
-            if (
-                symbol and
-                price
-            ):
+            if not symbol or not close_price:
+                return
 
-                try:
+            try:
 
-                    current_price = float(
-                        price
-                    )
+                current_price = float(
+                    close_price
+                )
 
-                    check_position(
-                        symbol,
-                        current_price
-                    )
+            except Exception:
 
-                except Exception:
-                    pass
+                return
+
+            # Only monitor symbols that actually have positions
+            with positions_lock:
+
+                has_position = (
+                    symbol in positions
+                )
+
+            if has_position:
+
+                check_position(
+                    symbol,
+                    current_price
+                )
 
     except Exception as e:
 
@@ -1536,18 +1665,29 @@ def make_stream_url():
 
     streams = []
 
+    # --------------------------------------------------------
+    # KLINE + MINI TICKER
+    #
+    # KLINE:
+    # Used for BUY signal.
+    #
+    # MINI TICKER:
+    # Used for real-time position monitoring.
+    #
+    # 150 + 150 = 300 streams
+    #
+    # This is far safer for REST API usage than continuously
+    # calling get_symbol_ticker() for every active position.
+    # --------------------------------------------------------
+
     for symbol in symbols:
 
-        lower_symbol = (
-            symbol.lower()
+        streams.append(
+            f"{symbol.lower()}@kline_5m"
         )
 
         streams.append(
-            f"{lower_symbol}@kline_5m"
-        )
-
-        streams.append(
-            f"{lower_symbol}@miniTicker"
+            f"{symbol.lower()}@miniTicker"
         )
 
     return (
@@ -1593,8 +1733,8 @@ def websocket_loop():
             )
 
             ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10
+                ping_interval=30,
+                ping_timeout=20
             )
 
         except Exception as e:
@@ -1604,10 +1744,10 @@ def websocket_loop():
             )
 
         logger.warning(
-            "WebSocket reconnecting in 5 seconds..."
+            "WebSocket reconnecting in 10 seconds..."
         )
 
-        time.sleep(5)
+        time.sleep(10)
 
 
 # ============================================================
@@ -1620,39 +1760,33 @@ def position_monitor():
         "Position monitor started."
     )
 
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Position prices are now received from WebSocket
+    # miniTicker.
+    #
+    # Therefore we DO NOT continuously call REST API here.
+    #
+    # This significantly reduces Binance REST API usage.
+    # --------------------------------------------------------
+
     while True:
 
         try:
 
             with positions_lock:
 
-                active_symbols = list(
-                    positions.keys()
+                position_count = len(
+                    positions
                 )
 
-            for symbol in active_symbols:
+            if position_count > 0:
 
-                try:
-
-                    price = get_current_price(
-                        symbol
-                    )
-
-                    if price is not None:
-
-                        check_position(
-                            symbol,
-                            price
-                        )
-
-                except Exception as e:
-
-                    logger.error(
-                        f"{symbol} | "
-                        f"Monitor error: {e}"
-                    )
-
-                time.sleep(0.2)
+                logger.debug(
+                    f"Position monitor active: "
+                    f"{position_count} positions"
+                )
 
         except Exception as e:
 
@@ -1660,7 +1794,7 @@ def position_monitor():
                 f"Position monitor error: {e}"
             )
 
-        time.sleep(2)
+        time.sleep(10)
 
 
 # ============================================================
@@ -1732,13 +1866,6 @@ def recover_positions():
             }:
                 continue
 
-            # ------------------------------------------------
-            # Important:
-            # We do not know historical entry price after
-            # restart, so current price is used as recovery
-            # reference.
-            # ------------------------------------------------
-
             current_price = get_current_price(
                 symbol
             )
@@ -1752,17 +1879,21 @@ def recover_positions():
             with positions_lock:
 
                 positions[symbol] = {
-                    "entry_price": float(
-                        current_price
-                    ),
-                    "quantity": float(
-                        total
-                    ),
-                    "highest_price": float(
-                        current_price
-                    ),
-                    "trailing_active": False,
-                    "buy_time": time.time()
+
+                    "entry_price":
+                        float(current_price),
+
+                    "quantity":
+                        float(total),
+
+                    "highest_price":
+                        float(current_price),
+
+                    "trailing_active":
+                        False,
+
+                    "buy_time":
+                        time.time()
                 }
 
             recovered += 1
@@ -1772,6 +1903,11 @@ def recover_positions():
                 f"POSITION RECOVERED | "
                 f"Qty={total} | "
                 f"Reference price={current_price}"
+            )
+
+            # Small safety delay
+            time.sleep(
+                KLINE_REQUEST_DELAY
             )
 
         logger.info(
@@ -1796,7 +1932,7 @@ def initialize():
     )
 
     logger.info(
-        "BB20 + EMA5 + ADX14 "
+        "BB20 + ADX14 + DI "
         "BINANCE SPOT BOT STARTING"
     )
 
@@ -1813,15 +1949,15 @@ def initialize():
     )
 
     logger.info(
-        "Close < EMA5"
-    )
-
-    logger.info(
-        "High < EMA5"
-    )
-
-    logger.info(
         f"ADX14 > {ADX_MIN}"
+    )
+
+    logger.info(
+        "+DI > -DI"
+    )
+
+    logger.info(
+        "EMA5 FILTERS DISABLED"
     )
 
     logger.info(
@@ -1853,16 +1989,37 @@ def initialize():
     )
 
     logger.info(
+        "WebSocket = KLINE + MINI TICKER"
+    )
+
+    logger.info(
+        "REST position polling = DISABLED"
+    )
+
+    logger.info(
+        "REST KLINE request cooldown enabled"
+    )
+
+    logger.info(
         "=" * 70
     )
 
-    # Exchange info
+    # --------------------------------------------------------
+    # Exchange information
+    # --------------------------------------------------------
+
     load_exchange_info()
 
-    # Top symbols
+    # --------------------------------------------------------
+    # Select symbols
+    # --------------------------------------------------------
+
     load_top_symbols()
 
-    # Recover existing balances
+    # --------------------------------------------------------
+    # Recover existing positions
+    # --------------------------------------------------------
+
     recover_positions()
 
 
@@ -1886,7 +2043,7 @@ if __name__ == "__main__":
     websocket_thread.start()
 
     # --------------------------------------------------------
-    # Position monitor thread
+    # Position monitor
     # --------------------------------------------------------
 
     monitor_thread = threading.Thread(
