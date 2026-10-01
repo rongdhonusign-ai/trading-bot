@@ -1,5 +1,5 @@
 python-binance
-pandas==2.2.3
+pandas
+numpy
 websocket-client
 Flask
-requests
