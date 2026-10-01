@@ -16,6 +16,18 @@ from binance.exceptions import BinanceAPIException
 
 
 # ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("BB_ADX_BOT")
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
@@ -23,7 +35,10 @@ API_KEY = os.environ.get("BINANCE_API_KEY")
 API_SECRET = os.environ.get("BINANCE_API_SECRET")
 
 if not API_KEY or not API_SECRET:
-    raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET missing")
+    raise RuntimeError(
+        "BINANCE_API_KEY / BINANCE_API_SECRET missing"
+    )
+
 
 client = Client(API_KEY, API_SECRET)
 
@@ -40,34 +55,36 @@ TOP_SYMBOLS = 150
 
 
 # ============================================================
-# BUY INDICATOR SETTINGS
+# INDICATORS
 # ============================================================
 
 BB_PERIOD = 20
 
 ADX_PERIOD = 14
+
 ADX_MIN = 20.0
 
 
 # ============================================================
-# RISK SETTINGS
+# STOP LOSS / TRAILING
 # ============================================================
 
-# Server-side stop loss = 1%
 STOP_LOSS_PCT = 0.0100
+# 1%
 
-# Trailing starts after price goes +1%
 TRAILING_ACTIVATION_PCT = 0.0100
+# +1%
 
-# After activation, trail by 0.5%
 TRAILING_STOP_PCT = 0.0050
+# 0.5% below highest price
 
 
 # ============================================================
-# SYSTEM SETTINGS
+# PERFORMANCE SETTINGS
 # ============================================================
 
 KLINE_REQUEST_COOLDOWN = 2.0
+
 KLINE_REQUEST_DELAY = 0.05
 
 BUY_COOLDOWN_SECONDS = 60
@@ -75,6 +92,7 @@ BUY_COOLDOWN_SECONDS = 60
 RECONNECT_DELAY = 10
 
 WS_PING_INTERVAL = 30
+
 WS_PING_TIMEOUT = 20
 
 WS_SYMBOLS_PER_CONNECTION = 40
@@ -103,6 +121,7 @@ EXCLUDED_SYMBOLS = {
     "ETHUSDT",
 }
 
+
 STOP_CLIENT_PREFIX = "BBADXSL_"
 
 
@@ -114,17 +133,26 @@ positions = {}
 
 positions_lock = threading.Lock()
 
+
 buying_symbols = set()
+
 buying_lock = threading.Lock()
 
+
 selling_symbols = set()
+
 selling_lock = threading.Lock()
 
+
 last_kline_request = {}
+
 last_kline_lock = threading.Lock()
 
+
 last_buy_time = {}
+
 last_buy_lock = threading.Lock()
+
 
 symbols = []
 
@@ -134,27 +162,25 @@ symbol_info_lock = threading.Lock()
 
 
 # ============================================================
-# WORK QUEUES
+# CANDLE QUEUE
 # ============================================================
 
-# WebSocket thread কখনো heavy REST কাজ করবে না।
-# Closed candle এখানে ঢুকবে।
-candle_queue = queue.Queue(maxsize=5000)
+candle_queue = queue.Queue(
+    maxsize=5000
+)
 
 queued_candles = set()
+
 queued_candles_lock = threading.Lock()
 
 
 # ============================================================
-# LOGGING
+# LATEST PRICE
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+latest_prices = {}
 
-logger = logging.getLogger("BBADX_BOT")
+latest_prices_lock = threading.Lock()
 
 
 # ============================================================
@@ -166,20 +192,27 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "Trading Bot is Active & Running!", 200
+
+    return (
+        "Trading Bot is Active & Running!",
+        200,
+    )
 
 
 @app.route("/health", methods=["GET"])
 def health():
+
     with positions_lock:
         position_count = len(positions)
 
-    return jsonify({
-        "status": "running",
-        "positions": position_count,
-        "symbols": len(symbols),
-        "timestamp": int(time.time()),
-    })
+    return jsonify(
+        {
+            "status": "running",
+            "positions": position_count,
+            "symbols": len(symbols),
+            "timestamp": time.time(),
+        }
+    )
 
 
 # ============================================================
@@ -187,36 +220,37 @@ def health():
 # ============================================================
 
 def floor_to_step(value, step):
-    """
-    Binance LOT_SIZE / PRICE_FILTER step অনুযায়ী
-    নিচের দিকে round করে।
-    """
 
     try:
+
         value = Decimal(str(value))
+
         step = Decimal(str(step))
 
         if step <= 0:
             return value
 
-        return (value / step).to_integral_value(
+        return (
+            value / step
+        ).to_integral_value(
             rounding=ROUND_DOWN
         ) * step
 
     except Exception:
+
         return Decimal("0")
 
 
 def decimal_to_string(value):
-    """
-    Decimal কে Binance-compatible string এ convert করে।
-    """
 
     try:
+
         value = Decimal(str(value))
+
         return format(value, "f")
 
     except Exception:
+
         return str(value)
 
 
@@ -228,66 +262,101 @@ def load_exchange_info():
 
     global symbol_info
 
-    logger.info("Loading Binance exchange information...")
+    logger.info(
+        "Loading Binance exchange information..."
+    )
 
     info = client.get_exchange_info()
 
-    new_symbol_info = {}
+    new_info = {}
 
     for item in info.get("symbols", []):
 
         try:
+
             symbol = item["symbol"]
 
-            if item.get("status") != "TRADING":
+            status = item.get("status")
+
+            quote_asset = item.get(
+                "quoteAsset"
+            )
+
+            base_asset = item.get(
+                "baseAsset"
+            )
+
+            if status != "TRADING":
                 continue
 
-            if item.get("quoteAsset") != "USDT":
+            if quote_asset != "USDT":
                 continue
 
-            filters = {
-                f["filterType"]: f
-                for f in item.get("filters", [])
-            }
+            filters = {}
 
-            lot_filter = filters.get("LOT_SIZE", {})
-            price_filter = filters.get("PRICE_FILTER", {})
+            for f in item.get(
+                "filters",
+                []
+            ):
 
-            min_notional = 0.0
+                filters[
+                    f.get("filterType")
+                ] = f
 
-            if "MIN_NOTIONAL" in filters:
-                min_notional = float(
-                    filters["MIN_NOTIONAL"].get(
-                        "minNotional", 0
-                    )
+            lot_filter = filters.get(
+                "LOT_SIZE",
+                {}
+            )
+
+            price_filter = filters.get(
+                "PRICE_FILTER",
+                {}
+            )
+
+            notional_filter = (
+                filters.get("NOTIONAL")
+                or
+                filters.get("MIN_NOTIONAL")
+                or
+                {}
+            )
+
+            step_size = lot_filter.get(
+                "stepSize",
+                "0.000001"
+            )
+
+            min_qty = lot_filter.get(
+                "minQty",
+                "0"
+            )
+
+            tick_size = price_filter.get(
+                "tickSize",
+                "0.000001"
+            )
+
+            min_notional = (
+                notional_filter.get(
+                    "minNotional",
+                    "0"
                 )
+            )
 
-            elif "NOTIONAL" in filters:
-                min_notional = float(
-                    filters["NOTIONAL"].get(
-                        "minNotional", 0
-                    )
-                )
+            new_info[symbol] = {
 
-            new_symbol_info[symbol] = {
+                "base_asset": base_asset,
 
-                "base_asset": item.get("baseAsset"),
+                "quote_asset": quote_asset,
 
-                "quote_asset": item.get("quoteAsset"),
+                "step_size": step_size,
 
-                "step_size": float(
-                    lot_filter.get("stepSize", 0)
-                ),
-
-                "min_qty": float(
-                    lot_filter.get("minQty", 0)
-                ),
+                "min_qty": min_qty,
 
                 "min_notional": min_notional,
 
-                "tick_size": float(
-                    price_filter.get("tickSize", 0)
-                ),
+                "tick_size": tick_size,
+
             }
 
         except Exception as e:
@@ -298,16 +367,17 @@ def load_exchange_info():
             )
 
     with symbol_info_lock:
-        symbol_info = new_symbol_info
+
+        symbol_info = new_info
 
     logger.info(
-        "Exchange info loaded: %s USDT symbols",
-        len(symbol_info)
+        "Exchange info loaded: %d USDT symbols",
+        len(new_info)
     )
 
 
 # ============================================================
-# LOAD TOP SYMBOLS
+# TOP SYMBOLS
 # ============================================================
 
 def load_top_symbols():
@@ -315,64 +385,98 @@ def load_top_symbols():
     global symbols
 
     logger.info(
-        "Loading top %s USDT symbols...",
+        "Loading top %d USDT symbols...",
         TOP_SYMBOLS
     )
 
-    tickers = client.get_ticker()
+    try:
 
-    candidates = []
+        tickers = client.get_ticker()
 
-    with symbol_info_lock:
-        info_copy = dict(symbol_info)
+        candidates = []
 
-    for ticker in tickers:
+        with symbol_info_lock:
 
-        try:
+            available = dict(symbol_info)
 
-            symbol = ticker.get("symbol")
+        for ticker in tickers:
 
-            if symbol not in info_copy:
+            try:
+
+                symbol = ticker.get(
+                    "symbol"
+                )
+
+                if symbol not in available:
+                    continue
+
+                if symbol in EXCLUDED_SYMBOLS:
+                    continue
+
+                info = available[symbol]
+
+                base_asset = info[
+                    "base_asset"
+                ]
+
+                if base_asset in STABLECOINS:
+                    continue
+
+                quote_volume = float(
+                    ticker.get(
+                        "quoteVolume",
+                        0
+                    )
+                    or 0
+                )
+
+                if quote_volume <= 0:
+                    continue
+
+                candidates.append(
+                    (
+                        symbol,
+                        quote_volume
+                    )
+                )
+
+            except Exception:
                 continue
 
-            if symbol in EXCLUDED_SYMBOLS:
-                continue
+        candidates.sort(
+            key=lambda x: x[1],
+            reverse=True
+        )
 
-            base_asset = info_copy[symbol]["base_asset"]
+        symbols = [
+            x[0]
+            for x in candidates[
+                :TOP_SYMBOLS
+            ]
+        ]
 
-            if base_asset in STABLECOINS:
-                continue
+        logger.info(
+            "Loaded %d symbols",
+            len(symbols)
+        )
 
-            quote_volume = float(
-                ticker.get("quoteVolume", 0)
+        if symbols:
+
+            logger.info(
+                "First symbols: %s",
+                ", ".join(
+                    symbols[:20]
+                )
             )
 
-            candidates.append(
-                (symbol, quote_volume)
-            )
+    except Exception as e:
 
-        except Exception:
-            continue
+        logger.error(
+            "Failed to load top symbols: %s",
+            e
+        )
 
-    candidates.sort(
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    symbols = [
-        item[0]
-        for item in candidates[:TOP_SYMBOLS]
-    ]
-
-    logger.info(
-        "Selected %s symbols",
-        len(symbols)
-    )
-
-    logger.info(
-        "Symbols: %s",
-        ", ".join(symbols)
-    )
+        symbols = []
 
 
 # ============================================================
@@ -387,7 +491,14 @@ def get_current_price(symbol):
             symbol=symbol
         )
 
-        return float(ticker["price"])
+        price = float(
+            ticker["price"]
+        )
+
+        if price <= 0:
+            return None
+
+        return price
 
     except Exception as e:
 
@@ -415,12 +526,18 @@ def get_closed_klines(symbol):
             0
         )
 
-        if now - previous < KLINE_REQUEST_COOLDOWN:
+        if (
+            now - previous
+            < KLINE_REQUEST_COOLDOWN
+        ):
+
             return None
 
         last_kline_request[symbol] = now
 
-    time.sleep(KLINE_REQUEST_DELAY)
+    time.sleep(
+        KLINE_REQUEST_DELAY
+    )
 
     try:
 
@@ -431,48 +548,116 @@ def get_closed_klines(symbol):
         )
 
         if not raw:
+
             return None
 
-        columns = [
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_volume",
-            "trades",
-            "taker_buy_base",
-            "taker_buy_quote",
-            "ignore",
-        ]
 
-        # Explicit deep copy
-        df = pd.DataFrame(
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Convert Binance response to OBJECT array first.
+        # Then construct a completely NEW DataFrame.
+        #
+        # This avoids:
+        #
+        # Invalid value [...] for dtype 'str'
+        #
+        # ----------------------------------------------------
+
+        raw_array = np.asarray(
             raw,
-            columns=columns
-        ).copy(deep=True)
+            dtype=object
+        )
 
-        numeric_columns = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
-            "taker_buy_base",
-            "taker_buy_quote",
-        ]
+        if raw_array.ndim != 2:
 
-        for col in numeric_columns:
+            return None
 
-            converted = pd.to_numeric(
-                df[col],
+        if raw_array.shape[0] < 50:
+
+            return None
+
+
+        # ----------------------------------------------------
+        # Convert OHLCV directly to float64
+        # ----------------------------------------------------
+
+        open_time = raw_array[:, 0]
+
+        open_price = (
+            pd.to_numeric(
+                raw_array[:, 1],
                 errors="coerce"
-            ).astype("float64")
+            ).astype(
+                np.float64
+            )
+        )
 
-            df.loc[:, col] = converted
+        high_price = (
+            pd.to_numeric(
+                raw_array[:, 2],
+                errors="coerce"
+            ).astype(
+                np.float64
+            )
+        )
+
+        low_price = (
+            pd.to_numeric(
+                raw_array[:, 3],
+                errors="coerce"
+            ).astype(
+                np.float64
+            )
+        )
+
+        close_price = (
+            pd.to_numeric(
+                raw_array[:, 4],
+                errors="coerce"
+            ).astype(
+                np.float64
+            )
+        )
+
+        volume = (
+            pd.to_numeric(
+                raw_array[:, 5],
+                errors="coerce"
+            ).astype(
+                np.float64
+            )
+        )
+
+        close_time = raw_array[:, 6]
+
+
+        # ----------------------------------------------------
+        # Build fresh DataFrame
+        # NO problematic dtype assignment
+        # ----------------------------------------------------
+
+        df = pd.DataFrame(
+            {
+                "open_time": open_time,
+
+                "open": open_price,
+
+                "high": high_price,
+
+                "low": low_price,
+
+                "close": close_price,
+
+                "volume": volume,
+
+                "close_time": close_time,
+            }
+        )
+
+
+        # ----------------------------------------------------
+        # Remove invalid rows
+        # ----------------------------------------------------
 
         df = df.dropna(
             subset=[
@@ -482,22 +667,78 @@ def get_closed_klines(symbol):
                 "close",
                 "volume",
             ]
-        ).copy(deep=True)
+        ).reset_index(
+            drop=True
+        )
 
-        if len(df) < 50:
+
+        # ----------------------------------------------------
+        # Safety: make absolutely sure OHLCV are float64
+        # ----------------------------------------------------
+
+        clean_df = pd.DataFrame(
+            {
+                "open_time":
+                    df[
+                        "open_time"
+                    ].to_numpy(),
+
+                "open":
+                    np.asarray(
+                        df["open"],
+                        dtype=np.float64
+                    ),
+
+                "high":
+                    np.asarray(
+                        df["high"],
+                        dtype=np.float64
+                    ),
+
+                "low":
+                    np.asarray(
+                        df["low"],
+                        dtype=np.float64
+                    ),
+
+                "close":
+                    np.asarray(
+                        df["close"],
+                        dtype=np.float64
+                    ),
+
+                "volume":
+                    np.asarray(
+                        df["volume"],
+                        dtype=np.float64
+                    ),
+
+                "close_time":
+                    df[
+                        "close_time"
+                    ].to_numpy(),
+            }
+        )
+
+
+        if len(clean_df) < 50:
+
             return None
 
-        return df
+
+        return clean_df
+
 
     except BinanceAPIException as e:
 
         logger.error(
-            "%s | Kline Binance API error: %s",
+            "%s | Binance Kline API error: %s",
             symbol,
             e
         )
 
         return None
+
 
     except Exception as e:
 
@@ -519,60 +760,63 @@ def calculate_indicators(df):
     try:
 
         if df is None:
+
             return None
 
         if len(df) < 50:
+
             return None
 
-        # Important:
-        # Always make an independent DataFrame.
-        df = df.copy(deep=True)
 
-        required_columns = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ]
+        # ----------------------------------------------------
+        # Create clean source DataFrame
+        # ----------------------------------------------------
 
-        for col in required_columns:
+        source = pd.DataFrame(
+            {
+                "open":
+                    np.asarray(
+                        df["open"],
+                        dtype=np.float64
+                    ),
 
-            df.loc[:, col] = (
-                pd.to_numeric(
-                    df[col],
-                    errors="coerce"
-                )
-                .astype("float64")
-            )
+                "high":
+                    np.asarray(
+                        df["high"],
+                        dtype=np.float64
+                    ),
 
-        df = df.dropna(
-            subset=required_columns
-        ).copy(deep=True)
+                "low":
+                    np.asarray(
+                        df["low"],
+                        dtype=np.float64
+                    ),
 
-        if len(df) < 50:
-            return None
+                "close":
+                    np.asarray(
+                        df["close"],
+                        dtype=np.float64
+                    ),
 
-        # ====================================================
-        # EMA 5
-        # ====================================================
-
-        df.loc[:, "ema5"] = (
-            df["close"]
-            .ewm(
-                span=5,
-                adjust=False
-            )
-            .mean()
-            .astype("float64")
+                "volume":
+                    np.asarray(
+                        df["volume"],
+                        dtype=np.float64
+                    ),
+            }
         )
+
 
         # ====================================================
         # BOLLINGER BAND 20
         # ====================================================
 
+        close = source[
+            "close"
+        ]
+
         bb_middle = (
-            df["close"]
+            close
             .rolling(
                 window=BB_PERIOD,
                 min_periods=BB_PERIOD
@@ -581,40 +825,43 @@ def calculate_indicators(df):
         )
 
         bb_std = (
-            df["close"]
+            close
             .rolling(
                 window=BB_PERIOD,
                 min_periods=BB_PERIOD
             )
-            .std(ddof=0)
+            .std(
+                ddof=0
+            )
         )
 
-        df.loc[:, "bb_middle"] = (
-            bb_middle.astype("float64")
+        bb_upper = (
+            bb_middle
+            + (2.0 * bb_std)
         )
 
-        df.loc[:, "bb_upper"] = (
-            (bb_middle + 2.0 * bb_std)
-            .astype("float64")
+        bb_lower = (
+            bb_middle
+            - (2.0 * bb_std)
         )
 
-        df.loc[:, "bb_lower"] = (
-            (bb_middle - 2.0 * bb_std)
-            .astype("float64")
-        )
 
         # ====================================================
         # ADX 14
         # ====================================================
 
-        high = df["high"].astype("float64")
-        low = df["low"].astype("float64")
-        close = df["close"].astype("float64")
+        high = source[
+            "high"
+        ]
 
-        previous_close = (
+        low = source[
+            "low"
+        ]
+
+        prev_close = (
             close.shift(1)
-            .astype("float64")
         )
+
 
         # ----------------------------------------------------
         # True Range
@@ -622,78 +869,101 @@ def calculate_indicators(df):
 
         tr1 = (
             high - low
-        ).abs().astype("float64")
+        ).astype(
+            np.float64
+        )
 
         tr2 = (
-            high - previous_close
-        ).abs().astype("float64")
+            high - prev_close
+        ).abs().astype(
+            np.float64
+        )
 
         tr3 = (
-            low - previous_close
-        ).abs().astype("float64")
-
-        tr_df = pd.concat(
-            [
-                tr1.rename("tr1"),
-                tr2.rename("tr2"),
-                tr3.rename("tr3"),
-            ],
-            axis=1
-        ).astype("float64")
-
-        # All columns are guaranteed numeric float64.
-        # This avoids:
-        # "No numeric types to aggregate"
-        tr = (
-            tr_df
-            .max(axis=1, skipna=True)
-            .astype("float64")
+            low - prev_close
+        ).abs().astype(
+            np.float64
         )
+
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Do NOT use DataFrame.max(numeric_only=True)
+        #
+        # This avoids:
+        # No numeric types to aggregate
+        #
+        # ----------------------------------------------------
+
+        tr12 = np.fmax(
+            tr1.to_numpy(
+                dtype=np.float64
+            ),
+            tr2.to_numpy(
+                dtype=np.float64
+            )
+        )
+
+        tr_array = np.fmax(
+            tr12,
+            tr3.to_numpy(
+                dtype=np.float64
+            )
+        )
+
+        tr = pd.Series(
+            tr_array,
+            index=source.index,
+            dtype="float64"
+        )
+
 
         # ----------------------------------------------------
         # Directional Movement
         # ----------------------------------------------------
 
         up_move = (
-            high.diff()
-            .astype("float64")
+            high - high.shift(1)
+        ).astype(
+            np.float64
         )
 
         down_move = (
-            -low.diff()
-            .astype("float64")
+            low.shift(1) - low
+        ).astype(
+            np.float64
         )
 
-        plus_condition = (
-            (up_move > down_move)
-            & (up_move > 0)
-        )
 
-        minus_condition = (
-            (down_move > up_move)
-            & (down_move > 0)
-        )
-
-        # No chained assignment.
-        plus_dm = (
-            up_move
-            .where(
-                plus_condition,
+        plus_dm = pd.Series(
+            np.where(
+                (
+                    (up_move > down_move)
+                    &
+                    (up_move > 0)
+                ),
+                up_move,
                 0.0
-            )
-            .fillna(0.0)
-            .astype("float64")
+            ),
+            index=source.index,
+            dtype="float64"
         )
 
-        minus_dm = (
-            down_move
-            .where(
-                minus_condition,
+
+        minus_dm = pd.Series(
+            np.where(
+                (
+                    (down_move > up_move)
+                    &
+                    (down_move > 0)
+                ),
+                down_move,
                 0.0
-            )
-            .fillna(0.0)
-            .astype("float64")
+            ),
+            index=source.index,
+            dtype="float64"
         )
+
 
         # ----------------------------------------------------
         # Wilder-style smoothing
@@ -701,93 +971,107 @@ def calculate_indicators(df):
 
         alpha = 1.0 / ADX_PERIOD
 
+
         atr = (
             tr
             .ewm(
                 alpha=alpha,
-                adjust=False
+                adjust=False,
+                min_periods=ADX_PERIOD
             )
             .mean()
-            .astype("float64")
+            .astype(
+                np.float64
+            )
         )
 
-        plus_dm_smoothed = (
+
+        smoothed_plus_dm = (
             plus_dm
             .ewm(
                 alpha=alpha,
-                adjust=False
+                adjust=False,
+                min_periods=ADX_PERIOD
             )
             .mean()
-            .astype("float64")
+            .astype(
+                np.float64
+            )
         )
 
-        minus_dm_smoothed = (
+
+        smoothed_minus_dm = (
             minus_dm
             .ewm(
                 alpha=alpha,
-                adjust=False
+                adjust=False,
+                min_periods=ADX_PERIOD
             )
             .mean()
-            .astype("float64")
+            .astype(
+                np.float64
+            )
         )
+
 
         # ----------------------------------------------------
         # DI+
         # ----------------------------------------------------
 
-        atr_safe = (
-            atr
-            .replace(
-                [np.inf, -np.inf],
-                np.nan
-            )
-        )
-
-        atr_safe = (
-            atr_safe
-            .mask(
-                atr_safe <= 0,
-                np.nan
-            )
-            .astype("float64")
-        )
-
         plus_di = (
             100.0
-            * plus_dm_smoothed
-            / atr_safe
-        ).astype("float64")
+            * smoothed_plus_dm
+            / atr.replace(
+                0,
+                np.nan
+            )
+        ).astype(
+            np.float64
+        )
+
+
+        # ----------------------------------------------------
+        # DI-
+        # ----------------------------------------------------
 
         minus_di = (
             100.0
-            * minus_dm_smoothed
-            / atr_safe
-        ).astype("float64")
+            * smoothed_minus_dm
+            / atr.replace(
+                0,
+                np.nan
+            )
+        ).astype(
+            np.float64
+        )
+
 
         # ----------------------------------------------------
         # DX
         # ----------------------------------------------------
 
         di_sum = (
-            plus_di + minus_di
-        ).astype("float64")
-
-        di_sum = (
-            di_sum
-            .mask(
-                di_sum <= 0,
-                np.nan
-            )
-            .astype("float64")
+            plus_di
+            + minus_di
         )
+
+        di_diff = (
+            plus_di
+            - minus_di
+        ).abs()
+
 
         dx = (
             100.0
-            * (
-                plus_di - minus_di
-            ).abs()
-            / di_sum
-        ).astype("float64")
+            * di_diff
+            / di_sum.replace(
+                0,
+                np.nan
+            )
+        ).astype(
+            np.float64
+        )
+
 
         # ----------------------------------------------------
         # ADX
@@ -797,36 +1081,102 @@ def calculate_indicators(df):
             dx
             .ewm(
                 alpha=alpha,
-                adjust=False
+                adjust=False,
+                min_periods=ADX_PERIOD
             )
             .mean()
-            .astype("float64")
+            .astype(
+                np.float64
+            )
         )
 
-        # Explicit .loc assignment
-        df.loc[:, "plus_di"] = (
-            plus_di
-            .reindex(df.index)
-            .astype("float64")
+
+        # ====================================================
+        # CREATE FINAL DATAFRAME
+        # ====================================================
+
+        result = pd.DataFrame(
+            {
+                "open":
+                    source[
+                        "open"
+                    ].to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "high":
+                    source[
+                        "high"
+                    ].to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "low":
+                    source[
+                        "low"
+                    ].to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "close":
+                    source[
+                        "close"
+                    ].to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "volume":
+                    source[
+                        "volume"
+                    ].to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "bb_middle":
+                    bb_middle.to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "bb_upper":
+                    bb_upper.to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "bb_lower":
+                    bb_lower.to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "plus_di":
+                    plus_di.to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "minus_di":
+                    minus_di.to_numpy(
+                        dtype=np.float64
+                    ),
+
+                "adx":
+                    adx.to_numpy(
+                        dtype=np.float64
+                    ),
+            }
         )
 
-        df.loc[:, "minus_di"] = (
-            minus_di
-            .reindex(df.index)
-            .astype("float64")
+
+        result = result.replace(
+            [np.inf, -np.inf],
+            np.nan
         )
 
-        df.loc[:, "adx"] = (
-            adx
-            .reindex(df.index)
-            .astype("float64")
-        )
 
-        return df
+        return result
+
 
     except Exception as e:
 
-        logger.exception(
+        logger.error(
             "Indicator calculation error: %s",
             e
         )
@@ -840,52 +1190,64 @@ def calculate_indicators(df):
 
 def check_buy_condition(symbol):
 
-    df = get_closed_klines(symbol)
-
-    if df is None:
-        return False
-
-    df = calculate_indicators(df)
-
-    if df is None:
-        return False
-
-    if len(df) < 3:
-        return False
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # -1 = currently forming candle
-    # -2 = last fully closed candle
-    # --------------------------------------------------------
-
-    candle = df.iloc[-2]
-
     try:
 
-        open_price = float(candle["open"])
-        close_price = float(candle["close"])
-
-        bb_lower = float(candle["bb_lower"])
-
-        adx = float(candle["adx"])
-
-        plus_di = float(candle["plus_di"])
-        minus_di = float(candle["minus_di"])
-
-    except Exception as e:
-
-        logger.error(
-            "%s | BUY data conversion error: %s",
-            symbol,
-            e
+        df = get_closed_klines(
+            symbol
         )
 
-        return False
+        if df is None:
 
-    if not all(
-        np.isfinite(x)
-        for x in [
+            return False
+
+
+        df = calculate_indicators(
+            df
+        )
+
+        if df is None:
+
+            return False
+
+
+        if len(df) < 3:
+
+            return False
+
+
+        # ----------------------------------------------------
+        # Use previous FULLY CLOSED candle
+        # ----------------------------------------------------
+
+        candle = df.iloc[-2]
+
+
+        open_price = float(
+            candle["open"]
+        )
+
+        close_price = float(
+            candle["close"]
+        )
+
+        bb_lower = float(
+            candle["bb_lower"]
+        )
+
+        adx = float(
+            candle["adx"]
+        )
+
+        plus_di = float(
+            candle["plus_di"]
+        )
+
+        minus_di = float(
+            candle["minus_di"]
+        )
+
+
+        values = [
             open_price,
             close_price,
             bb_lower,
@@ -893,111 +1255,180 @@ def check_buy_condition(symbol):
             plus_di,
             minus_di,
         ]
-    ):
-        return False
 
-    # ========================================================
-    # YOUR SAME BUY RULE
-    # ========================================================
 
-    condition_1 = (
-        open_price < bb_lower
-    )
+        if not all(
+            np.isfinite(x)
+            for x in values
+        ):
 
-    condition_2 = (
-        close_price > bb_lower
-    )
+            return False
 
-    condition_3 = (
-        adx > ADX_MIN
-    )
 
-    condition_4 = (
-        plus_di > minus_di
-    )
+        # ====================================================
+        # EXACT BUY RULES
+        # ====================================================
 
-    if (
-        condition_1
-        and condition_2
-        and condition_3
-        and condition_4
-    ):
-
-        logger.info(
-            "%s | BUY SIGNAL | "
-            "Open=%.8f | Close=%.8f | "
-            "BBLower=%.8f | ADX=%.2f | "
-            "DI+=%.2f | DI-=%.2f",
-            symbol,
-            open_price,
-            close_price,
-            bb_lower,
-            adx,
-            plus_di,
-            minus_di,
+        condition_1 = (
+            open_price < bb_lower
         )
 
-        return True
+        condition_2 = (
+            close_price > bb_lower
+        )
 
-    return False
+        condition_3 = (
+            adx > ADX_MIN
+        )
+
+        condition_4 = (
+            plus_di > minus_di
+        )
+
+
+        if (
+            condition_1
+            and condition_2
+            and condition_3
+            and condition_4
+        ):
+
+            logger.info(
+                "%s | BUY SIGNAL | "
+                "Open=%.8f | Close=%.8f | "
+                "BBLower=%.8f | ADX=%.2f | "
+                "DI+=%.2f | DI-=%.2f",
+                symbol,
+                open_price,
+                close_price,
+                bb_lower,
+                adx,
+                plus_di,
+                minus_di,
+            )
+
+            return True
+
+
+        return False
+
+
+    except Exception as e:
+
+        logger.error(
+            "%s | Buy condition error: %s",
+            symbol,
+            e
+        )
+
+        return False
 
 
 # ============================================================
-# QUANTITY NORMALIZATION
+# STOP LOSS CLIENT ID
 # ============================================================
 
-def normalize_quantity(symbol, quantity):
+def make_stop_client_id(symbol):
+
+    timestamp = int(
+        time.time() * 1000
+    )
+
+    return (
+        f"{STOP_CLIENT_PREFIX}"
+        f"{symbol}_"
+        f"{timestamp}"
+    )
+
+
+# ============================================================
+# NORMALIZE QUANTITY
+# ============================================================
+
+def normalize_quantity(
+    symbol,
+    quantity
+):
 
     with symbol_info_lock:
-        info = symbol_info.get(symbol)
+
+        info = symbol_info.get(
+            symbol
+        )
 
     if not info:
-        return 0.0
 
-    step = info["step_size"]
-    min_qty = info["min_qty"]
+        return Decimal("0")
 
-    if step <= 0:
-        return 0.0
+
+    step_size = Decimal(
+        str(
+            info[
+                "step_size"
+            ]
+        )
+    )
+
+    min_qty = Decimal(
+        str(
+            info[
+                "min_qty"
+            ]
+        )
+    )
+
 
     qty = floor_to_step(
         quantity,
-        step
+        step_size
     )
 
-    if qty < Decimal(str(min_qty)):
-        return 0.0
 
-    return float(qty)
+    if qty < min_qty:
+
+        return Decimal("0")
+
+
+    return qty
 
 
 # ============================================================
-# PRICE NORMALIZATION
+# NORMALIZE PRICE
 # ============================================================
 
-def normalize_price(symbol, price):
+def normalize_price(
+    symbol,
+    price
+):
 
     with symbol_info_lock:
-        info = symbol_info.get(symbol)
+
+        info = symbol_info.get(
+            symbol
+        )
 
     if not info:
-        return float(price)
 
-    tick_size = info["tick_size"]
+        return Decimal("0")
 
-    if tick_size <= 0:
-        return float(price)
 
-    result = floor_to_step(
+    tick_size = Decimal(
+        str(
+            info[
+                "tick_size"
+            ]
+        )
+    )
+
+
+    return floor_to_step(
         price,
         tick_size
     )
 
-    return float(result)
-
 
 # ============================================================
-# SERVER STOP LOSS
+# PLACE SERVER STOP LOSS
 # ============================================================
 
 def place_server_stop_loss(
@@ -1009,82 +1440,107 @@ def place_server_stop_loss(
     try:
 
         stop_price = (
-            float(entry_price)
-            * (1.0 - STOP_LOSS_PCT)
+            Decimal(
+                str(entry_price)
+            )
+            * (
+                Decimal("1")
+                - Decimal(
+                    str(STOP_LOSS_PCT)
+                )
+            )
         )
+
 
         stop_price = normalize_price(
             symbol,
             stop_price
         )
 
-        quantity = normalize_quantity(
+
+        qty = normalize_quantity(
             symbol,
             quantity
         )
 
-        if quantity <= 0:
-            logger.error(
-                "%s | Invalid stop quantity",
-                symbol
-            )
-            return None
 
         if stop_price <= 0:
+
             logger.error(
                 "%s | Invalid stop price",
                 symbol
             )
+
             return None
 
+
+        if qty <= 0:
+
+            logger.error(
+                "%s | Invalid stop quantity",
+                symbol
+            )
+
+            return None
+
+
         client_order_id = (
-            STOP_CLIENT_PREFIX
-            + symbol
-            + "_"
-            + str(int(time.time() * 1000))
+            make_stop_client_id(
+                symbol
+            )
         )
 
+
         order = client.create_order(
+
             symbol=symbol,
+
             side="SELL",
+
             type="STOP_LOSS",
+
             quantity=decimal_to_string(
-                quantity
+                qty
             ),
+
             stopPrice=decimal_to_string(
                 stop_price
             ),
+
             newClientOrderId=client_order_id,
+
             newOrderRespType="RESULT",
         )
 
-        order_id = order.get("orderId")
 
         logger.info(
-            "%s | Server SL placed | "
-            "Entry=%.8f | SL=%.8f | OrderID=%s",
+            "%s | SERVER STOP LOSS PLACED | "
+            "Stop=%.8f | Qty=%s | OrderID=%s",
             symbol,
-            entry_price,
-            stop_price,
-            order_id,
+            float(stop_price),
+            decimal_to_string(qty),
+            order.get("orderId"),
         )
 
-        return order_id
+
+        return order
+
 
     except BinanceAPIException as e:
 
         logger.error(
-            "%s | Server SL API error: %s",
+            "%s | Stop loss Binance error: %s",
             symbol,
             e
         )
 
         return None
 
+
     except Exception as e:
 
         logger.error(
-            "%s | Server SL error: %s",
+            "%s | Stop loss error: %s",
             symbol,
             e
         )
@@ -1096,40 +1552,53 @@ def place_server_stop_loss(
 # FIND EXISTING SERVER STOP
 # ============================================================
 
-def find_existing_server_stop(symbol):
+def find_existing_server_stop(
+    symbol
+):
 
     try:
 
-        open_orders = client.get_open_orders(
+        orders = client.get_open_orders(
             symbol=symbol
         )
 
-        for order in open_orders:
 
-            if order.get("side") != "SELL":
-                continue
+        for order in orders:
 
-            client_id = (
-                order.get("clientOrderId")
-                or ""
+            side = order.get(
+                "side"
             )
 
-            if not client_id.startswith(
-                STOP_CLIENT_PREFIX
+            order_type = order.get(
+                "type"
+            )
+
+            client_id = order.get(
+                "clientOrderId",
+                ""
+            )
+
+
+            if (
+                side == "SELL"
+                and
+                order_type == "STOP_LOSS"
+                and
+                client_id.startswith(
+                    STOP_CLIENT_PREFIX
+                )
             ):
-                continue
 
-            if order.get("type") != "STOP_LOSS":
-                continue
+                return order
 
-            return order.get("orderId")
 
         return None
+
 
     except Exception as e:
 
         logger.error(
-            "%s | Find server SL error: %s",
+            "%s | Find stop order error: %s",
             symbol,
             e
         )
@@ -1148,17 +1617,15 @@ def get_stop_order_status(
 
     try:
 
-        order = client.get_order(
+        return client.get_order(
             symbol=symbol,
             orderId=order_id
         )
 
-        return order.get("status")
-
     except Exception as e:
 
         logger.error(
-            "%s | Stop order status error: %s",
+            "%s | Stop status error: %s",
             symbol,
             e
         )
@@ -1167,16 +1634,13 @@ def get_stop_order_status(
 
 
 # ============================================================
-# CANCEL SERVER STOP
+# CANCEL STOP LOSS
 # ============================================================
 
 def cancel_server_stop(
     symbol,
     order_id
 ):
-
-    if not order_id:
-        return True
 
     try:
 
@@ -1186,7 +1650,7 @@ def cancel_server_stop(
         )
 
         logger.info(
-            "%s | Server SL cancelled | OrderID=%s",
+            "%s | Server stop cancelled | OrderID=%s",
             symbol,
             order_id
         )
@@ -1195,10 +1659,8 @@ def cancel_server_stop(
 
     except BinanceAPIException as e:
 
-        # If already filled/cancelled, don't treat
-        # it as a fatal problem.
-        logger.warning(
-            "%s | Cancel SL API response: %s",
+        logger.error(
+            "%s | Cancel stop Binance error: %s",
             symbol,
             e
         )
@@ -1208,7 +1670,7 @@ def cancel_server_stop(
     except Exception as e:
 
         logger.error(
-            "%s | Cancel SL error: %s",
+            "%s | Cancel stop error: %s",
             symbol,
             e
         )
@@ -1227,42 +1689,52 @@ def market_sell(
 
     try:
 
-        quantity = normalize_quantity(
+        qty = normalize_quantity(
             symbol,
             quantity
         )
 
-        if quantity <= 0:
+
+        if qty <= 0:
+
             logger.error(
-                "%s | Invalid market sell quantity",
+                "%s | Invalid sell quantity",
                 symbol
             )
+
             return None
 
+
         order = client.order_market_sell(
+
             symbol=symbol,
+
             quantity=decimal_to_string(
-                quantity
+                qty
             )
         )
 
+
         logger.info(
-            "%s | MARKET SELL executed | Qty=%s",
+            "%s | MARKET SELL EXECUTED | Qty=%s",
             symbol,
-            quantity
+            decimal_to_string(qty)
         )
 
+
         return order
+
 
     except BinanceAPIException as e:
 
         logger.error(
-            "%s | Market sell API error: %s",
+            "%s | Market sell Binance error: %s",
             symbol,
             e
         )
 
         return None
+
 
     except Exception as e:
 
@@ -1284,151 +1756,209 @@ def buy_symbol(symbol):
     with buying_lock:
 
         if symbol in buying_symbols:
-            return
+
+            return False
 
         buying_symbols.add(symbol)
 
+
     try:
+
+        # ----------------------------------------------------
+        # Duplicate position protection
+        # ----------------------------------------------------
 
         with positions_lock:
 
             if symbol in positions:
-                return
+
+                return False
+
+
+        # ----------------------------------------------------
+        # Buy cooldown
+        # ----------------------------------------------------
 
         now = time.time()
 
         with last_buy_lock:
 
-            previous_buy = last_buy_time.get(
-                symbol,
-                0
+            previous_buy = (
+                last_buy_time.get(
+                    symbol,
+                    0
+                )
             )
 
             if (
                 now - previous_buy
                 < BUY_COOLDOWN_SECONDS
             ):
-                return
+
+                return False
 
             last_buy_time[symbol] = now
 
+
         logger.info(
-            "%s | Sending MARKET BUY | Amount=%.2f USDT",
+            "%s | Executing MARKET BUY | "
+            "Amount=%.2f USDT",
             symbol,
             TRADE_AMOUNT_USDT
         )
 
+
+        # ----------------------------------------------------
+        # MARKET BUY
+        # ----------------------------------------------------
+
         order = client.order_market_buy(
+
             symbol=symbol,
-            quoteOrderQty=decimal_to_string(
+
+            quoteOrderQty=str(
                 TRADE_AMOUNT_USDT
             )
         )
 
-        executed_qty = float(
-            order.get(
-                "executedQty",
-                0
+
+        # ----------------------------------------------------
+        # Calculate actual filled quantity
+        # ----------------------------------------------------
+
+        executed_qty = Decimal(
+            str(
+                order.get(
+                    "executedQty",
+                    "0"
+                )
             )
         )
 
-        fills = order.get(
+
+        if executed_qty <= 0:
+
+            logger.error(
+                "%s | BUY executedQty is zero",
+                symbol
+            )
+
+            return False
+
+
+        # ----------------------------------------------------
+        # Calculate average entry price
+        # ----------------------------------------------------
+
+        total_quote = Decimal("0")
+
+        total_qty = Decimal("0")
+
+
+        for fill in order.get(
             "fills",
             []
-        )
+        ):
 
-        total_cost = 0.0
-        total_qty = 0.0
-
-        for fill in fills:
-
-            try:
-
-                fill_price = float(
-                    fill["price"]
+            fill_price = Decimal(
+                str(
+                    fill.get(
+                        "price",
+                        "0"
+                    )
                 )
+            )
 
-                fill_qty = float(
-                    fill["qty"]
+            fill_qty = Decimal(
+                str(
+                    fill.get(
+                        "qty",
+                        "0"
+                    )
                 )
+            )
 
-                total_cost += (
-                    fill_price * fill_qty
-                )
+            total_quote += (
+                fill_price
+                * fill_qty
+            )
 
-                total_qty += fill_qty
+            total_qty += fill_qty
 
-            except Exception:
-                continue
 
         if total_qty > 0:
 
             entry_price = (
-                total_cost
+                total_quote
                 / total_qty
             )
 
         else:
 
-            entry_price = (
-                get_current_price(symbol)
+            entry_price = Decimal(
+                str(
+                    get_current_price(
+                        symbol
+                    )
+                    or 0
+                )
             )
 
-        if entry_price is None:
+
+        if entry_price <= 0:
 
             logger.error(
-                "%s | Cannot determine entry price",
+                "%s | Invalid entry price",
                 symbol
             )
 
-            return
+            return False
+
+
+        # ----------------------------------------------------
+        # Normalize quantity
+        # ----------------------------------------------------
 
         quantity = normalize_quantity(
             symbol,
             executed_qty
         )
 
+
         if quantity <= 0:
 
             logger.error(
-                "%s | Invalid executed quantity: %s",
-                symbol,
-                executed_qty
+                "%s | Quantity below minimum",
+                symbol
             )
 
-            return
+            return False
 
-        logger.info(
-            "%s | BUY executed | "
-            "Entry=%.8f | Qty=%.8f",
-            symbol,
-            entry_price,
-            quantity
-        )
 
-        # ====================================================
-        # SERVER STOP LOSS
-        # ====================================================
+        # ----------------------------------------------------
+        # PLACE SERVER STOP LOSS
+        # ----------------------------------------------------
 
-        stop_order_id = (
+        stop_order = (
             place_server_stop_loss(
                 symbol,
                 quantity,
-                entry_price
+                float(entry_price)
             )
         )
 
-        # ====================================================
-        # SAFETY:
-        # If server SL cannot be placed,
-        # immediately market sell.
-        # ====================================================
 
-        if not stop_order_id:
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # If server SL cannot be placed,
+        # emergency market sell.
+        # ----------------------------------------------------
+
+        if stop_order is None:
 
             logger.error(
-                "%s | Server SL FAILED. "
-                "Emergency MARKET SELL.",
+                "%s | STOP LOSS FAILED -> "
+                "Emergency MARKET SELL",
                 symbol
             )
 
@@ -1437,72 +1967,213 @@ def buy_symbol(symbol):
                 quantity
             )
 
-            return
+            return False
 
-        with positions_lock:
 
-            positions[symbol] = {
+        stop_order_id = stop_order.get(
+            "orderId"
+        )
 
-                "entry_price": float(
+
+        stop_price = (
+            entry_price
+            * (
+                Decimal("1")
+                - Decimal(
+                    str(
+                        STOP_LOSS_PCT
+                    )
+                )
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # Save position
+        # ----------------------------------------------------
+
+        position = {
+
+            "symbol": symbol,
+
+            "entry_price":
+                float(
                     entry_price
                 ),
 
-                "quantity": float(
+            "quantity":
+                float(
                     quantity
                 ),
 
-                "highest_price": float(
+            "highest_price":
+                float(
                     entry_price
                 ),
 
-                "trailing_active": False,
+            "trailing_active":
+                False,
 
-                "stop_order_id": stop_order_id,
+            "stop_order_id":
+                stop_order_id,
 
-                "stop_price": normalize_price(
-                    symbol,
-                    entry_price
-                    * (
-                        1.0
-                        - STOP_LOSS_PCT
-                    )
+            "stop_price":
+                float(
+                    stop_price
                 ),
-            }
+
+            "created_at":
+                time.time(),
+        }
+
+
+        with positions_lock:
+
+            positions[
+                symbol
+            ] = position
+
 
         logger.info(
-            "%s | POSITION OPENED | "
-            "Entry=%.8f | SL=%.8f | "
-            "Trailing activates=%.8f",
+            "%s | BUY SUCCESS | "
+            "Entry=%.8f | Qty=%s | "
+            "SL=%.8f | Trailing activation=+%.2f%%",
             symbol,
-            entry_price,
-            entry_price * (
-                1.0 - STOP_LOSS_PCT
+            float(entry_price),
+            decimal_to_string(
+                quantity
             ),
-            entry_price * (
-                1.0 + TRAILING_ACTIVATION_PCT
-            ),
+            float(stop_price),
+            TRAILING_ACTIVATION_PCT * 100,
         )
+
+
+        return True
+
 
     except BinanceAPIException as e:
 
         logger.error(
-            "%s | BUY API error: %s",
+            "%s | BUY Binance error: %s",
             symbol,
             e
         )
 
+        return False
+
+
     except Exception as e:
 
-        logger.exception(
+        logger.error(
             "%s | BUY error: %s",
             symbol,
             e
         )
 
+        return False
+
+
     finally:
 
         with buying_lock:
-            buying_symbols.discard(symbol)
+
+            buying_symbols.discard(
+                symbol
+            )
+
+
+# ============================================================
+# SELL SYMBOL
+# ============================================================
+
+def sell_symbol(
+    symbol,
+    reason
+):
+
+    with selling_lock:
+
+        if symbol in selling_symbols:
+
+            return False
+
+        selling_symbols.add(
+            symbol
+        )
+
+
+    try:
+
+        with positions_lock:
+
+            position = positions.get(
+                symbol
+            )
+
+
+        if not position:
+
+            return False
+
+
+        stop_order_id = position.get(
+            "stop_order_id"
+        )
+
+
+        # ----------------------------------------------------
+        # Cancel server SL first
+        # ----------------------------------------------------
+
+        if stop_order_id:
+
+            cancel_server_stop(
+                symbol,
+                stop_order_id
+            )
+
+
+        # ----------------------------------------------------
+        # Market sell
+        # ----------------------------------------------------
+
+        order = market_sell(
+            symbol,
+            position[
+                "quantity"
+            ]
+        )
+
+
+        if order is not None:
+
+            with positions_lock:
+
+                positions.pop(
+                    symbol,
+                    None
+                )
+
+
+            logger.info(
+                "%s | POSITION CLOSED | Reason=%s",
+                symbol,
+                reason
+            )
+
+            return True
+
+
+        return False
+
+
+    finally:
+
+        with selling_lock:
+
+            selling_symbols.discard(
+                symbol
+            )
 
 
 # ============================================================
@@ -1511,7 +2182,7 @@ def buy_symbol(symbol):
 
 def check_position(
     symbol,
-    current_price
+    current_price=None
 ):
 
     try:
@@ -1522,113 +2193,159 @@ def check_position(
                 symbol
             )
 
-            if not position:
-                return
 
-            # Make copy so calculations don't hold lock
-            position = dict(position)
+        if not position:
 
-        entry_price = float(
-            position["entry_price"]
-        )
+            return
 
-        quantity = float(
-            position["quantity"]
-        )
 
-        highest_price = float(
-            position["highest_price"]
-        )
+        # ----------------------------------------------------
+        # Get current price
+        # ----------------------------------------------------
 
-        trailing_active = bool(
-            position["trailing_active"]
-        )
+        if current_price is None:
 
-        stop_order_id = position.get(
-            "stop_order_id"
-        )
-
-        # ====================================================
-        # UPDATE HIGHEST PRICE
-        # ====================================================
-
-        if current_price > highest_price:
-
-            highest_price = current_price
-
-            with positions_lock:
-
-                if symbol in positions:
-
-                    positions[symbol][
-                        "highest_price"
-                    ] = highest_price
-
-        # ====================================================
-        # SERVER SL LEVEL
-        # ====================================================
-
-        server_stop_price = (
-            entry_price
-            * (1.0 - STOP_LOSS_PCT)
-        )
-
-        # ====================================================
-        # SERVER STOP CHECK
-        # ====================================================
-
-        if (
-            current_price
-            <= server_stop_price
-            and stop_order_id
-        ):
-
-            status = (
-                get_stop_order_status(
-                    symbol,
-                    stop_order_id
+            current_price = (
+                get_current_price(
+                    symbol
                 )
             )
 
-            if status == "FILLED":
 
-                logger.info(
-                    "%s | Server SL FILLED",
-                    symbol
+        if current_price is None:
+
+            return
+
+
+        current_price = float(
+            current_price
+        )
+
+
+        if current_price <= 0:
+
+            return
+
+
+        entry_price = float(
+            position[
+                "entry_price"
+            ]
+        )
+
+
+        # ----------------------------------------------------
+        # Update highest price
+        # ----------------------------------------------------
+
+        if (
+            current_price
+            > position[
+                "highest_price"
+            ]
+        ):
+
+            position[
+                "highest_price"
+            ] = current_price
+
+
+        highest_price = float(
+            position[
+                "highest_price"
+            ]
+        )
+
+
+        # ====================================================
+        # SERVER STOP LOSS CHECK
+        # ====================================================
+
+        stop_price = float(
+            position[
+                "stop_price"
+            ]
+        )
+
+
+        if current_price <= stop_price:
+
+            stop_order_id = (
+                position.get(
+                    "stop_order_id"
+                )
+            )
+
+
+            if stop_order_id:
+
+                status = (
+                    get_stop_order_status(
+                        symbol,
+                        stop_order_id
+                    )
                 )
 
-                with positions_lock:
-                    positions.pop(
-                        symbol,
-                        None
+
+                if status:
+
+                    order_status = status.get(
+                        "status"
                     )
 
-                return
 
-            elif status in {
-                "CANCELED",
-                "EXPIRED",
-                "REJECTED",
-            }:
+                    if order_status == "FILLED":
 
-                logger.warning(
-                    "%s | Server SL status=%s. "
-                    "Emergency MARKET SELL.",
-                    symbol,
-                    status
-                )
+                        logger.info(
+                            "%s | SERVER STOP LOSS FILLED",
+                            symbol
+                        )
+
+                        with positions_lock:
+
+                            positions.pop(
+                                symbol,
+                                None
+                            )
+
+                        return
+
+
+                    if order_status in {
+                        "CANCELED",
+                        "EXPIRED",
+                        "REJECTED",
+                    }:
+
+                        logger.warning(
+                            "%s | Server stop status=%s "
+                            "-> Emergency market sell",
+                            symbol,
+                            order_status
+                        )
+
+                        sell_symbol(
+                            symbol,
+                            "STOP_LOSS_FALLBACK"
+                        )
+
+                        return
+
+
+                    if order_status == "NEW":
+
+                        return
+
+
+            else:
 
                 sell_symbol(
                     symbol,
-                    reason="SERVER_SL_FALLBACK"
+                    "STOP_LOSS"
                 )
 
                 return
 
-            elif status == "NEW":
-
-                # Binance server-side SL is active.
-                return
 
         # ====================================================
         # TRAILING ACTIVATION
@@ -1642,35 +2359,37 @@ def check_position(
             )
         )
 
+
         if (
-            not trailing_active
-            and current_price
+            not position[
+                "trailing_active"
+            ]
+            and
+            current_price
             >= activation_price
         ):
 
-            trailing_active = True
+            position[
+                "trailing_active"
+            ] = True
 
-            with positions_lock:
-
-                if symbol in positions:
-
-                    positions[symbol][
-                        "trailing_active"
-                    ] = True
 
             logger.info(
-                "%s | TRAILING ACTIVATED | "
-                "Price=%.8f | Activation=%.8f",
+                "%s | TRAILING STOP ACTIVATED | "
+                "Entry=%.8f | Current=%.8f",
                 symbol,
+                entry_price,
                 current_price,
-                activation_price,
             )
+
 
         # ====================================================
         # TRAILING STOP
         # ====================================================
 
-        if trailing_active:
+        if position[
+            "trailing_active"
+        ]:
 
             trailing_stop = (
                 highest_price
@@ -1680,7 +2399,11 @@ def check_position(
                 )
             )
 
-            if current_price <= trailing_stop:
+
+            if (
+                current_price
+                <= trailing_stop
+            ):
 
                 logger.info(
                     "%s | TRAILING STOP HIT | "
@@ -1692,10 +2415,12 @@ def check_position(
                     trailing_stop,
                 )
 
+
                 sell_symbol(
                     symbol,
-                    reason="TRAILING_STOP"
+                    "TRAILING_STOP"
                 )
+
 
     except Exception as e:
 
@@ -1704,106 +2429,6 @@ def check_position(
             symbol,
             e
         )
-
-
-# ============================================================
-# SELL SYMBOL
-# ============================================================
-
-def sell_symbol(
-    symbol,
-    reason="MANUAL"
-):
-
-    with selling_lock:
-
-        if symbol in selling_symbols:
-            return
-
-        selling_symbols.add(symbol)
-
-    try:
-
-        with positions_lock:
-
-            position = positions.get(
-                symbol
-            )
-
-            if not position:
-                return
-
-            quantity = float(
-                position["quantity"]
-            )
-
-            stop_order_id = position.get(
-                "stop_order_id"
-            )
-
-        logger.info(
-            "%s | SELL START | Reason=%s",
-            symbol,
-            reason
-        )
-
-        # ====================================================
-        # CANCEL SERVER STOP FIRST
-        # ====================================================
-
-        if stop_order_id:
-
-            cancel_server_stop(
-                symbol,
-                stop_order_id
-            )
-
-            time.sleep(0.1)
-
-        # ====================================================
-        # MARKET SELL
-        # ====================================================
-
-        order = market_sell(
-            symbol,
-            quantity
-        )
-
-        if order:
-
-            with positions_lock:
-
-                positions.pop(
-                    symbol,
-                    None
-                )
-
-            logger.info(
-                "%s | POSITION CLOSED | Reason=%s",
-                symbol,
-                reason
-            )
-
-        else:
-
-            logger.error(
-                "%s | MARKET SELL FAILED | "
-                "Position kept in memory for retry.",
-                symbol
-            )
-
-    except Exception as e:
-
-        logger.exception(
-            "%s | SELL error: %s",
-            symbol,
-            e
-        )
-
-    finally:
-
-        with selling_lock:
-            selling_symbols.discard(symbol)
 
 
 # ============================================================
@@ -1822,78 +2447,78 @@ def recover_entry_price_from_trades(
             limit=1000
         )
 
-        total_buy_qty = 0.0
-        total_buy_cost = 0.0
+
+        net_qty = Decimal("0")
+
+        total_cost = Decimal("0")
+
 
         for trade in trades:
 
-            try:
-
-                qty = float(
-                    trade["qty"]
-                )
-
-                price = float(
-                    trade["price"]
-                )
-
-                is_buyer = bool(
-                    trade["isBuyer"]
-                )
-
-                if is_buyer:
-
-                    total_buy_qty += qty
-
-                    total_buy_cost += (
-                        qty * price
+            qty = Decimal(
+                str(
+                    trade.get(
+                        "qty",
+                        "0"
                     )
-
-                else:
-
-                    sell_qty = min(
-                        qty,
-                        total_buy_qty
-                    )
-
-                    if (
-                        total_buy_qty
-                        > 0
-                    ):
-
-                        average_buy_price = (
-                            total_buy_cost
-                            / total_buy_qty
-                        )
-
-                        total_buy_qty -= (
-                            sell_qty
-                        )
-
-                        total_buy_cost -= (
-                            sell_qty
-                            * average_buy_price
-                        )
-
-            except Exception:
-                continue
-
-        if total_buy_qty > 0:
-
-            return (
-                total_buy_cost
-                / total_buy_qty
+                )
             )
+
+            price = Decimal(
+                str(
+                    trade.get(
+                        "price",
+                        "0"
+                    )
+                )
+            )
+
+            is_buyer = bool(
+                trade.get(
+                    "isBuyer",
+                    False
+                )
+            )
+
+
+            if is_buyer:
+
+                net_qty += qty
+
+                total_cost += (
+                    qty * price
+                )
+
+            else:
+
+                net_qty -= qty
+
+
+        if net_qty <= 0:
+
+            return None
+
+
+        average_price = (
+            total_cost
+            / net_qty
+        )
+
+
+        return float(
+            average_price
+        )
+
 
     except Exception as e:
 
-        logger.warning(
+        logger.error(
             "%s | Recover entry error: %s",
             symbol,
             e
         )
 
-    return None
+        return None
 
 
 # ============================================================
@@ -1906,53 +2531,82 @@ def recover_positions():
         "Checking existing Binance balances..."
     )
 
+
     try:
 
-        account = client.get_account()
+        account = (
+            client.get_account()
+        )
 
         balances = account.get(
             "balances",
             []
         )
 
-        recovered = 0
 
         for balance in balances:
 
             try:
 
-                asset = balance["asset"]
-
-                free = float(
-                    balance["free"]
+                asset = balance.get(
+                    "asset"
                 )
 
-                locked = float(
-                    balance["locked"]
+                free = Decimal(
+                    str(
+                        balance.get(
+                            "free",
+                            "0"
+                        )
+                    )
+                )
+
+                locked = Decimal(
+                    str(
+                        balance.get(
+                            "locked",
+                            "0"
+                        )
+                    )
                 )
 
                 total_balance = (
                     free + locked
                 )
 
+
                 if total_balance <= 0:
                     continue
+
 
                 if asset in STABLECOINS:
                     continue
 
+
                 symbol = (
-                    asset
-                    + "USDT"
+                    asset + "USDT"
                 )
 
-                if symbol in EXCLUDED_SYMBOLS:
-                    continue
 
                 with symbol_info_lock:
 
                     if symbol not in symbol_info:
                         continue
+
+
+                if symbol in EXCLUDED_SYMBOLS:
+                    continue
+
+
+                quantity = normalize_quantity(
+                    symbol,
+                    total_balance
+                )
+
+
+                if quantity <= 0:
+                    continue
+
 
                 current_price = (
                     get_current_price(
@@ -1960,10 +2614,15 @@ def recover_positions():
                     )
                 )
 
-                if current_price is None:
+
+                if not current_price:
                     continue
 
-                # Try to determine entry
+
+                # ------------------------------------------------
+                # Recover average entry
+                # ------------------------------------------------
+
                 entry_price = (
                     recover_entry_price_from_trades(
                         symbol,
@@ -1971,41 +2630,58 @@ def recover_positions():
                     )
                 )
 
-                if entry_price is None:
 
-                    # Fallback
-                    entry_price = (
-                        current_price
-                    )
+                if not entry_price:
 
-                quantity = (
-                    normalize_quantity(
-                        symbol,
-                        total_balance
-                    )
-                )
+                    entry_price = current_price
 
-                if quantity <= 0:
-                    continue
 
-                stop_order_id = (
+                # ------------------------------------------------
+                # Find existing server stop
+                # ------------------------------------------------
+
+                existing_stop = (
                     find_existing_server_stop(
                         symbol
                     )
                 )
 
-                # If no server SL exists,
-                # create one immediately.
-                if not stop_order_id:
 
-                    logger.warning(
-                        "%s | Existing position "
-                        "has no server SL. "
-                        "Creating one.",
-                        symbol
+                stop_order_id = None
+
+                stop_price = (
+                    entry_price
+                    * (
+                        1.0
+                        - STOP_LOSS_PCT
                     )
+                )
+
+
+                if existing_stop:
 
                     stop_order_id = (
+                        existing_stop.get(
+                            "orderId"
+                        )
+                    )
+
+                    try:
+
+                        stop_price = float(
+                            existing_stop.get(
+                                "stopPrice",
+                                stop_price
+                            )
+                        )
+
+                    except Exception:
+                        pass
+
+
+                else:
+
+                    stop_order = (
                         place_server_stop_loss(
                             symbol,
                             quantity,
@@ -2013,45 +2689,66 @@ def recover_positions():
                         )
                     )
 
+
+                    if stop_order:
+
+                        stop_order_id = (
+                            stop_order.get(
+                                "orderId"
+                            )
+                        )
+
+
                 if not stop_order_id:
 
-                    logger.error(
-                        "%s | Could not create "
-                        "recovery SL. Skipping.",
+                    logger.warning(
+                        "%s | Could not create recovery stop",
                         symbol
                     )
 
                     continue
 
-                activation_price = (
-                    entry_price
-                    * (
-                        1.0
-                        + TRAILING_ACTIVATION_PCT
-                    )
-                )
 
                 trailing_active = (
                     current_price
-                    >= activation_price
+                    >= (
+                        entry_price
+                        * (
+                            1.0
+                            + TRAILING_ACTIVATION_PCT
+                        )
+                    )
                 )
+
 
                 with positions_lock:
 
-                    positions[symbol] = {
+                    positions[
+                        symbol
+                    ] = {
 
-                        "entry_price": float(
-                            entry_price
-                        ),
+                        "symbol":
+                            symbol,
 
-                        "quantity": float(
-                            quantity
-                        ),
+                        "entry_price":
+                            float(
+                                entry_price
+                            ),
 
-                        "highest_price": max(
-                            float(entry_price),
-                            float(current_price)
-                        ),
+                        "quantity":
+                            float(
+                                quantity
+                            ),
+
+                        "highest_price":
+                            max(
+                                float(
+                                    current_price
+                                ),
+                                float(
+                                    entry_price
+                                )
+                            ),
 
                         "trailing_active":
                             trailing_active,
@@ -2060,71 +2757,42 @@ def recover_positions():
                             stop_order_id,
 
                         "stop_price":
-                            normalize_price(
-                                symbol,
-                                entry_price
-                                * (
-                                    1.0
-                                    - STOP_LOSS_PCT
-                                )
+                            float(
+                                stop_price
                             ),
+
+                        "created_at":
+                            time.time(),
+
                     }
 
-                recovered += 1
 
                 logger.info(
-                    "%s | Position recovered | "
-                    "Qty=%.8f | Entry=%.8f | "
-                    "Current=%.8f",
+                    "%s | POSITION RECOVERED | "
+                    "Entry=%.8f | Qty=%s | "
+                    "Current=%.8f | Trailing=%s",
                     symbol,
-                    quantity,
                     entry_price,
+                    decimal_to_string(
+                        quantity
+                    ),
                     current_price,
+                    trailing_active,
                 )
+
 
             except Exception as e:
 
                 logger.error(
-                    "Position recovery error: %s",
+                    "Balance recovery error: %s",
                     e
                 )
 
-        logger.info(
-            "Position recovery complete | "
-            "Recovered=%s",
-            recovered
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Account recovery error: %s",
-            e
-        )
-
-
-# ============================================================
-# PROCESS CLOSED CANDLE
-# ============================================================
-
-def process_closed_candle(symbol):
-
-    try:
-
-        with positions_lock:
-
-            if symbol in positions:
-                return
-
-        if check_buy_condition(symbol):
-
-            buy_symbol(symbol)
 
     except Exception as e:
 
         logger.error(
-            "%s | Candle processing error: %s",
-            symbol,
+            "Position recovery failed: %s",
             e
         )
 
@@ -2133,14 +2801,18 @@ def process_closed_candle(symbol):
 # CANDLE QUEUE
 # ============================================================
 
-def enqueue_closed_candle(symbol):
+def enqueue_candle(symbol):
 
     with queued_candles_lock:
 
         if symbol in queued_candles:
+
             return
 
-        queued_candles.add(symbol)
+        queued_candles.add(
+            symbol
+        )
+
 
     try:
 
@@ -2150,12 +2822,8 @@ def enqueue_closed_candle(symbol):
 
     except queue.Full:
 
-        logger.warning(
-            "Candle queue full. Dropping %s",
-            symbol
-        )
-
         with queued_candles_lock:
+
             queued_candles.discard(
                 symbol
             )
@@ -2171,113 +2839,27 @@ def candle_worker():
         "Candle worker started"
     )
 
+
     while True:
 
-        symbol = None
+        symbol = (
+            candle_queue.get()
+        )
+
 
         try:
 
-            symbol = candle_queue.get()
+            with queued_candles_lock:
 
-            process_closed_candle(
-                symbol
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                "Candle worker error: %s",
-                e
-            )
-
-        finally:
-
-            if symbol:
-
-                with queued_candles_lock:
-
-                    queued_candles.discard(
-                        symbol
-                    )
-
-            candle_queue.task_done()
-
-
-# ============================================================
-# WEBSOCKET MESSAGE PROCESSOR
-# ============================================================
-
-def process_ws_message(message):
-
-    try:
-
-        data = json.loads(message)
-
-        payload = data.get(
-            "data",
-            data
-        )
-
-        event_type = payload.get(
-            "e"
-        )
-
-        # ====================================================
-        # KLINE
-        # ====================================================
-
-        if event_type == "kline":
-
-            kline = payload.get(
-                "k",
-                {}
-            )
-
-            symbol = kline.get(
-                "s"
-            )
-
-            candle_closed = bool(
-                kline.get("x", False)
-            )
-
-            if (
-                symbol
-                and candle_closed
-            ):
-
-                # IMPORTANT:
-                # Do NOT calculate indicators here.
-                # Put symbol into worker queue.
-                enqueue_closed_candle(
+                queued_candles.discard(
                     symbol
                 )
 
-        # ====================================================
-        # MINI TICKER
-        # ====================================================
 
-        elif event_type == "24hrMiniTicker":
-
-            symbol = payload.get(
-                "s"
-            )
-
-            price_text = payload.get(
-                "c"
-            )
-
-            if not symbol or not price_text:
-                return
-
-            try:
-
-                current_price = float(
-                    price_text
-                )
-
-            except Exception:
-                return
+            # ------------------------------------------------
+            # If already holding this symbol,
+            # don't look for another BUY.
+            # ------------------------------------------------
 
             with positions_lock:
 
@@ -2285,203 +2867,37 @@ def process_ws_message(message):
                     symbol in positions
                 )
 
+
             if has_position:
 
-                # Position check is normally lightweight.
-                check_position(
-                    symbol,
-                    current_price
-                )
-
-    except json.JSONDecodeError:
-
-        logger.warning(
-            "WebSocket received invalid JSON"
-        )
-
-    except Exception as e:
-
-        logger.error(
-            "WebSocket message processing error: %s",
-            e
-        )
+                continue
 
 
-# ============================================================
-# WEBSOCKET URL
-# ============================================================
+            # ------------------------------------------------
+            # Check BUY condition
+            # ------------------------------------------------
 
-def make_stream_url(
-    symbol_chunk
-):
-
-    streams = []
-
-    for symbol in symbol_chunk:
-
-        lower_symbol = symbol.lower()
-
-        streams.append(
-            lower_symbol
-            + "@kline_5m"
-        )
-
-        streams.append(
-            lower_symbol
-            + "@miniTicker"
-        )
-
-    return (
-        "wss://stream.binance.com:9443"
-        "/stream?streams="
-        + "/".join(streams)
-    )
-
-
-# ============================================================
-# WEBSOCKET WORKER
-# ============================================================
-
-def websocket_worker(
-    symbol_chunk,
-    worker_id
-):
-
-    url = make_stream_url(
-        symbol_chunk
-    )
-
-    logger.info(
-        "WebSocket worker %s starting | "
-        "Symbols=%s",
-        worker_id,
-        len(symbol_chunk)
-    )
-
-    while True:
-
-        try:
-
-            def on_open(ws):
-
-                logger.info(
-                    "WebSocket worker %s connected",
-                    worker_id
-                )
-
-            def on_message(
-                ws,
-                message
+            if check_buy_condition(
+                symbol
             ):
 
-                # Keep this callback very fast.
-                process_ws_message(
-                    message
+                buy_symbol(
+                    symbol
                 )
 
-            def on_error(
-                ws,
-                error
-            ):
-
-                logger.error(
-                    "WebSocket worker %s error: %s",
-                    worker_id,
-                    error
-                )
-
-            def on_close(
-                ws,
-                close_status_code,
-                close_msg
-            ):
-
-                logger.warning(
-                    "WebSocket worker %s closed | "
-                    "Code=%s | Msg=%s",
-                    worker_id,
-                    close_status_code,
-                    close_msg
-                )
-
-            ws = websocket.WebSocketApp(
-                url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
-            )
-
-            ws.run_forever(
-                ping_interval=WS_PING_INTERVAL,
-                ping_timeout=WS_PING_TIMEOUT,
-                ping_payload="ping",
-            )
 
         except Exception as e:
 
-            logger.exception(
-                "WebSocket worker %s exception: %s",
-                worker_id,
+            logger.error(
+                "%s | Candle worker error: %s",
+                symbol,
                 e
             )
 
-        logger.info(
-            "WebSocket worker %s reconnecting in %s seconds...",
-            worker_id,
-            RECONNECT_DELAY
-        )
 
-        time.sleep(
-            RECONNECT_DELAY
-        )
+        finally:
 
-
-# ============================================================
-# WEBSOCKET LOOP
-# ============================================================
-
-def websocket_loop():
-
-    if not symbols:
-
-        logger.error(
-            "No symbols available for WebSocket"
-        )
-
-        return
-
-    chunks = [
-        symbols[i:i + WS_SYMBOLS_PER_CONNECTION]
-        for i in range(
-            0,
-            len(symbols),
-            WS_SYMBOLS_PER_CONNECTION
-        )
-    ]
-
-    logger.info(
-        "Starting %s WebSocket connections...",
-        len(chunks)
-    )
-
-    for index, chunk in enumerate(
-        chunks,
-        start=1
-    ):
-
-        thread = threading.Thread(
-            target=websocket_worker,
-            args=(chunk, index),
-            daemon=True,
-            name=f"WS-{index}",
-        )
-
-        thread.start()
-
-        # Avoid opening all connections
-        # at exactly the same moment.
-        time.sleep(0.5)
+            candle_queue.task_done()
 
 
 # ============================================================
@@ -2494,59 +2910,412 @@ def position_monitor():
         "Position monitor started"
     )
 
+
     while True:
 
         try:
 
             with positions_lock:
 
-                active = list(
-                    positions.items()
+                current_symbols = list(
+                    positions.keys()
                 )
 
-            if active:
 
-                logger.info(
-                    "Active positions: %s",
-                    len(active)
-                )
+            for symbol in current_symbols:
 
-                for symbol, position in active:
+                try:
 
-                    try:
+                    # Use latest WebSocket price
+                    with latest_prices_lock:
 
-                        current_price = (
-                            get_current_price(
-                                symbol
-                            )
+                        price = latest_prices.get(
+                            symbol
                         )
 
-                        if current_price is None:
-                            continue
 
-                        check_position(
-                            symbol,
-                            current_price
-                        )
+                    check_position(
+                        symbol,
+                        price
+                    )
 
-                    except Exception as e:
 
-                        logger.error(
-                            "%s | Monitor error: %s",
-                            symbol,
-                            e
-                        )
+                except Exception as e:
 
-            time.sleep(60)
+                    logger.error(
+                        "%s | Monitor error: %s",
+                        symbol,
+                        e
+                    )
+
+
+            time.sleep(
+                5
+            )
+
 
         except Exception as e:
 
-            logger.exception(
-                "Position monitor error: %s",
+            logger.error(
+                "Position monitor loop error: %s",
                 e
             )
 
-            time.sleep(10)
+            time.sleep(
+                5
+            )
+
+
+# ============================================================
+# WEBSOCKET MESSAGE
+# ============================================================
+
+def process_ws_message(
+    message
+):
+
+    try:
+
+        data = json.loads(
+            message
+        )
+
+
+        # ----------------------------------------------------
+        # Combined stream format
+        # ----------------------------------------------------
+
+        if "data" in data:
+
+            data = data[
+                "data"
+            ]
+
+
+        event_type = data.get(
+            "e"
+        )
+
+
+        # ====================================================
+        # KLINE
+        # ====================================================
+
+        if event_type == "kline":
+
+            kline = data.get(
+                "k",
+                {}
+            )
+
+            symbol = kline.get(
+                "s"
+            )
+
+
+            is_closed = kline.get(
+                "x",
+                False
+            )
+
+
+            if (
+                symbol
+                and is_closed
+            ):
+
+                enqueue_candle(
+                    symbol
+                )
+
+
+        # ====================================================
+        # MINI TICKER
+        # ====================================================
+
+        elif event_type == "24hrMiniTicker":
+
+            symbol = data.get(
+                "s"
+            )
+
+            price_text = data.get(
+                "c"
+            )
+
+
+            if (
+                symbol
+                and price_text
+            ):
+
+                try:
+
+                    price = float(
+                        price_text
+                    )
+
+                    if price > 0:
+
+                        with latest_prices_lock:
+
+                            latest_prices[
+                                symbol
+                            ] = price
+
+
+                except Exception:
+                    pass
+
+
+    except Exception as e:
+
+        logger.error(
+            "WebSocket message processing error: %s",
+            e
+        )
+
+
+# ============================================================
+# WEBSOCKET CALLBACKS
+# ============================================================
+
+def ws_on_message(
+    ws,
+    message
+):
+
+    process_ws_message(
+        message
+    )
+
+
+def ws_on_error(
+    ws,
+    error
+):
+
+    logger.error(
+        "WebSocket error: %s",
+        error
+    )
+
+
+def ws_on_close(
+    ws,
+    close_status_code,
+    close_msg
+):
+
+    logger.warning(
+        "WebSocket closed | code=%s | msg=%s",
+        close_status_code,
+        close_msg
+    )
+
+
+def ws_on_open(ws):
+
+    logger.info(
+        "WebSocket connected"
+    )
+
+
+# ============================================================
+# MAKE STREAM URL
+# ============================================================
+
+def make_stream_url(
+    symbol_list
+):
+
+    streams = []
+
+    for symbol in symbol_list:
+
+        lower_symbol = (
+            symbol.lower()
+        )
+
+        streams.append(
+            f"{lower_symbol}@kline_5m"
+        )
+
+        streams.append(
+            f"{lower_symbol}@miniTicker"
+        )
+
+
+    return (
+        "wss://stream.binance.com:9443"
+        "/stream?streams="
+        + "/".join(streams)
+    )
+
+
+# ============================================================
+# RUN ONE WEBSOCKET
+# ============================================================
+
+def run_websocket(
+    symbol_list,
+    connection_number
+):
+
+    if not symbol_list:
+
+        return
+
+
+    url = make_stream_url(
+        symbol_list
+    )
+
+
+    logger.info(
+        "Starting WebSocket #%d | Symbols=%d",
+        connection_number,
+        len(symbol_list)
+    )
+
+
+    while True:
+
+        try:
+
+            ws = websocket.WebSocketApp(
+
+                url,
+
+                on_open=ws_on_open,
+
+                on_message=ws_on_message,
+
+                on_error=ws_on_error,
+
+                on_close=ws_on_close,
+            )
+
+
+            ws.run_forever(
+
+                ping_interval=
+                    WS_PING_INTERVAL,
+
+                ping_timeout=
+                    WS_PING_TIMEOUT,
+
+                ping_payload="ping",
+
+            )
+
+
+        except Exception as e:
+
+            logger.error(
+                "WebSocket #%d exception: %s",
+                connection_number,
+                e
+            )
+
+
+        logger.warning(
+            "WebSocket #%d reconnecting in %d seconds...",
+            connection_number,
+            RECONNECT_DELAY
+        )
+
+
+        time.sleep(
+            RECONNECT_DELAY
+        )
+
+
+# ============================================================
+# WEBSOCKET MANAGER
+# ============================================================
+
+def websocket_manager():
+
+    logger.info(
+        "Starting WebSocket manager..."
+    )
+
+
+    chunks = []
+
+
+    for i in range(
+        0,
+        len(symbols),
+        WS_SYMBOLS_PER_CONNECTION
+    ):
+
+        chunks.append(
+            symbols[
+                i:
+                i + WS_SYMBOLS_PER_CONNECTION
+            ]
+        )
+
+
+    for index, chunk in enumerate(
+        chunks,
+        start=1
+    ):
+
+        thread = threading.Thread(
+
+            target=run_websocket,
+
+            args=(
+                chunk,
+                index
+            ),
+
+            daemon=True,
+        )
+
+
+        thread.start()
+
+
+        # Small delay between connections
+        time.sleep(
+            1
+        )
+
+
+    logger.info(
+        "Started %d WebSocket connections",
+        len(chunks)
+    )
+
+
+# ============================================================
+# FLASK SERVER
+# ============================================================
+
+def run_flask():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+
+    app.run(
+
+        host="0.0.0.0",
+
+        port=port,
+
+        debug=False,
+
+        use_reloader=False,
+    )
 
 
 # ============================================================
@@ -2564,38 +3333,51 @@ def startup():
     )
 
     logger.info(
-        "BUY RULE → "
-        "OPEN < BB20 LOWER + "
-        "CLOSE > BB20 LOWER + "
-        "ADX14 > 20 + DI+ > DI-"
+        "BUY RULE:"
     )
 
     logger.info(
-        "TRADE AMOUNT → %.2f USDT",
-        TRADE_AMOUNT_USDT
+        "Open < BB20 Lower"
     )
 
     logger.info(
-        "SERVER STOP LOSS → %.2f%%",
+        "AND Close > BB20 Lower"
+    )
+
+    logger.info(
+        "AND ADX14 > 20"
+    )
+
+    logger.info(
+        "AND DI+ > DI-"
+    )
+
+    logger.info(
+        "STOP LOSS = %.2f%%",
         STOP_LOSS_PCT * 100
     )
 
     logger.info(
-        "TRAILING ACTIVATION → +%.2f%%",
+        "TRAILING ACTIVATION = +%.2f%%",
         TRAILING_ACTIVATION_PCT * 100
     )
 
     logger.info(
-        "TRAILING DISTANCE → %.2f%%",
+        "TRAILING DISTANCE = %.2f%%",
         TRAILING_STOP_PCT * 100
     )
 
     logger.info(
-        "TIMEFRAME → 5 MINUTES"
+        "TRADE AMOUNT = %.2f USDT",
+        TRADE_AMOUNT_USDT
     )
 
     logger.info(
-        "TOP SYMBOLS → %s",
+        "TIMEFRAME = 5 MINUTES"
+    )
+
+    logger.info(
+        "TOP SYMBOLS = %d",
         TOP_SYMBOLS
     )
 
@@ -2603,11 +3385,13 @@ def startup():
         "=" * 70
     )
 
+
     # --------------------------------------------------------
-    # Exchange information
+    # Binance exchange info
     # --------------------------------------------------------
 
     load_exchange_info()
+
 
     # --------------------------------------------------------
     # Top symbols
@@ -2615,50 +3399,65 @@ def startup():
 
     load_top_symbols()
 
+
+    if not symbols:
+
+        raise RuntimeError(
+            "No symbols loaded"
+        )
+
+
     # --------------------------------------------------------
     # Recover existing positions
     # --------------------------------------------------------
 
     recover_positions()
 
+
     # --------------------------------------------------------
     # Candle worker
     # --------------------------------------------------------
 
-    worker = threading.Thread(
+    candle_thread = threading.Thread(
+
         target=candle_worker,
-        daemon=True,
-        name="CandleWorker",
+
+        daemon=True
     )
 
-    worker.start()
+    candle_thread.start()
+
 
     # --------------------------------------------------------
     # Position monitor
     # --------------------------------------------------------
 
-    monitor = threading.Thread(
+    monitor_thread = threading.Thread(
+
         target=position_monitor,
-        daemon=True,
-        name="PositionMonitor",
+
+        daemon=True
     )
 
-    monitor.start()
+    monitor_thread.start()
+
 
     # --------------------------------------------------------
     # WebSockets
     # --------------------------------------------------------
 
-    ws_thread = threading.Thread(
-        target=websocket_loop,
-        daemon=True,
-        name="WebSocketManager",
+    websocket_thread = threading.Thread(
+
+        target=websocket_manager,
+
+        daemon=True
     )
 
-    ws_thread.start()
+    websocket_thread.start()
+
 
     logger.info(
-        "All trading workers started."
+        "All background services started."
     )
 
 
@@ -2670,15 +3469,6 @@ if __name__ == "__main__":
 
     startup()
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        threaded=True,
-    )
+    # Flask runs in main thread
+    run_flask()
