@@ -67,14 +67,22 @@ TRAILING_STOP_PCT = 0.0050
 # API / REQUEST SAFETY
 # ============================================================
 
-# Minimum time between REST kline requests for the same symbol
 KLINE_REQUEST_COOLDOWN = 2.0
 
-# Prevent duplicate BUY attempts on same symbol
 BUY_COOLDOWN_SECONDS = 60
 
-# Small delay between REST kline requests
 KLINE_REQUEST_DELAY = 0.05
+
+
+# ============================================================
+# RECOVERY SETTINGS
+# ============================================================
+
+# Binance my-trades maximum requested history
+RECOVERY_TRADE_LIMIT = 1000
+
+# Minimum balance considered as a real position
+RECOVERY_MIN_QTY = 0.00000001
 
 
 # ============================================================
@@ -108,7 +116,11 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "BB20 + ADX14 + DI BINANCE SPOT BOT RUNNING"
+
+    return (
+        "BB20 + ADX14 + DI "
+        "BINANCE SPOT BOT RUNNING"
+    )
 
 
 @app.route("/health")
@@ -428,7 +440,7 @@ def round_quantity(symbol, quantity):
 
 # ============================================================
 # REST PRICE
-# ONLY USED FOR BUY ORDER / RECOVERY
+# ONLY USED FOR BUY / RECOVERY
 # ============================================================
 
 def get_current_price(symbol):
@@ -458,10 +470,6 @@ def get_current_price(symbol):
 
 def get_closed_klines(symbol, limit=100):
 
-    # --------------------------------------------------------
-    # Request cooldown protection
-    # --------------------------------------------------------
-
     now = time.time()
 
     last_request = last_kline_request.get(
@@ -487,7 +495,6 @@ def get_closed_klines(symbol, limit=100):
         )
 
         if not klines:
-
             return None
 
         rows = []
@@ -511,7 +518,6 @@ def get_closed_klines(symbol, limit=100):
                 continue
 
         if len(rows) < 50:
-
             return None
 
         df = pd.DataFrame(rows)
@@ -538,7 +544,6 @@ def get_closed_klines(symbol, limit=100):
         )
 
         if len(df) < 50:
-
             return None
 
         return df
@@ -574,6 +579,8 @@ def calculate_indicators(df):
         if len(df) < 50:
             return None
 
+        df = df.copy()
+
         numeric_cols = [
             "open",
             "high",
@@ -584,7 +591,7 @@ def calculate_indicators(df):
 
         for col in numeric_cols:
 
-            df[col] = pd.to_numeric(
+            df.loc[:, col] = pd.to_numeric(
                 df[col],
                 errors="coerce"
             )
@@ -667,14 +674,12 @@ def calculate_indicators(df):
         # ====================================================
 
         prev_close = close.shift(1)
-
         prev_high = high.shift(1)
-
         prev_low = low.shift(1)
 
-        # ----------------------------------------------------
+        # ====================================================
         # TRUE RANGE
-        # ----------------------------------------------------
+        # ====================================================
 
         tr1 = high - low
 
@@ -688,27 +693,20 @@ def calculate_indicators(df):
             prev_close
         ).abs()
 
-        tr = tr1.copy()
+        tr = pd.concat(
+            [
+                tr1,
+                tr2,
+                tr3
+            ],
+            axis=1
+        ).max(
+            axis=1
+        )
 
-        mask2 = tr2 > tr
-
-        tr.loc[
-            mask2
-        ] = tr2.loc[
-            mask2
-        ]
-
-        mask3 = tr3 > tr
-
-        tr.loc[
-            mask3
-        ] = tr3.loc[
-            mask3
-        ]
-
-        # ----------------------------------------------------
+        # ====================================================
         # DIRECTIONAL MOVEMENT
-        # ----------------------------------------------------
+        # ====================================================
 
         up_move = (
             high -
@@ -720,43 +718,25 @@ def calculate_indicators(df):
             low
         )
 
-        plus_dm = pd.Series(
-            0.0,
-            index=close.index,
-            dtype="float64"
+        plus_dm = up_move.where(
+            (
+                (up_move > down_move) &
+                (up_move > 0)
+            ),
+            0.0
         )
 
-        minus_dm = pd.Series(
-            0.0,
-            index=close.index,
-            dtype="float64"
+        minus_dm = down_move.where(
+            (
+                (down_move > up_move) &
+                (down_move > 0)
+            ),
+            0.0
         )
 
-        plus_mask = (
-            (up_move > down_move) &
-            (up_move > 0)
-        )
-
-        minus_mask = (
-            (down_move > up_move) &
-            (down_move > 0)
-        )
-
-        plus_dm.loc[
-            plus_mask
-        ] = up_move.loc[
-            plus_mask
-        ]
-
-        minus_dm.loc[
-            minus_mask
-        ] = down_move.loc[
-            minus_mask
-        ]
-
-        # ----------------------------------------------------
+        # ====================================================
         # WILDER SMOOTHING
-        # ----------------------------------------------------
+        # ====================================================
 
         atr = tr.ewm(
             alpha=(1.0 / 14.0),
@@ -776,15 +756,13 @@ def calculate_indicators(df):
             min_periods=14
         ).mean()
 
-        atr_safe = atr.copy()
+        atr_safe = atr.mask(
+            atr == 0
+        )
 
-        atr_safe.loc[
-            atr_safe == 0
-        ] = float("nan")
-
-        # ----------------------------------------------------
+        # ====================================================
         # +DI / -DI
-        # ----------------------------------------------------
+        # ====================================================
 
         plus_di = (
             100.0 *
@@ -803,23 +781,23 @@ def calculate_indicators(df):
             minus_di
         )
 
-        di_sum.loc[
+        di_sum_safe = di_sum.mask(
             di_sum == 0
-        ] = float("nan")
+        )
 
-        # ----------------------------------------------------
+        # ====================================================
         # DX
-        # ----------------------------------------------------
+        # ====================================================
 
         dx = (
             100.0 *
             (plus_di - minus_di).abs() /
-            di_sum
+            di_sum_safe
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # ADX
-        # ----------------------------------------------------
+        # ====================================================
 
         adx14 = dx.ewm(
             alpha=(1.0 / 14.0),
@@ -831,7 +809,7 @@ def calculate_indicators(df):
         # ADD INDICATORS
         # ====================================================
 
-        df["EMA5"] = pd.Series(
+        df.loc[:, "EMA5"] = pd.Series(
             ema5.to_numpy(
                 dtype="float64"
             ),
@@ -839,7 +817,7 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        df["BB_MIDDLE"] = pd.Series(
+        df.loc[:, "BB_MIDDLE"] = pd.Series(
             bb_middle.to_numpy(
                 dtype="float64"
             ),
@@ -847,7 +825,7 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        df["BB_UPPER"] = pd.Series(
+        df.loc[:, "BB_UPPER"] = pd.Series(
             bb_upper.to_numpy(
                 dtype="float64"
             ),
@@ -855,7 +833,7 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        df["BB_LOWER"] = pd.Series(
+        df.loc[:, "BB_LOWER"] = pd.Series(
             bb_lower.to_numpy(
                 dtype="float64"
             ),
@@ -863,7 +841,7 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        df["PLUS_DI"] = pd.Series(
+        df.loc[:, "PLUS_DI"] = pd.Series(
             plus_di.to_numpy(
                 dtype="float64"
             ),
@@ -871,7 +849,7 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        df["MINUS_DI"] = pd.Series(
+        df.loc[:, "MINUS_DI"] = pd.Series(
             minus_di.to_numpy(
                 dtype="float64"
             ),
@@ -879,7 +857,7 @@ def calculate_indicators(df):
             dtype="float64"
         )
 
-        df["ADX14"] = pd.Series(
+        df.loc[:, "ADX14"] = pd.Series(
             adx14.to_numpy(
                 dtype="float64"
             ),
@@ -901,7 +879,7 @@ def calculate_indicators(df):
             "ADX14"
         ]:
 
-            df[col] = pd.to_numeric(
+            df.loc[:, col] = pd.to_numeric(
                 df[col],
                 errors="coerce"
             ).astype(
@@ -966,22 +944,18 @@ def entry_signal(candle):
         # BUY CONDITIONS
         # ====================================================
 
-        # 1. Candle opened below BB20 Lower
         condition_1 = (
             open_price < bb_lower
         )
 
-        # 2. Candle closed back above BB20 Lower
         condition_2 = (
             close_price > bb_lower
         )
 
-        # 3. ADX must show sufficient trend strength
         condition_3 = (
             adx14 > ADX_MIN
         )
 
-        # 4. Bullish directional filter
         condition_4 = (
             plus_di > minus_di
         )
@@ -1008,10 +982,6 @@ def entry_signal(candle):
 
 def buy_symbol(symbol):
 
-    # --------------------------------------------------------
-    # Duplicate BUY protection
-    # --------------------------------------------------------
-
     with buy_lock:
 
         now = time.time()
@@ -1035,7 +1005,6 @@ def buy_symbol(symbol):
         with positions_lock:
 
             if symbol in positions:
-
                 return False
 
         price = get_current_price(
@@ -1171,7 +1140,10 @@ def buy_symbol(symbol):
                     False,
 
                 "buy_time":
-                    time.time()
+                    time.time(),
+
+                "recovered":
+                    False
             }
 
         logger.info(
@@ -1212,7 +1184,6 @@ def sell_symbol(
     with selling_lock:
 
         if symbol in selling_symbols:
-
             return False
 
         selling_symbols.add(
@@ -1228,7 +1199,6 @@ def sell_symbol(
             )
 
         if not position:
-
             return False
 
         quantity = float(
@@ -1241,7 +1211,6 @@ def sell_symbol(
         )
 
         if quantity <= 0:
-
             return False
 
         logger.info(
@@ -1331,9 +1300,9 @@ def check_position(
         if entry_price <= 0:
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # UPDATE HIGHEST PRICE
-        # ----------------------------------------------------
+        # ====================================================
 
         if current_price > highest_price:
 
@@ -1347,9 +1316,9 @@ def check_position(
                         "highest_price"
                     ] = highest_price
 
-        # ----------------------------------------------------
+        # ====================================================
         # STOP LOSS
-        # ----------------------------------------------------
+        # ====================================================
 
         stop_loss_price = (
             entry_price *
@@ -1373,9 +1342,9 @@ def check_position(
 
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # TRAILING ACTIVATION
-        # ----------------------------------------------------
+        # ====================================================
 
         activation_price = (
             entry_price *
@@ -1404,9 +1373,9 @@ def check_position(
                 f"Current={current_price:.10f}"
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # TRAILING STOP
-        # ----------------------------------------------------
+        # ====================================================
 
         if trailing_active:
 
@@ -1448,7 +1417,6 @@ def process_closed_candle(symbol):
         with positions_lock:
 
             if symbol in positions:
-
                 return
 
         df = get_closed_klines(
@@ -1469,15 +1437,8 @@ def process_closed_candle(symbol):
         if len(df) < 50:
             return
 
-        # ----------------------------------------------------
-        # PREVIOUS CANDLE = CLOSED CANDLE
-        # ----------------------------------------------------
-
+        # Previous candle = closed candle
         candle = df.iloc[-2]
-
-        # ----------------------------------------------------
-        # LOG INDICATORS
-        # ----------------------------------------------------
 
         try:
 
@@ -1493,10 +1454,6 @@ def process_closed_candle(symbol):
 
         except Exception:
             pass
-
-        # ----------------------------------------------------
-        # BUY
-        # ----------------------------------------------------
 
         if entry_signal(candle):
 
@@ -1532,12 +1489,7 @@ def process_ws_message(message):
 
         data = json.loads(message)
 
-        # ----------------------------------------------------
-        # Combined stream wrapper
-        # ----------------------------------------------------
-
         if "data" in data:
-
             data = data["data"]
 
         event_type = data.get("e")
@@ -1592,7 +1544,6 @@ def process_ws_message(message):
 
                 return
 
-            # Only monitor symbols that actually have positions
             with positions_lock:
 
                 has_position = (
@@ -1664,21 +1615,6 @@ def on_open(
 def make_stream_url():
 
     streams = []
-
-    # --------------------------------------------------------
-    # KLINE + MINI TICKER
-    #
-    # KLINE:
-    # Used for BUY signal.
-    #
-    # MINI TICKER:
-    # Used for real-time position monitoring.
-    #
-    # 150 + 150 = 300 streams
-    #
-    # This is far safer for REST API usage than continuously
-    # calling get_symbol_ticker() for every active position.
-    # --------------------------------------------------------
 
     for symbol in symbols:
 
@@ -1760,17 +1696,6 @@ def position_monitor():
         "Position monitor started."
     )
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Position prices are now received from WebSocket
-    # miniTicker.
-    #
-    # Therefore we DO NOT continuously call REST API here.
-    #
-    # This significantly reduces Binance REST API usage.
-    # --------------------------------------------------------
-
     while True:
 
         try:
@@ -1798,13 +1723,286 @@ def position_monitor():
 
 
 # ============================================================
+# RECOVER ENTRY PRICE FROM BINANCE TRADE HISTORY
+# ============================================================
+
+def recover_entry_price_from_trades(
+    symbol,
+    base_asset,
+    current_balance
+):
+
+    """
+    Binance trade history থেকে বর্তমান position-এর
+    weighted-average entry price reconstruct করে।
+
+    BUY:
+        position quantity বাড়ায়
+        position cost বাড়ায়
+
+    SELL:
+        average-cost basis অনুযায়ী
+        position quantity এবং cost কমায়
+    """
+
+    try:
+
+        logger.info(
+            f"{symbol} | "
+            f"Loading Binance trade history..."
+        )
+
+        trades = client.get_my_trades(
+            symbol=symbol,
+            limit=RECOVERY_TRADE_LIMIT
+        )
+
+        if not trades:
+
+            logger.warning(
+                f"{symbol} | "
+                f"No trade history found."
+            )
+
+            return None
+
+        trades = sorted(
+            trades,
+            key=lambda x: (
+                int(
+                    x.get(
+                        "time",
+                        0
+                    )
+                ),
+                int(
+                    x.get(
+                        "id",
+                        0
+                    )
+                )
+            )
+        )
+
+        position_qty = 0.0
+        position_cost = 0.0
+
+        for trade in trades:
+
+            try:
+
+                price = float(
+                    trade.get(
+                        "price",
+                        0
+                    )
+                )
+
+                qty = float(
+                    trade.get(
+                        "qty",
+                        0
+                    )
+                )
+
+                if (
+                    price <= 0 or
+                    qty <= 0
+                ):
+                    continue
+
+                is_buyer = bool(
+                    trade.get(
+                        "isBuyer",
+                        False
+                    )
+                )
+
+                commission = float(
+                    trade.get(
+                        "commission",
+                        0
+                    )
+                )
+
+                commission_asset = str(
+                    trade.get(
+                        "commissionAsset",
+                        ""
+                    )
+                )
+
+                # =================================================
+                # BUY
+                # =================================================
+
+                if is_buyer:
+
+                    buy_qty = qty
+
+                    # Commission base asset হলে
+                    # account-এ পাওয়া quantity কমে যায়
+                    if (
+                        commission_asset ==
+                        base_asset
+                    ):
+
+                        buy_qty = max(
+                            0.0,
+                            qty - commission
+                        )
+
+                    # Quote value
+                    buy_cost = (
+                        qty *
+                        price
+                    )
+
+                    # USDT commission হলে
+                    # actual quote cost-এ commission যোগ
+                    if (
+                        commission_asset ==
+                        "USDT"
+                    ):
+
+                        buy_cost += commission
+
+                    position_qty += buy_qty
+
+                    position_cost += buy_cost
+
+                # =================================================
+                # SELL
+                # =================================================
+
+                else:
+
+                    sell_qty = qty
+
+                    # SELL commission base asset হলে
+                    # additional base asset deducted হয়
+                    if (
+                        commission_asset ==
+                        base_asset
+                    ):
+
+                        sell_qty += commission
+
+                    if position_qty > 0:
+
+                        average_cost = (
+                            position_cost /
+                            position_qty
+                        )
+
+                        removed_cost = (
+                            average_cost *
+                            min(
+                                sell_qty,
+                                position_qty
+                            )
+                        )
+
+                        position_qty = max(
+                            0.0,
+                            position_qty -
+                            sell_qty
+                        )
+
+                        position_cost = max(
+                            0.0,
+                            position_cost -
+                            removed_cost
+                        )
+
+            except Exception:
+
+                continue
+
+        # =====================================================
+        # CHECK RESULT
+        # =====================================================
+
+        if position_qty <= 0:
+
+            logger.warning(
+                f"{symbol} | "
+                f"Trade history does not show "
+                f"an active position."
+            )
+
+            return None
+
+        entry_price = (
+            position_cost /
+            position_qty
+        )
+
+        if (
+            entry_price <= 0 or
+            pd.isna(entry_price)
+        ):
+
+            return None
+
+        logger.info(
+            f"{symbol} | "
+            f"RECOVERED ENTRY PRICE = "
+            f"{entry_price:.10f} | "
+            f"History Qty = "
+            f"{position_qty:.10f} | "
+            f"Account Qty = "
+            f"{current_balance:.10f}"
+        )
+
+        return float(entry_price)
+
+    except BinanceAPIException as e:
+
+        logger.error(
+            f"{symbol} | "
+            f"Trade history API error: {e}"
+        )
+
+        return None
+
+    except Exception as e:
+
+        logger.exception(
+            f"{symbol} | "
+            f"Trade history recovery error: {e}"
+        )
+
+        return None
+
+
+# ============================================================
 # RECOVER POSITIONS
 # ============================================================
 
 def recover_positions():
 
+    global symbols
+
     logger.info(
-        "Checking existing balances..."
+        "=" * 70
+    )
+
+    logger.info(
+        "CHECKING EXISTING BINANCE POSITIONS..."
+    )
+
+    logger.info(
+        "RECOVERY MODE = BINANCE TRADE HISTORY"
+    )
+
+    logger.info(
+        "CURRENT MARKET PRICE WILL NOT BE USED "
+        "AS ENTRY PRICE"
+    )
+
+    logger.info(
+        "=" * 70
     )
 
     try:
@@ -1818,100 +2016,294 @@ def recover_positions():
 
         recovered = 0
 
+        recovered_symbols = []
+
         for balance in balances:
 
-            asset = balance.get(
-                "asset"
-            )
+            try:
 
-            free = float(
-                balance.get(
-                    "free",
-                    0
+                asset = balance.get(
+                    "asset"
                 )
-            )
 
-            locked = float(
-                balance.get(
-                    "locked",
-                    0
+                free = float(
+                    balance.get(
+                        "free",
+                        0
+                    )
                 )
-            )
 
-            total = (
-                free +
-                locked
-            )
+                locked = float(
+                    balance.get(
+                        "locked",
+                        0
+                    )
+                )
 
-            if total <= 0:
-                continue
+                total = (
+                    free +
+                    locked
+                )
 
-            symbol = (
-                asset +
-                "USDT"
-            )
+                if total <= RECOVERY_MIN_QTY:
+                    continue
 
-            if symbol not in symbol_info:
-                continue
+                # ------------------------------------------------
+                # Excluded assets
+                # ------------------------------------------------
 
-            if symbol not in symbols:
-                continue
+                if asset in STABLECOINS:
+                    continue
 
-            if asset in STABLECOINS:
-                continue
+                if asset in {
+                    "BTC",
+                    "ETH"
+                }:
+                    continue
 
-            if asset in {
-                "BTC",
-                "ETH"
-            }:
-                continue
+                symbol = (
+                    asset +
+                    "USDT"
+                )
 
-            current_price = get_current_price(
-                symbol
-            )
+                # ------------------------------------------------
+                # Must be a known USDT symbol
+                # ------------------------------------------------
 
-            if (
-                current_price is None or
-                current_price <= 0
-            ):
-                continue
+                if symbol not in symbol_info:
 
-            with positions_lock:
+                    logger.debug(
+                        f"{symbol} | "
+                        f"Not available as USDT trading symbol."
+                    )
 
-                positions[symbol] = {
+                    continue
 
-                    "entry_price":
-                        float(current_price),
+                # ------------------------------------------------
+                # Recover actual entry from Binance history
+                # ------------------------------------------------
 
-                    "quantity":
-                        float(total),
+                entry_price = (
+                    recover_entry_price_from_trades(
+                        symbol,
+                        asset,
+                        total
+                    )
+                )
 
-                    "highest_price":
-                        float(current_price),
+                if (
+                    entry_price is None or
+                    entry_price <= 0
+                ):
 
-                    "trailing_active":
-                        False,
+                    logger.warning(
+                        f"{symbol} | "
+                        f"Could not recover entry price. "
+                        f"Position will NOT be restored."
+                    )
 
-                    "buy_time":
-                        time.time()
-                }
+                    continue
 
-            recovered += 1
+                # ------------------------------------------------
+                # Round actual balance
+                # ------------------------------------------------
 
-            logger.warning(
-                f"{symbol} | "
-                f"POSITION RECOVERED | "
-                f"Qty={total} | "
-                f"Reference price={current_price}"
-            )
+                quantity = round_quantity(
+                    symbol,
+                    total
+                )
 
-            # Small safety delay
-            time.sleep(
-                KLINE_REQUEST_DELAY
-            )
+                if quantity <= 0:
+
+                    logger.warning(
+                        f"{symbol} | "
+                        f"Recovered quantity too small."
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Current price
+                #
+                # This is ONLY used to determine whether
+                # trailing should already be active.
+                #
+                # It is NOT used as entry price.
+                # ------------------------------------------------
+
+                current_price = get_current_price(
+                    symbol
+                )
+
+                if (
+                    current_price is None or
+                    current_price <= 0
+                ):
+
+                    logger.warning(
+                        f"{symbol} | "
+                        f"Current price unavailable. "
+                        f"Using entry price temporarily."
+                    )
+
+                    current_price = entry_price
+
+                # ------------------------------------------------
+                # Initial highest price
+                #
+                # Previous highest price before restart is not
+                # stored in RAM, so we cannot know it exactly.
+                #
+                # We start from current price if current price
+                # is above entry.
+                # ------------------------------------------------
+
+                highest_price = max(
+                    entry_price,
+                    current_price
+                )
+
+                # ------------------------------------------------
+                # Determine trailing state
+                # ------------------------------------------------
+
+                activation_price = (
+                    entry_price *
+                    (
+                        1.0 +
+                        TRAILING_ACTIVATION_PCT
+                    )
+                )
+
+                trailing_active = (
+                    current_price >=
+                    activation_price
+                )
+
+                # ------------------------------------------------
+                # Save recovered position
+                # ------------------------------------------------
+
+                with positions_lock:
+
+                    positions[symbol] = {
+
+                        "entry_price":
+                            float(entry_price),
+
+                        "quantity":
+                            float(quantity),
+
+                        "highest_price":
+                            float(highest_price),
+
+                        "trailing_active":
+                            bool(trailing_active),
+
+                        "buy_time":
+                            time.time(),
+
+                        "recovered":
+                            True
+                    }
+
+                # ------------------------------------------------
+                # Add recovered symbol to WebSocket list
+                #
+                # Even if it is no longer in Top 150,
+                # it must still be monitored.
+                # ------------------------------------------------
+
+                if symbol not in symbols:
+
+                    symbols.append(
+                        symbol
+                    )
+
+                    logger.info(
+                        f"{symbol} | "
+                        f"Added to WebSocket monitoring "
+                        f"because an open position was recovered."
+                    )
+
+                recovered += 1
+
+                recovered_symbols.append(
+                    symbol
+                )
+
+                stop_loss_price = (
+                    entry_price *
+                    (
+                        1.0 -
+                        STOP_LOSS_PCT
+                    )
+                )
+
+                trailing_activation = (
+                    entry_price *
+                    (
+                        1.0 +
+                        TRAILING_ACTIVATION_PCT
+                    )
+                )
+
+                logger.warning(
+                    f"{symbol} | "
+                    f"POSITION RECOVERED | "
+                    f"Entry={entry_price:.10f} | "
+                    f"Qty={quantity:.10f} | "
+                    f"Current={current_price:.10f} | "
+                    f"SL={stop_loss_price:.10f} | "
+                    f"TrailActivation="
+                    f"{trailing_activation:.10f} | "
+                    f"TrailingActive="
+                    f"{trailing_active}"
+                )
+
+                # Small safety delay
+                time.sleep(
+                    KLINE_REQUEST_DELAY
+                )
+
+            except Exception as e:
+
+                logger.exception(
+                    f"Position recovery error for "
+                    f"{balance.get('asset')}: {e}"
+                )
+
+        logger.info(
+            "=" * 70
+        )
 
         logger.info(
             f"Recovered positions: {recovered}"
+        )
+
+        if recovered_symbols:
+
+            logger.info(
+                "Recovered symbols: "
+                + ", ".join(
+                    recovered_symbols
+                )
+            )
+
+        else:
+
+            logger.info(
+                "No existing positions found."
+            )
+
+        logger.info(
+            "=" * 70
+        )
+
+    except BinanceAPIException as e:
+
+        logger.error(
+            f"Binance account recovery error: {e}"
         )
 
     except Exception as e:
@@ -1998,6 +2390,11 @@ def initialize():
 
     logger.info(
         "REST KLINE request cooldown enabled"
+    )
+
+    logger.info(
+        "POSITION RECOVERY = "
+        "BINANCE TRADE HISTORY"
     )
 
     logger.info(
