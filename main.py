@@ -26,9 +26,9 @@ if not API_KEY or not API_SECRET:
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # TRADE SETTINGS
-# ------------------------------------------------------------
+# ============================================================
 
 TRADE_AMOUNT_USDT = 35.0
 
@@ -36,47 +36,52 @@ TIMEFRAME = "5m"
 
 TOP_SYMBOLS = 150
 
-# ------------------------------------------------------------
+
+# ============================================================
 # BOLLINGER BAND
-# ------------------------------------------------------------
+# ============================================================
 
 BB_PERIOD = 20
 BB_STD = 2.0
 
-# ------------------------------------------------------------
+
+# ============================================================
 # EMA
-# ------------------------------------------------------------
+# ============================================================
 
 EMA_PERIOD = 5
 
-# ------------------------------------------------------------
+
+# ============================================================
 # ADX
-# ------------------------------------------------------------
+# ============================================================
 
 ADX_PERIOD = 14
 ADX_MIN = 20.0
 
-# ------------------------------------------------------------
+
+# ============================================================
 # STOP LOSS
-# ------------------------------------------------------------
+# ============================================================
 
 STOP_LOSS_PCT = 0.010
-# 1.00%
+# -1.00%
 
-# ------------------------------------------------------------
+
+# ============================================================
 # TRAILING STOP
-# ------------------------------------------------------------
+# ============================================================
 
 TRAILING_ACTIVATION_PCT = 0.010
 # +1.00% profit হলে trailing শুরু
 
 TRAILING_STOP_PCT = 0.005
-# Highest price থেকে 0.50% নিচে নামলে sell
+# Highest price থেকে -0.50% হলে sell
 
 
-# ------------------------------------------------------------
+# ============================================================
 # BALANCE BUFFER
-# ------------------------------------------------------------
+# ============================================================
 
 SELL_BALANCE_BUFFER = 0.999
 
@@ -118,10 +123,16 @@ def home():
 
 @app.route("/health")
 def health():
+    with positions_lock:
+        position_count = len(positions)
+
+    with symbols_lock:
+        symbol_count = len(symbols)
+
     return jsonify({
         "status": "ok",
-        "positions": len(positions),
-        "symbols": len(symbols)
+        "positions": position_count,
+        "symbols": symbol_count
     })
 
 
@@ -166,6 +177,7 @@ STABLECOINS = {
 # ============================================================
 
 def load_exchange_info():
+
     global symbol_info
 
     logger.info("Loading Binance exchange information...")
@@ -211,7 +223,10 @@ def load_top_symbols():
 
     global symbols
 
-    logger.info("Loading top %d symbols by 24h quote volume...", TOP_SYMBOLS)
+    logger.info(
+        "Loading top %d symbols by 24h quote volume...",
+        TOP_SYMBOLS
+    )
 
     tickers = client.get_ticker()
 
@@ -225,7 +240,9 @@ def load_top_symbols():
             continue
 
         try:
-            quote_volume = float(ticker.get("quoteVolume", 0))
+            quote_volume = float(
+                ticker.get("quoteVolume", 0)
+            )
         except Exception:
             quote_volume = 0.0
 
@@ -321,7 +338,6 @@ def round_quantity(symbol, quantity):
         return quantity
 
     step = Decimal(str(step_size))
-
     qty = Decimal(str(quantity))
 
     qty = (
@@ -345,7 +361,12 @@ def get_current_price(symbol):
             symbol=symbol
         )
 
-        return float(ticker["price"])
+        price = float(ticker["price"])
+
+        if price <= 0:
+            return None
+
+        return price
 
     except Exception as e:
 
@@ -395,28 +416,76 @@ def get_closed_klines(symbol, limit=100):
             columns=columns
         )
 
+        # ----------------------------------------------------
+        # FORCE NUMERIC OHLCV
+        # ----------------------------------------------------
+
         numeric_columns = [
             "open",
             "high",
             "low",
             "close",
-            "volume"
+            "volume",
+            "quote_volume",
+            "taker_base",
+            "taker_quote"
         ]
 
         for col in numeric_columns:
+
             df[col] = pd.to_numeric(
                 df[col],
                 errors="coerce"
             )
 
-        # Remove currently forming candle.
-        current_time = int(time.time() * 1000)
+            df[col] = df[col].astype("float64")
+
+        # ----------------------------------------------------
+        # TIME COLUMNS
+        # ----------------------------------------------------
+
+        df["open_time"] = pd.to_numeric(
+            df["open_time"],
+            errors="coerce"
+        )
+
+        df["close_time"] = pd.to_numeric(
+            df["close_time"],
+            errors="coerce"
+        )
+
+        # ----------------------------------------------------
+        # REMOVE INVALID ROWS
+        # ----------------------------------------------------
+
+        df = df.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume"
+            ]
+        )
+
+        # ----------------------------------------------------
+        # REMOVE CURRENTLY FORMING CANDLE
+        # ----------------------------------------------------
+
+        current_time = int(
+            time.time() * 1000
+        )
 
         df = df[
             df["close_time"] <= current_time
         ].copy()
 
-        return df.reset_index(drop=True)
+        if df.empty:
+            return None
+
+        return df.reset_index(
+            drop=True
+        )
 
     except Exception as e:
 
@@ -435,215 +504,293 @@ def get_closed_klines(symbol, limit=100):
 
 def calculate_indicators(df):
 
-    df = df.copy()
+    if df is None or df.empty:
+        return None
 
-    # --------------------------------------------------------
-    # EMA 5
-    # --------------------------------------------------------
+    try:
 
-    df["ema5"] = (
-        df["close"]
-        .ewm(
-            span=EMA_PERIOD,
-            adjust=False
+        df = df.copy()
+
+        # ----------------------------------------------------
+        # FORCE OHLC TO NUMERIC AGAIN
+        # ----------------------------------------------------
+
+        price_columns = [
+            "open",
+            "high",
+            "low",
+            "close"
+        ]
+
+        for col in price_columns:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            ).astype("float64")
+
+        df = df.dropna(
+            subset=price_columns
+        ).copy()
+
+        if len(df) < 50:
+            return None
+
+        # ====================================================
+        # EMA 5
+        # ====================================================
+
+        close = df["close"].astype("float64")
+
+        df["ema5"] = (
+            close
+            .ewm(
+                span=EMA_PERIOD,
+                adjust=False
+            )
+            .mean()
+            .astype("float64")
         )
-        .mean()
-    )
 
-    # --------------------------------------------------------
-    # BB20
-    # --------------------------------------------------------
+        # ====================================================
+        # BB20
+        # ====================================================
 
-    df["bb_middle"] = (
-        df["close"]
-        .rolling(
-            BB_PERIOD
+        df["bb_middle"] = (
+            close
+            .rolling(
+                window=BB_PERIOD,
+                min_periods=BB_PERIOD
+            )
+            .mean()
+            .astype("float64")
         )
-        .mean()
-    )
 
-    df["bb_std"] = (
-        df["close"]
-        .rolling(
-            BB_PERIOD
+        df["bb_std"] = (
+            close
+            .rolling(
+                window=BB_PERIOD,
+                min_periods=BB_PERIOD
+            )
+            .std(
+                ddof=0
+            )
+            .astype("float64")
         )
-        .std(
-            ddof=0
+
+        df["bb_upper"] = (
+            df["bb_middle"]
+            + (
+                BB_STD
+                * df["bb_std"]
+            )
+        ).astype("float64")
+
+        df["bb_lower"] = (
+            df["bb_middle"]
+            - (
+                BB_STD
+                * df["bb_std"]
+            )
+        ).astype("float64")
+
+        # ====================================================
+        # ADX 14
+        # ====================================================
+
+        high = df["high"].astype("float64")
+        low = df["low"].astype("float64")
+        close = df["close"].astype("float64")
+
+        previous_close = (
+            close.shift(1)
+            .astype("float64")
         )
-    )
 
-    df["bb_upper"] = (
-        df["bb_middle"]
-        + (
-            BB_STD
-            * df["bb_std"]
+        # ----------------------------------------------------
+        # TRUE RANGE
+        # ----------------------------------------------------
+
+        tr1 = (
+            high - low
+        ).astype("float64")
+
+        tr2 = (
+            high - previous_close
+        ).abs().astype("float64")
+
+        tr3 = (
+            low - previous_close
+        ).abs().astype("float64")
+
+        tr_df = pd.concat(
+            [
+                tr1,
+                tr2,
+                tr3
+            ],
+            axis=1
         )
-    )
 
-    df["bb_lower"] = (
-        df["bb_middle"]
-        - (
-            BB_STD
-            * df["bb_std"]
+        tr = (
+            tr_df
+            .max(axis=1)
+            .astype("float64")
         )
-    )
 
-    # ========================================================
-    # ADX 14
-    # ========================================================
+        # ----------------------------------------------------
+        # DIRECTIONAL MOVEMENT
+        # ----------------------------------------------------
 
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    previous_close = close.shift(1)
-
-    # --------------------------------------------------------
-    # True Range
-    # --------------------------------------------------------
-
-    tr1 = high - low
-
-    tr2 = (
-        high - previous_close
-    ).abs()
-
-    tr3 = (
-        low - previous_close
-    ).abs()
-
-    df["tr"] = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-        axis=1
-    ).max(axis=1)
-
-    # --------------------------------------------------------
-    # Directional Movement
-    # --------------------------------------------------------
-
-    up_move = high.diff()
-
-    down_move = -low.diff()
-
-    plus_dm = pd.Series(
-        0.0,
-        index=df.index
-    )
-
-    minus_dm = pd.Series(
-        0.0,
-        index=df.index
-    )
-
-    plus_condition = (
-        (up_move > down_move)
-        & (up_move > 0)
-    )
-
-    minus_condition = (
-        (down_move > up_move)
-        & (down_move > 0)
-    )
-
-    plus_dm.loc[
-        plus_condition
-    ] = up_move.loc[
-        plus_condition
-    ]
-
-    minus_dm.loc[
-        minus_condition
-    ] = down_move.loc[
-        minus_condition
-    ]
-
-    # --------------------------------------------------------
-    # Wilder-style smoothing
-    # --------------------------------------------------------
-
-    alpha = 1.0 / ADX_PERIOD
-
-    atr = (
-        df["tr"]
-        .ewm(
-            alpha=alpha,
-            adjust=False
+        up_move = (
+            high.diff()
+            .astype("float64")
         )
-        .mean()
-    )
 
-    smooth_plus_dm = (
-        plus_dm
-        .ewm(
-            alpha=alpha,
-            adjust=False
+        down_move = (
+            -low.diff()
+        ).astype("float64")
+
+        plus_dm = pd.Series(
+            0.0,
+            index=df.index,
+            dtype="float64"
         )
-        .mean()
-    )
 
-    smooth_minus_dm = (
-        minus_dm
-        .ewm(
-            alpha=alpha,
-            adjust=False
+        minus_dm = pd.Series(
+            0.0,
+            index=df.index,
+            dtype="float64"
         )
-        .mean()
-    )
 
-    # --------------------------------------------------------
-    # +DI / -DI
-    # --------------------------------------------------------
-
-    df["plus_di"] = (
-        100.0
-        * smooth_plus_dm
-        / atr.replace(0, pd.NA)
-    )
-
-    df["minus_di"] = (
-        100.0
-        * smooth_minus_dm
-        / atr.replace(0, pd.NA)
-    )
-
-    # --------------------------------------------------------
-    # DX
-    # --------------------------------------------------------
-
-    di_sum = (
-        df["plus_di"]
-        + df["minus_di"]
-    )
-
-    di_difference = (
-        df["plus_di"]
-        - df["minus_di"]
-    ).abs()
-
-    df["dx"] = (
-        100.0
-        * di_difference
-        / di_sum.replace(0, pd.NA)
-    )
-
-    # --------------------------------------------------------
-    # ADX
-    # --------------------------------------------------------
-
-    df["adx14"] = (
-        df["dx"]
-        .ewm(
-            alpha=alpha,
-            adjust=False
+        plus_condition = (
+            (up_move > down_move)
+            & (up_move > 0)
         )
-        .mean()
-    )
 
-    return df
+        minus_condition = (
+            (down_move > up_move)
+            & (down_move > 0)
+        )
+
+        plus_dm.loc[
+            plus_condition
+        ] = up_move.loc[
+            plus_condition
+        ]
+
+        minus_dm.loc[
+            minus_condition
+        ] = down_move.loc[
+            minus_condition
+        ]
+
+        # ----------------------------------------------------
+        # WILDER SMOOTHING
+        # ----------------------------------------------------
+
+        alpha = 1.0 / float(ADX_PERIOD)
+
+        atr = (
+            tr
+            .ewm(
+                alpha=alpha,
+                adjust=False
+            )
+            .mean()
+            .astype("float64")
+        )
+
+        smooth_plus_dm = (
+            plus_dm
+            .ewm(
+                alpha=alpha,
+                adjust=False
+            )
+            .mean()
+            .astype("float64")
+        )
+
+        smooth_minus_dm = (
+            minus_dm
+            .ewm(
+                alpha=alpha,
+                adjust=False
+            )
+            .mean()
+            .astype("float64")
+        )
+
+        # ----------------------------------------------------
+        # +DI / -DI
+        # ----------------------------------------------------
+
+        atr_safe = atr.replace(
+            0,
+            float("nan")
+        )
+
+        df["plus_di"] = (
+            100.0
+            * smooth_plus_dm
+            / atr_safe
+        ).astype("float64")
+
+        df["minus_di"] = (
+            100.0
+            * smooth_minus_dm
+            / atr_safe
+        ).astype("float64")
+
+        # ----------------------------------------------------
+        # DX
+        # ----------------------------------------------------
+
+        di_sum = (
+            df["plus_di"]
+            + df["minus_di"]
+        ).astype("float64")
+
+        di_difference = (
+            df["plus_di"]
+            - df["minus_di"]
+        ).abs().astype("float64")
+
+        di_sum_safe = di_sum.replace(
+            0,
+            float("nan")
+        )
+
+        df["dx"] = (
+            100.0
+            * di_difference
+            / di_sum_safe
+        ).astype("float64")
+
+        # ----------------------------------------------------
+        # ADX
+        # ----------------------------------------------------
+
+        df["adx14"] = (
+            df["dx"]
+            .ewm(
+                alpha=alpha,
+                adjust=False
+            )
+            .mean()
+            .astype("float64")
+        )
+
+        return df
+
+    except Exception as e:
+
+        logger.error(
+            "Indicator calculation error: %s",
+            e
+        )
+
+        return None
 
 
 # ============================================================
@@ -659,6 +806,9 @@ def entry_signal(df):
         return False
 
     df = calculate_indicators(df)
+
+    if df is None:
+        return False
 
     candle = df.iloc[-1]
 
@@ -701,10 +851,6 @@ def entry_signal(df):
         candle["adx14"]
     )
 
-    # ========================================================
-    # BUY CONDITIONS
-    # ========================================================
-
     condition_1 = (
         candle_open < lower_bb
     )
@@ -742,6 +888,9 @@ def get_signal_data(df):
 
     df = calculate_indicators(df)
 
+    if df is None:
+        return None
+
     candle = df.iloc[-1]
 
     return {
@@ -766,7 +915,7 @@ def buy_symbol(symbol):
     try:
 
         # ----------------------------------------------------
-        # Duplicate position check
+        # DUPLICATE POSITION CHECK
         # ----------------------------------------------------
 
         with positions_lock:
@@ -778,7 +927,7 @@ def buy_symbol(symbol):
                 return False
 
         # ----------------------------------------------------
-        # Get balance
+        # GET USDT BALANCE
         # ----------------------------------------------------
 
         balance_data = client.get_asset_balance(
@@ -793,6 +942,7 @@ def buy_symbol(symbol):
         )
 
         if available_usdt < TRADE_AMOUNT_USDT:
+
             logger.warning(
                 "%s | Not enough USDT. Available: %.4f",
                 symbol,
@@ -802,7 +952,7 @@ def buy_symbol(symbol):
             return False
 
         # ----------------------------------------------------
-        # Get market price
+        # CURRENT PRICE
         # ----------------------------------------------------
 
         current_price = get_current_price(
@@ -813,7 +963,7 @@ def buy_symbol(symbol):
             return False
 
         # ----------------------------------------------------
-        # Get quantity
+        # QUANTITY
         # ----------------------------------------------------
 
         quantity = (
@@ -835,6 +985,7 @@ def buy_symbol(symbol):
         )
 
         if quantity < min_qty:
+
             logger.warning(
                 "%s | Quantity below minimum. Qty=%.12f MinQty=%.12f",
                 symbol,
@@ -848,6 +999,7 @@ def buy_symbol(symbol):
             quantity * current_price
             < min_notional
         ):
+
             logger.warning(
                 "%s | Notional below minimum.",
                 symbol
@@ -859,7 +1011,7 @@ def buy_symbol(symbol):
             return False
 
         # ----------------------------------------------------
-        # BUY MARKET ORDER
+        # MARKET BUY
         # ----------------------------------------------------
 
         order = client.order_market_buy(
@@ -868,7 +1020,7 @@ def buy_symbol(symbol):
         )
 
         # ----------------------------------------------------
-        # Calculate actual executed quantity
+        # EXECUTED QUANTITY / PRICE
         # ----------------------------------------------------
 
         executed_qty = float(
@@ -882,6 +1034,8 @@ def buy_symbol(symbol):
             "fills",
             []
         )
+
+        actual_entry_price = current_price
 
         if fills:
 
@@ -913,14 +1067,6 @@ def buy_symbol(symbol):
                     total_cost
                     / total_qty
                 )
-
-            else:
-
-                actual_entry_price = current_price
-
-        else:
-
-            actual_entry_price = current_price
 
         # ----------------------------------------------------
         # SAVE POSITION
@@ -971,7 +1117,7 @@ def buy_symbol(symbol):
         )
 
         logger.info(
-            "TRAILING STOP: %.2f%%",
+            "TRAILING STOP: %.2f%% FROM HIGH",
             TRAILING_STOP_PCT * 100
         )
 
@@ -1037,7 +1183,7 @@ def sell_symbol(symbol, reason):
             return False
 
         # ----------------------------------------------------
-        # Get actual asset balance
+        # ACTUAL ASSET BALANCE
         # ----------------------------------------------------
 
         base_asset = symbol_info[
@@ -1082,6 +1228,10 @@ def sell_symbol(symbol, reason):
             symbol=symbol,
             quantity=quantity
         )
+
+        # ----------------------------------------------------
+        # USE ACTUAL EXECUTED SELL PRICE
+        # ----------------------------------------------------
 
         current_price = get_current_price(
             symbol
@@ -1177,6 +1327,7 @@ def sell_symbol(symbol, reason):
     finally:
 
         with positions_lock:
+
             selling_symbols.discard(
                 symbol
             )
@@ -1330,9 +1481,7 @@ def check_position(
 # PROCESS CLOSED CANDLE
 # ============================================================
 
-def process_closed_candle(
-    symbol
-):
+def process_closed_candle(symbol):
 
     try:
 
@@ -1355,6 +1504,9 @@ def process_closed_candle(
         df = calculate_indicators(
             df
         )
+
+        if df is None:
+            return
 
         candle = df.iloc[-1]
 
@@ -1473,10 +1625,6 @@ def process_ws_message(message):
             message
         )
 
-        # ----------------------------------------------------
-        # Combined stream format
-        # ----------------------------------------------------
-
         payload = data.get(
             "data",
             data
@@ -1510,7 +1658,6 @@ def process_ws_message(message):
             if not symbol:
                 return
 
-            # Only CLOSED candle
             if is_closed:
 
                 process_closed_candle(
@@ -1542,6 +1689,9 @@ def process_ws_message(message):
 
             except Exception:
 
+                return
+
+            if current_price <= 0:
                 return
 
             check_position(
@@ -1650,7 +1800,13 @@ def websocket_loop():
 
         try:
 
-            if not symbols:
+            with symbols_lock:
+
+                symbol_count = len(
+                    symbols
+                )
+
+            if symbol_count == 0:
 
                 logger.warning(
                     "No symbols available for WebSocket."
@@ -1664,7 +1820,7 @@ def websocket_loop():
 
             logger.info(
                 "Connecting WebSocket for %d symbols...",
-                len(symbols)
+                symbol_count
             )
 
             ws = websocket.WebSocketApp(
@@ -1802,15 +1958,6 @@ def recover_positions():
             if not current_price:
                 continue
 
-            # ------------------------------------------------
-            # IMPORTANT:
-            # Existing position's actual historical entry
-            # price is not available here.
-            #
-            # We initialize entry at current price so the bot
-            # can safely monitor it after restart.
-            # ------------------------------------------------
-
             with positions_lock:
 
                 positions[symbol] = {
@@ -1931,7 +2078,7 @@ if __name__ == "__main__":
     initialize()
 
     # --------------------------------------------------------
-    # Position safety monitor
+    # POSITION SAFETY MONITOR
     # --------------------------------------------------------
 
     monitor_thread = threading.Thread(
@@ -1942,7 +2089,7 @@ if __name__ == "__main__":
     monitor_thread.start()
 
     # --------------------------------------------------------
-    # WebSocket
+    # WEBSOCKET
     # --------------------------------------------------------
 
     websocket_thread = threading.Thread(
@@ -1953,7 +2100,7 @@ if __name__ == "__main__":
     websocket_thread.start()
 
     # --------------------------------------------------------
-    # Flask server
+    # FLASK SERVER
     # --------------------------------------------------------
 
     port = int(
