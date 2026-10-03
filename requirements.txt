@@ -2,4 +2,4 @@ python-binance
 pandas
 numpy
 websocket-client
-Flask
+flask
