@@ -1,5 +1,5 @@
-Flask
+flask
 gunicorn
-python-binance
+requests
 pandas
 websocket-client
