@@ -1,5 +1,6 @@
-python-binance==1.0.19
-pandas==2.2.3
-numpy==1.26.4
-websocket-client==1.8.0
-Flask==3.0.3
+Flask
+requests
+pandas
+numpy
+websocket-client
+python-dotenv
