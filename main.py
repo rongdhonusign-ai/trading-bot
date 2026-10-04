@@ -34,10 +34,7 @@ BB_PERIOD = 20
 BB_STD = 2.0
 
 EMA_PERIOD = 5
-
-# RSI(3) BUY confirmation
-RSI_PERIOD = 3
-RSI_OVERSOLD = 10.0
+SMA_PERIOD = 20
 
 # 1% STOP LOSS
 STOP_LOSS_PCT = 0.010
@@ -133,7 +130,7 @@ def home():
 
     return jsonify({
         "status": "running",
-        "bot": "BB20 EMA5 + RSI3 Recovery Spot Bot",
+        "bot": "BB20 EMA5 Spot Bot",
         "timeframe": TIMEFRAME,
         "trade_amount": TRADE_AMOUNT_USDT,
         "stop_loss": f"{STOP_LOSS_PCT * 100:.2f}%"
@@ -622,51 +619,9 @@ def calculate_indicators(df):
         adjust=False
     ).mean()
 
-    # --------------------------------------------------------
-    # RSI(3)
-    # Wilder-style RSI using EWM smoothing.
-    # --------------------------------------------------------
-    delta = close.diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = (-delta).clip(
-        lower=0
-    )
-
-    avg_gain = gain.ewm(
-        alpha=1 / RSI_PERIOD,
-        adjust=False,
-        min_periods=RSI_PERIOD
+    sma20 = close.rolling(
+        SMA_PERIOD
     ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / RSI_PERIOD,
-        adjust=False,
-        min_periods=RSI_PERIOD
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        float("nan")
-    )
-
-    rsi3 = 100 - (100 / (1 + rs))
-
-    # Edge cases: no loss => RSI 100; no gain => RSI 0.
-    rsi3 = rsi3.where(
-        avg_loss != 0,
-        100.0
-    )
-
-    rsi3 = rsi3.where(
-        avg_gain != 0,
-        0.0
-    )
-
-    df["rsi3"] = rsi3
 
     df["bb_middle"] = middle
 
@@ -675,6 +630,7 @@ def calculate_indicators(df):
     df["bb_lower"] = lower
 
     df["ema5"] = ema5
+    df["sma20"] = sma20
 
     return df
 
@@ -692,22 +648,17 @@ def entry_signal(df):
         return False
 
     candle = df.iloc[-1]
-    previous_candle = df.iloc[-2]
 
     required = [
         "bb_lower",
         "bb_upper",
-        "ema5",
-        "rsi3"
+        "ema5"
     ]
 
     if any(
         pd.isna(candle[x])
         for x in required
     ):
-        return False
-
-    if pd.isna(previous_candle["rsi3"]):
         return False
 
     candle_open = float(
@@ -728,14 +679,6 @@ def entry_signal(df):
 
     ema5 = float(
         candle["ema5"]
-    )
-
-    rsi3 = float(
-        candle["rsi3"]
-    )
-
-    previous_rsi3 = float(
-        previous_candle["rsi3"]
     )
 
     # --------------------------------------------------------
@@ -763,24 +706,11 @@ def entry_signal(df):
         candle_high < ema5
     )
 
-    # RSI(3) must be oversold.
-    condition_5 = (
-        rsi3 < RSI_OVERSOLD
-    )
-
-    # RSI(3) must be recovering: current RSI is higher
-    # than the previous CLOSED candle's RSI.
-    condition_6 = (
-        rsi3 > previous_rsi3
-    )
-
     return (
         condition_1
         and condition_2
         and condition_3
         and condition_4
-        and condition_5
-        and condition_6
     )
 
 
@@ -1022,7 +952,9 @@ def buy_symbol(symbol):
 
                 "buy_order_id": order["orderId"],
 
-                "buy_time": time.time()
+                "buy_time": time.time(),
+                "sma20_touched": False,
+                "sma20_touch_price": None
             }
 
         log.info(
@@ -1380,7 +1312,8 @@ def sell_symbol(
 def check_position(
     symbol,
     current_price,
-    upper_band
+    upper_band,
+    sma20
 ):
 
     with state_lock:
@@ -1416,6 +1349,54 @@ def check_position(
         )
 
         return
+
+    # --------------------------------------------------------
+    # SMA20 TOUCH -> 1% DROP EXIT
+    # --------------------------------------------------------
+    # After BUY, wait until live price touches/crosses SMA20.
+    # The first live price at the touch is saved.
+    # If price then drops 1% from that touch price,
+    # execute a MARKET SELL immediately.
+
+    if sma20 is not None:
+
+        sma20 = float(sma20)
+
+        if not position.get("sma20_touched", False):
+
+            # The entry strategy buys below SMA20 in normal conditions.
+            # Therefore a touch/cross is detected when live price
+            # reaches or moves above SMA20.
+            if current_price >= sma20:
+
+                with state_lock:
+                    if symbol in positions:
+                        positions[symbol]["sma20_touched"] = True
+                        positions[symbol]["sma20_touch_price"] = current_price
+
+                log.warning(
+                    "SMA20 TOUCHED -> %s | sma20=%.12f | touch_price=%.12f",
+                    symbol,
+                    sma20,
+                    current_price
+                )
+
+        else:
+
+            touch_price = position.get("sma20_touch_price")
+
+            if touch_price is not None:
+
+                sma20_drop_price = float(touch_price) * 0.99
+
+                if current_price <= sma20_drop_price:
+
+                    sell_symbol(
+                        symbol,
+                        "SMA20 TOUCH THEN 1% DROP"
+                    )
+
+                    return
 
     # --------------------------------------------------------
     # UPPER BB EXIT
@@ -1603,21 +1584,6 @@ def process_kline(
 
             if entry_signal(df):
 
-                rsi_value = float(
-                    df.iloc[-1]["rsi3"]
-                )
-
-                previous_rsi_value = float(
-                    df.iloc[-2]["rsi3"]
-                )
-
-                log.info(
-                    "BUY CONDITIONS PASSED → %s | RSI3=%.2f | Previous RSI3=%.2f",
-                    symbol,
-                    rsi_value,
-                    previous_rsi_value
-                )
-
                 buy_symbol(
                     symbol
                 )
@@ -1670,6 +1636,7 @@ def process_ticker(
         return
 
     upper_band = None
+    sma20 = None
 
     if (
         df is not None
@@ -1689,6 +1656,14 @@ def process_ticker(
                     last["bb_upper"]
                 )
 
+            if not pd.isna(
+                last["sma20"]
+            ):
+
+                sma20 = float(
+                    last["sma20"]
+                )
+
         except Exception:
 
             pass
@@ -1696,7 +1671,8 @@ def process_ticker(
     check_position(
         symbol,
         price,
-        upper_band
+        upper_band,
+        sma20
     )
 
 
@@ -1984,6 +1960,7 @@ def position_safety_loop():
                         )
 
                     upper = None
+                    sma20 = None
 
                     if (
                         df is not None
@@ -2003,6 +1980,14 @@ def position_safety_loop():
                                     last["bb_upper"]
                                 )
 
+                            if not pd.isna(
+                                last["sma20"]
+                            ):
+
+                                sma20 = float(
+                                    last["sma20"]
+                                )
+
                         except Exception:
 
                             pass
@@ -2010,7 +1995,8 @@ def position_safety_loop():
                     check_position(
                         symbol,
                         price,
-                        upper
+                        upper,
+                        sma20
                     )
 
                 except Exception as e:
@@ -2073,7 +2059,7 @@ def start_bot():
     )
 
     log.info(
-        "BB20 + EMA5 + RSI3 RECOVERY BINANCE SPOT BOT STARTING"
+        "BB20 + EMA5 BINANCE SPOT BOT STARTING"
     )
 
     log.info(
