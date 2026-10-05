@@ -3,8 +3,8 @@ import time
 import json
 import hmac
 import hashlib
-import threading
 import logging
+import threading
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 
@@ -13,2074 +13,1667 @@ import websocket
 
 from flask import Flask, jsonify
 
-# ============================================================
-
-# LOGGING
 
 # ============================================================
-
-logging.basicConfig(
-level=logging.INFO,
-format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-log = logging.getLogger("RSI_BOT")
-
-# ============================================================
-
 # CONFIG
-
 # ============================================================
 
-API_KEY = os.environ.get("BINANCE_API_KEY")
-API_SECRET = os.environ.get("BINANCE_API_SECRET")
-
-if not API_KEY or not API_SECRET:
-raise RuntimeError(
-"BINANCE_API_KEY / BINANCE_API_SECRET missing"
-)
+API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
 BASE_URL = "https://api.binance.com"
-WS_URL = "wss://stream.binance.com:9443/stream"
+WS_BASE_URL = "wss://stream.binance.com:9443/stream?streams="
 
 TIMEFRAME = "5m"
 
 TOP_SYMBOLS = 150
+GROUP_SIZE = 50
 
 BUY_USDT = Decimal("15")
 
 RSI_FAST_PERIOD = 3
 RSI_SLOW_PERIOD = 50
 
-BUY_RSI_SLOW_MIN = Decimal("50")
+BUY_RSI_SLOW_MIN = Decimal("52")
 BUY_RSI_FAST_MAX = Decimal("10")
 
 SELL_RSI_LEVEL = Decimal("80")
 
-STOP_LOSS_PERCENT = Decimal("0.01")
+HISTORY_LIMIT = 120
 
-HISTORY_LIMIT = 100
+# কতবার REST request retry করবে
+REST_RETRIES = 3
 
-REST_DELAY = 0.50
+# WebSocket reconnect delay
+WS_RECONNECT_DELAY = 5
 
-BUY_COOLDOWN_SECONDS = 60
+# WebSocket ping
+WS_PING_INTERVAL = 30
+WS_PING_TIMEOUT = 15
 
-RECONNECT_DELAY = 15
+# Top 150 refresh interval
+# 30 মিনিটে একবার নতুন Top 150 নির্ধারণ হবে।
+TOP_SYMBOL_REFRESH_SECONDS = 30 * 60
 
-REQUEST_TIMEOUT = 20
+# TRUE করলে কোনো real order যাবে না
+# LIVE trading করতে FALSE রাখতে হবে
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-RECV_WINDOW = 10000
+# API request-এর মধ্যে অতিরিক্ত নিরাপত্তা delay
+REST_DELAY = 0.12
 
-DEFAULT_418_COOLDOWN = 3600
+# Binance-এর সাধারণ stablecoins
+STABLECOINS = {
+    "USDT",
+    "USDC",
+    "FDUSD",
+    "BUSD",
+    "TUSD",
+    "DAI",
+    "USDP",
+    "PYUSD",
+    "EUR",
+    "EURI",
+    "AEUR",
+    "GBP",
+    "TRY",
+    "BRL",
+    "UAH",
+    "RUB",
+    "PLN",
+    "ARS",
+    "ZAR",
+    "NGN",
+    "RON",
+    "MXN",
+    "IDRT",
+    "BIDR",
+    "AUD",
+    "CAD",
+    "CHF",
+    "JPY",
+    "CZK",
+    "DKK",
+    "SEK",
+    "NOK",
+}
+
+EXCLUDED_BASE_ASSETS = {
+    "BTC",
+    "ETH",
+} | STABLECOINS
+
 
 # ============================================================
+# LOGGING
+# ============================================================
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+log = logging.getLogger("RSI_BOT")
+
+
+# ============================================================
 # FLASK
-
 # ============================================================
 
-app = Flask(**name**)
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return jsonify(
+        {
+            "status": "running",
+            "bot": "Binance Spot RSI3/RSI50 Bot",
+            "timeframe": TIMEFRAME,
+            "top_symbols": TOP_SYMBOLS,
+            "buy_usdt": str(BUY_USDT),
+            "buy_rule": "RSI50 > 52 AND RSI3 < 10",
+            "sell_rule": "RSI3 crosses above 80",
+            "dry_run": DRY_RUN,
+        }
+    )
+
+
+@app.route("/health")
+def health():
+    return jsonify(
+        {
+            "status": "healthy",
+            "bot_running": bot_started.is_set(),
+            "symbols": len(symbols),
+            "positions": len(positions),
+            "websocket_threads": len(ws_threads),
+        }
+    )
+
 
 # ============================================================
-
-# HTTP SESSION
-
+# GLOBAL STATE
 # ============================================================
 
 session = requests.Session()
 
-session.headers.update({
-"X-MBX-APIKEY": API_KEY,
-"User-Agent": "RSI50-RSI3-BOT"
-})
+session.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0 Binance-RSI-Bot/1.0",
+        "Accept": "application/json",
+    }
+)
 
-# ============================================================
-
-# GLOBAL STATE
-
-# ============================================================
-
-exchange_info = {}
-
-symbol_filters = {}
+state_lock = threading.RLock()
 
 symbols = []
+symbol_info = {}
 
-rsi_state = {}
-
+# symbol -> {
+#     "qty": Decimal,
+#     "buy_order_id": ...,
+#     "buy_time": ...
+# }
 positions = {}
 
-last_buy_time = {}
+# symbol -> {
+#     "closes": [Decimal, ...],
+#     "last_closed_time": int,
+#     "rsi3": Decimal,
+#     "rsi50": Decimal,
+# }
+market_data = {}
 
-last_candle_time = {}
+ws_threads = []
 
-binance_cooldown_until = 0
+bot_started = threading.Event()
 
-bot_ready = False
+server_time_offset_ms = 0
 
-bot_initializing = False
-
-shutdown_event = threading.Event()
-
-rest_lock = threading.Lock()
-
-order_lock = threading.Lock()
-
-state_lock = threading.Lock()
 
 # ============================================================
-
-# DECIMAL HELPERS
-
+# TIME / SIGNATURE
 # ============================================================
 
-def D(value):
-try:
-return Decimal(str(value))
-except Exception:
-return Decimal("0")
+def local_timestamp_ms():
+    return int(time.time() * 1000)
 
-def decimal_string(value):
-value = D(value)
 
-```
-text = format(value, "f")
+def server_timestamp_ms():
+    return local_timestamp_ms() + server_time_offset_ms
 
-if "." in text:
-    text = text.rstrip("0").rstrip(".")
 
-return text or "0"
-```
+def update_server_time():
+    global server_time_offset_ms
 
-def floor_to_step(value, step):
+    for attempt in range(REST_RETRIES):
+        try:
+            started = local_timestamp_ms()
 
-```
-value = D(value)
-step = D(step)
+            r = session.get(
+                BASE_URL + "/api/v3/time",
+                timeout=10,
+            )
 
-if value <= 0 or step <= 0:
-    return Decimal("0")
+            ended = local_timestamp_ms()
 
-return (
-    value / step
-).to_integral_value(
-    rounding=ROUND_DOWN
-) * step
-```
+            r.raise_for_status()
 
-# ============================================================
+            data = r.json()
+            server_time = int(data["serverTime"])
 
-# BINANCE COOLDOWN
+            midpoint = (started + ended) // 2
 
-# ============================================================
+            server_time_offset_ms = server_time - midpoint
 
-def cooldown_remaining():
+            log.info(
+                "Binance server time offset: %d ms",
+                server_time_offset_ms,
+            )
 
-```
-remaining = int(
-    binance_cooldown_until - time.time()
-)
+            return True
 
-return max(0, remaining)
-```
+        except Exception as e:
+            log.warning(
+                "Server time sync failed (%d/%d): %s",
+                attempt + 1,
+                REST_RETRIES,
+                e,
+            )
 
-def activate_cooldown(seconds, reason):
+            time.sleep(1 + attempt)
 
-```
-global binance_cooldown_until
+    return False
 
-seconds = max(
-    int(seconds),
-    1
-)
 
-new_until = time.time() + seconds
-
-if new_until > binance_cooldown_until:
-
-    binance_cooldown_until = new_until
-
-log.error(
-    "BINANCE COOLDOWN | %s | %s seconds",
-    reason,
-    seconds
-)
-```
-
-def wait_for_binance():
-
-```
-while not shutdown_event.is_set():
-
-    remaining = cooldown_remaining()
-
-    if remaining <= 0:
-        return
-
-    log.warning(
-        "Binance REST paused. Remaining=%s seconds",
-        remaining
-    )
-
-    time.sleep(
-        min(30, remaining)
-    )
-```
-
-# ============================================================
-
-# BINANCE REST
-
-# ============================================================
-
-def handle_binance_error(response):
-
-```
-if response.status_code == 418:
-
-    retry_after = response.headers.get(
-        "Retry-After"
-    )
-
-    try:
-        seconds = int(retry_after)
-    except Exception:
-        seconds = DEFAULT_418_COOLDOWN
-
-    activate_cooldown(
-        seconds,
-        "HTTP 418 temporary IP restriction"
-    )
-
-    raise RuntimeError(
-        "BINANCE_418"
-    )
-
-if response.status_code == 429:
-
-    retry_after = response.headers.get(
-        "Retry-After"
-    )
-
-    try:
-        seconds = int(retry_after)
-    except Exception:
-        seconds = 60
-
-    activate_cooldown(
-        seconds,
-        "HTTP 429 rate limit"
-    )
-
-    raise RuntimeError(
-        "BINANCE_429"
-    )
-
-if response.status_code >= 400:
-
-    try:
-        data = response.json()
-    except Exception:
-        data = response.text
-
-    raise RuntimeError(
-        f"BINANCE_HTTP_{response.status_code}: {data}"
-    )
-```
-
-def public_get(path, params=None):
-
-```
-wait_for_binance()
-
-with rest_lock:
-
-    wait_for_binance()
-
-    response = session.get(
-        BASE_URL + path,
-        params=params or {},
-        timeout=REQUEST_TIMEOUT
-    )
-
-    handle_binance_error(response)
-
-    return response.json()
-```
-
-def signed_request(method, path, params=None):
-
-```
-wait_for_binance()
-
-with rest_lock:
-
-    wait_for_binance()
-
-    data = dict(params or {})
-
-    data["timestamp"] = int(
-        time.time() * 1000
-    )
-
-    data["recvWindow"] = RECV_WINDOW
-
-    query = urlencode(
-        data,
-        doseq=True
-    )
+def sign_params(params):
+    query = urlencode(params, doseq=True)
 
     signature = hmac.new(
-        API_SECRET.encode(),
-        query.encode(),
-        hashlib.sha256
+        API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
 
-    query += "&signature=" + signature
+    return query + "&signature=" + signature
 
-    url = (
-        BASE_URL
-        + path
-        + "?"
-        + query
-    )
-
-    response = session.request(
-        method,
-        url,
-        timeout=REQUEST_TIMEOUT
-    )
-
-    handle_binance_error(response)
-
-    return response.json()
-```
 
 # ============================================================
-
-# EXACT WILDER RSI
-
+# REST HELPERS
 # ============================================================
 
-def calculate_rsi(closes, period):
-
-```
-if len(closes) < period + 1:
-    return None
-
-values = [
-    D(x)
-    for x in closes
-]
-
-gains = []
-losses = []
-
-for i in range(
-    1,
-    len(values)
-):
-
-    change = (
-        values[i]
-        - values[i - 1]
-    )
-
-    if change > 0:
-
-        gains.append(change)
-        losses.append(
-            Decimal("0")
-        )
-
-    else:
-
-        gains.append(
-            Decimal("0")
-        )
-
-        losses.append(
-            abs(change)
-        )
-
-avg_gain = (
-    sum(
-        gains[:period],
-        Decimal("0")
-    )
-    / Decimal(period)
-)
-
-avg_loss = (
-    sum(
-        losses[:period],
-        Decimal("0")
-    )
-    / Decimal(period)
-)
-
-for i in range(
-    period,
-    len(gains)
-):
-
-    avg_gain = (
-        (
-            avg_gain
-            * Decimal(period - 1)
-        )
-        + gains[i]
-    ) / Decimal(period)
-
-    avg_loss = (
-        (
-            avg_loss
-            * Decimal(period - 1)
-        )
-        + losses[i]
-    ) / Decimal(period)
-
-if avg_loss == 0:
-
-    if avg_gain == 0:
-        return Decimal("50")
-
-    return Decimal("100")
-
-rs = avg_gain / avg_loss
-
-return (
-    Decimal("100")
-    - (
-        Decimal("100")
-        / (
-            Decimal("1")
-            + rs
-        )
-    )
-)
-```
-
-# ============================================================
-
-# EXCHANGE INFO
-
-# ============================================================
-
-def load_exchange_info():
-
-```
-log.info(
-    "Loading Binance exchange information..."
-)
-
-info = public_get(
-    "/api/v3/exchangeInfo"
-)
-
-symbol_filters.clear()
-
-for item in info.get(
-    "symbols",
-    []
-):
-
-    symbol = item.get(
-        "symbol"
-    )
-
-    if not symbol:
-        continue
-
-    filters = {}
-
-    for f in item.get(
-        "filters",
-        []
-    ):
-
-        filter_type = f.get(
-            "filterType"
-        )
-
-        if filter_type:
-            filters[filter_type] = f
-
-    symbol_filters[symbol] = filters
-
-return info
-```
-
-# ============================================================
-
-# SYMBOL SELECTION
-
-# ============================================================
-
-STABLE_BASES = {
-"USDT",
-"USDC",
-"FDUSD",
-"BUSD",
-"TUSD",
-"DAI",
-"USDP",
-"EUR",
-"GBP",
-"TRY",
-"BRL",
-"AUD",
-"RUB",
-"UAH",
-"PLN",
-"RON",
-"ZAR"
-}
-
-def select_symbols(info):
-
-```
-eligible = set()
-
-for item in info.get(
-    "symbols",
-    []
-):
-
-    if item.get(
-        "status"
-    ) != "TRADING":
-        continue
-
-    if item.get(
-        "quoteAsset"
-    ) != "USDT":
-        continue
-
-    if item.get(
-        "isSpotTradingAllowed"
-    ) is False:
-        continue
-
-    base = item.get(
-        "baseAsset",
-        ""
-    )
-
-    if base in STABLE_BASES:
-        continue
-
-    if base in {
-        "BTC",
-        "ETH"
-    }:
-        continue
-
-    symbol = item.get(
-        "symbol"
-    )
-
-    if symbol:
-        eligible.add(symbol)
-
-log.info(
-    "Eligible USDT spot symbols=%s",
-    len(eligible)
-)
-
-if not eligible:
-    raise RuntimeError(
-        "No eligible USDT symbols"
-    )
-
-# One ticker request only.
-ticker_data = public_get(
-    "/api/v3/ticker/24hr"
-)
-
-ranked = []
-
-for item in ticker_data:
-
-    symbol = item.get(
-        "symbol"
-    )
-
-    if symbol not in eligible:
-        continue
-
-    quote_volume = D(
-        item.get(
-            "quoteVolume",
-            "0"
-        )
-    )
-
-    ranked.append(
-        (
-            symbol,
-            quote_volume
-        )
-    )
-
-ranked.sort(
-    key=lambda x: x[1],
-    reverse=True
-)
-
-selected = [
-    item[0]
-    for item in ranked[
-        :TOP_SYMBOLS
-    ]
-]
-
-log.info(
-    "Selected %s symbols.",
-    len(selected)
-)
-
-return selected
-```
-
-# ============================================================
-
-# STARTUP HISTORY
-
-# ============================================================
-
-def load_symbol_history(symbol):
-
-```
-data = public_get(
-    "/api/v3/klines",
-    {
-        "symbol": symbol,
-        "interval": TIMEFRAME,
-        "limit": HISTORY_LIMIT
-    }
-)
-
-closes = []
-
-for candle in data:
-
-    try:
-        closes.append(
-            D(candle[4])
-        )
-    except Exception:
-        pass
-
-if len(closes) < (
-    RSI_SLOW_PERIOD + 1
-):
-
-    log.warning(
-        "%s | insufficient history: %s",
-        symbol,
-        len(closes)
-    )
-
-    return False
-
-rsi3 = calculate_rsi(
-    closes,
-    RSI_FAST_PERIOD
-)
-
-rsi50 = calculate_rsi(
-    closes,
-    RSI_SLOW_PERIOD
-)
-
-if rsi3 is None or rsi50 is None:
-    return False
-
-rsi_state[symbol] = {
-    "closes": closes,
-    "rsi3": rsi3,
-    "rsi50": rsi50,
-    "previous_rsi3": rsi3,
-    "last_close": closes[-1]
-}
-
-return True
-```
-
-def initialize_history():
-
-```
-log.info(
-    "Loading RSI history for %s symbols...",
-    len(symbols)
-)
-
-success = 0
-
-for index, symbol in enumerate(
-    symbols,
-    start=1
-):
-
-    if shutdown_event.is_set():
-        return False
-
-    try:
-
-        if load_symbol_history(
-            symbol
-        ):
-            success += 1
-
-    except RuntimeError as e:
-
-        if str(e) in {
-            "BINANCE_418",
-            "BINANCE_429"
-        }:
-
-            log.error(
-                "History loading stopped because Binance rate limit is active."
+def public_get(path, params=None):
+    for attempt in range(REST_RETRIES):
+        try:
+            time.sleep(REST_DELAY)
+
+            response = session.get(
+                BASE_URL + path,
+                params=params,
+                timeout=15,
             )
 
-            return False
-
-        log.error(
-            "%s | history error: %s",
-            symbol,
-            e
-        )
-
-    except Exception as e:
-
-        log.error(
-            "%s | history error: %s",
-            symbol,
-            e
-        )
-
-    if index % 10 == 0:
-
-        log.info(
-            "History progress: %s/%s",
-            index,
-            len(symbols)
-        )
-
-    time.sleep(
-        REST_DELAY
-    )
-
-log.info(
-    "RSI initialization complete: %s/%s",
-    success,
-    len(symbols)
-)
-
-return success > 0
-```
-
-# ============================================================
-
-# LOCAL RSI UPDATE
-
-# ============================================================
-
-def update_local_rsi(
-symbol,
-close
-):
-
-```
-state = rsi_state.get(
-    symbol
-)
-
-if not state:
-    return None, None
-
-close = D(close)
-
-if (
-    state["last_close"]
-    == close
-):
-    return (
-        state["rsi3"],
-        state["rsi50"]
-    )
-
-previous_rsi3 = state["rsi3"]
-
-closes = state["closes"]
-
-closes.append(close)
-
-if len(closes) > HISTORY_LIMIT:
-
-    del closes[
-        :-HISTORY_LIMIT
-    ]
-
-rsi3 = calculate_rsi(
-    closes,
-    RSI_FAST_PERIOD
-)
-
-rsi50 = calculate_rsi(
-    closes,
-    RSI_SLOW_PERIOD
-)
-
-if rsi3 is None or rsi50 is None:
-    return None, None
-
-state["previous_rsi3"] = (
-    previous_rsi3
-)
-
-state["rsi3"] = rsi3
-
-state["rsi50"] = rsi50
-
-state["last_close"] = close
-
-return rsi3, rsi50
-```
-
-# ============================================================
-
-# QUANTITY FILTERS
-
-# ============================================================
-
-def get_quantity_filter(symbol):
-
-```
-filters = symbol_filters.get(
-    symbol,
-    {}
-)
-
-market_filter = filters.get(
-    "MARKET_LOT_SIZE"
-)
-
-lot_filter = filters.get(
-    "LOT_SIZE"
-)
-
-if market_filter:
-
-    step = D(
-        market_filter.get(
-            "stepSize",
-            "0"
-        )
-    )
-
-    if step > 0:
-        return market_filter
-
-if lot_filter:
-
-    step = D(
-        lot_filter.get(
-            "stepSize",
-            "0"
-        )
-    )
-
-    if step > 0:
-        return lot_filter
-
-return None
-```
-
-def normalize_quantity(
-symbol,
-quantity
-):
-
-```
-quantity = D(quantity)
-
-if quantity <= 0:
-    return Decimal("0")
-
-filt = get_quantity_filter(
-    symbol
-)
-
-if not filt:
-
-    log.error(
-        "%s | No valid LOT_SIZE filter",
-        symbol
-    )
-
-    return Decimal("0")
-
-step = D(
-    filt.get(
-        "stepSize",
-        "0"
-    )
-)
-
-min_qty = D(
-    filt.get(
-        "minQty",
-        "0"
-    )
-)
-
-max_qty = D(
-    filt.get(
-        "maxQty",
-        "0"
-    )
-)
-
-if step <= 0:
-
-    log.error(
-        "%s | Invalid stepSize=%s",
-        symbol,
-        step
-    )
-
-    return Decimal("0")
-
-qty = floor_to_step(
-    quantity,
-    step
-)
-
-if qty < min_qty:
-
-    log.warning(
-        "%s | qty=%s < minQty=%s",
-        symbol,
-        decimal_string(qty),
-        decimal_string(min_qty)
-    )
-
-    return Decimal("0")
-
-if max_qty > 0 and qty > max_qty:
-
-    qty = floor_to_step(
-        max_qty,
-        step
-    )
-
-return qty
-```
-
-def get_min_notional(symbol):
-
-```
-filters = symbol_filters.get(
-    symbol,
-    {}
-)
-
-notional = filters.get(
-    "NOTIONAL"
-)
-
-if notional:
-
-    if notional.get(
-        "applyMinToMarket",
-        True
-    ):
-
-        value = D(
-            notional.get(
-                "minNotional",
-                "0"
-            )
-        )
-
-        if value > 0:
-            return value
-
-minimum = filters.get(
-    "MIN_NOTIONAL"
-)
-
-if minimum:
-
-    if minimum.get(
-        "applyToMarket",
-        True
-    ):
-
-        value = D(
-            minimum.get(
-                "minNotional",
-                "0"
-            )
-        )
-
-        if value > 0:
-            return value
-
-return Decimal("0")
-```
-
-def calculate_buy_quantity(
-symbol,
-price
-):
-
-```
-price = D(price)
-
-if price <= 0:
-    return Decimal("0")
-
-raw_quantity = (
-    BUY_USDT / price
-)
-
-quantity = normalize_quantity(
-    symbol,
-    raw_quantity
-)
-
-if quantity <= 0:
-    return Decimal("0")
-
-notional = (
-    quantity * price
-)
-
-minimum = get_min_notional(
-    symbol
-)
-
-if (
-    minimum > 0
-    and notional < minimum
-):
-
-    log.warning(
-        "%s | notional=%s < minNotional=%s",
-        symbol,
-        decimal_string(notional),
-        decimal_string(minimum)
-    )
-
-    return Decimal("0")
-
-log.info(
-    "%s | Quantity OK | price=%s | qty=%s | notional=%s",
-    symbol,
-    decimal_string(price),
-    decimal_string(quantity),
-    decimal_string(notional)
-)
-
-return quantity
-```
-
-# ============================================================
-
-# BUY
-
-# ============================================================
-
-def place_buy(
-symbol,
-price
-):
-
-```
-if cooldown_remaining() > 0:
-
-    log.warning(
-        "%s | BUY blocked by cooldown",
-        symbol
-    )
-
-    return None
-
-quantity = calculate_buy_quantity(
-    symbol,
-    price
-)
-
-if quantity <= 0:
-
-    log.warning(
-        "%s | BUY quantity invalid",
-        symbol
-    )
-
-    return None
-
-client_id = (
-    "RSIBUY_"
-    + str(
-        int(
-            time.time() * 1000
-        )
-    )
-)
-
-params = {
-    "symbol": symbol,
-    "side": "BUY",
-    "type": "MARKET",
-    "quantity": decimal_string(
-        quantity
-    ),
-    "newClientOrderId": client_id
-}
-
-log.info(
-    "%s | BUY attempt | $%s | qty=%s",
-    symbol,
-    decimal_string(BUY_USDT),
-    decimal_string(quantity)
-)
-
-try:
-
-    with order_lock:
-
-        result = signed_request(
-            "POST",
-            "/api/v3/order",
-            params
-        )
-
-    executed_qty = D(
-        result.get(
-            "executedQty",
-            "0"
-        )
-    )
-
-    quote_qty = D(
-        result.get(
-            "cummulativeQuoteQty",
-            "0"
-        )
-    )
-
-    if (
-        executed_qty > 0
-        and quote_qty > 0
-    ):
-
-        entry_price = (
-            quote_qty
-            / executed_qty
-        )
-
-    else:
-
-        entry_price = D(price)
-
-    positions[symbol] = {
-        "qty": executed_qty,
-        "entry_price": entry_price,
-        "buy_time": time.time()
-    }
-
-    last_buy_time[symbol] = (
-        time.time()
-    )
-
-    log.info(
-        "%s | BUY SUCCESS | orderId=%s | executed=%s | entry=%s",
-        symbol,
-        result.get("orderId"),
-        decimal_string(executed_qty),
-        decimal_string(entry_price)
-    )
-
-    # Place server-side stop loss.
-    place_stop_loss(
-        symbol,
-        executed_qty,
-        entry_price
-    )
-
-    return result
-
-except RuntimeError as e:
-
-    log.error(
-        "%s | BUY error: %s",
-        symbol,
-        e
-    )
-
-except Exception as e:
-
-    log.error(
-        "%s | BUY exception: %s",
-        symbol,
-        e
-    )
-
-return None
-```
-
-# ============================================================
-
-# STOP LOSS
-
-# ============================================================
-
-def place_stop_loss(
-symbol,
-quantity,
-entry_price
-):
-
-```
-quantity = normalize_quantity(
-    symbol,
-    quantity
-)
-
-if quantity <= 0:
-    return None
-
-entry_price = D(
-    entry_price
-)
-
-stop_price = (
-    entry_price
-    * (
-        Decimal("1")
-        - STOP_LOSS_PERCENT
-    )
-)
-
-stop_price = stop_price.quantize(
-    Decimal("0.00000001"),
-    rounding=ROUND_DOWN
-)
-
-client_id = (
-    "RSISL_"
-    + str(
-        int(
-            time.time() * 1000
-        )
-    )
-)
-
-params = {
-    "symbol": symbol,
-    "side": "SELL",
-    "type": "STOP_LOSS_LIMIT",
-    "timeInForce": "GTC",
-    "quantity": decimal_string(
-        quantity
-    ),
-    "price": decimal_string(
-        stop_price
-    ),
-    "stopPrice": decimal_string(
-        stop_price
-    ),
-    "newClientOrderId": client_id
-}
-
-try:
-
-    with order_lock:
-
-        result = signed_request(
-            "POST",
-            "/api/v3/order",
-            params
-        )
-
-    log.info(
-        "%s | STOP LOSS placed | stop=%s | qty=%s | orderId=%s",
-        symbol,
-        decimal_string(stop_price),
-        decimal_string(quantity),
-        result.get("orderId")
-    )
-
-    return result
-
-except RuntimeError as e:
-
-    log.error(
-        "%s | STOP LOSS error: %s",
-        symbol,
-        e
-    )
-
-except Exception as e:
-
-    log.error(
-        "%s | STOP LOSS exception: %s",
-        symbol,
-        e
-    )
-
-return None
-```
-
-# ============================================================
-
-# SELL
-
-# ============================================================
-
-def place_sell(
-symbol,
-quantity,
-reason
-):
-
-```
-if cooldown_remaining() > 0:
-
-    log.warning(
-        "%s | SELL blocked by cooldown",
-        symbol
-    )
-
-    return None
-
-quantity = normalize_quantity(
-    symbol,
-    quantity
-)
-
-if quantity <= 0:
-
-    log.warning(
-        "%s | SELL quantity invalid",
-        symbol
-    )
-
-    return None
-
-client_id = (
-    "RSISELL_"
-    + str(
-        int(
-            time.time() * 1000
-        )
-    )
-)
-
-params = {
-    "symbol": symbol,
-    "side": "SELL",
-    "type": "MARKET",
-    "quantity": decimal_string(
-        quantity
-    ),
-    "newClientOrderId": client_id
-}
-
-try:
-
-    with order_lock:
-
-        result = signed_request(
-            "POST",
-            "/api/v3/order",
-            params
-        )
-
-    log.info(
-        "%s | SELL SUCCESS | reason=%s | orderId=%s",
-        symbol,
-        reason,
-        result.get("orderId")
-    )
-
-    positions.pop(
-        symbol,
-        None
-    )
-
-    return result
-
-except RuntimeError as e:
-
-    log.error(
-        "%s | SELL error: %s",
-        symbol,
-        e
-    )
-
-except Exception as e:
-
-    log.error(
-        "%s | SELL exception: %s",
-        symbol,
-        e
-    )
-
-return None
-```
-
-# ============================================================
-
-# STRATEGY
-
-# ============================================================
-
-def process_closed_candle(
-symbol,
-close
-):
-
-```
-state = rsi_state.get(
-    symbol
-)
-
-if not state:
-    return
-
-rsi3, rsi50 = update_local_rsi(
-    symbol,
-    close
-)
-
-if rsi3 is None or rsi50 is None:
-    return
-
-previous_rsi3 = state.get(
-    "previous_rsi3",
-    rsi3
-)
-
-log.info(
-    "%s | Close=%s | RSI50=%.2f | RSI3=%.2f",
-    symbol,
-    decimal_string(close),
-    float(rsi50),
-    float(rsi3)
-)
-
-# ========================================================
-# SELL
-# ========================================================
-
-if symbol in positions:
-
-    if (
-        previous_rsi3
-        <= SELL_RSI_LEVEL
-        and rsi3
-        > SELL_RSI_LEVEL
-    ):
-
-        quantity = positions[
-            symbol
-        ]["qty"]
-
-        log.info(
-            "%s | SELL SIGNAL | RSI3 crossed above %s",
-            symbol,
-            decimal_string(
-                SELL_RSI_LEVEL
-            )
-        )
-
-        place_sell(
-            symbol,
-            quantity,
-            "RSI3_CROSS_ABOVE_80"
-        )
-
-    return
-
-# ========================================================
-# BUY COOLDOWN
-# ========================================================
-
-last_buy = last_buy_time.get(
-    symbol,
-    0
-)
-
-if (
-    time.time()
-    - last_buy
-    < BUY_COOLDOWN_SECONDS
-):
-    return
-
-# ========================================================
-# BUY
-# ========================================================
-
-if (
-    rsi50 > BUY_RSI_SLOW_MIN
-    and rsi3 < BUY_RSI_FAST_MAX
-):
-
-    log.info(
-        "%s | BUY SIGNAL | RSI50=%.2f RSI3=%.2f",
-        symbol,
-        float(rsi50),
-        float(rsi3)
-    )
-
-    place_buy(
-        symbol,
-        close
-    )
-```
-
-# ============================================================
-
-# WEBSOCKET
-
-# ============================================================
-
-def build_websocket_url():
-
-```
-streams = []
-
-for symbol in symbols:
-
-    streams.append(
-        symbol.lower()
-        + "@kline_5m"
-    )
-
-return (
-    WS_URL
-    + "?streams="
-    + "/".join(streams)
-)
-```
-
-def ws_message(
-ws,
-message
-):
-
-```
-try:
-
-    payload = json.loads(
-        message
-    )
-
-    data = payload.get(
-        "data",
-        payload
-    )
-
-    if data.get("e") != "kline":
-        return
-
-    kline = data.get(
-        "k",
-        {}
-    )
-
-    symbol = kline.get(
-        "s"
-    )
-
-    if not symbol:
-        return
-
-    # Only CLOSED candle.
-    if not kline.get(
-        "x",
-        False
-    ):
-        return
-
-    close = D(
-        kline.get(
-            "c",
-            "0"
-        )
-    )
-
-    candle_time = int(
-        kline.get(
-            "T",
-            0
-        )
-    )
-
-    if (
-        last_candle_time.get(
-            symbol
-        )
-        == candle_time
-    ):
-        return
-
-    last_candle_time[
-        symbol
-    ] = candle_time
-
-    process_closed_candle(
-        symbol,
-        close
-    )
-
-except Exception as e:
-
-    log.error(
-        "WebSocket message error: %s",
-        e
-    )
-```
-
-def ws_open(ws):
-
-```
-log.info(
-    "WebSocket connected | symbols=%s",
-    len(symbols)
-)
-```
-
-def ws_error(
-ws,
-error
-):
-
-```
-log.error(
-    "WebSocket error: %s",
-    error
-)
-```
-
-def ws_close(
-ws,
-status,
-message
-):
-
-```
-log.warning(
-    "WebSocket closed | code=%s | %s",
-    status,
-    message
-)
-```
-
-def websocket_worker():
-
-```
-global bot_ready
-
-while not shutdown_event.is_set():
-
-    try:
-
-        url = build_websocket_url()
-
-        log.info(
-            "Starting combined WebSocket..."
-        )
-
-        ws = websocket.WebSocketApp(
-            url,
-            on_open=ws_open,
-            on_message=ws_message,
-            on_error=ws_error,
-            on_close=ws_close
-        )
-
-        ws.run_forever(
-            ping_interval=120,
-            ping_timeout=30,
-            skip_utf8_validation=True
-        )
-
-    except Exception as e:
-
-        log.error(
-            "WebSocket exception: %s",
-            e
-        )
-
-    if shutdown_event.is_set():
-        break
-
-    bot_ready = False
-
-    log.warning(
-        "WebSocket reconnect in %s seconds",
-        RECONNECT_DELAY
-    )
-
-    time.sleep(
-        RECONNECT_DELAY
-    )
-
-    bot_ready = True
-```
-
-# ============================================================
-
-# BOT INITIALIZATION
-
-# ============================================================
-
-def initialize_bot():
-
-```
-global exchange_info
-global symbols
-global bot_ready
-
-log.info("=" * 70)
-
-log.info(
-    "STARTING BINANCE RSI50 + RSI3 BOT"
-)
-
-log.info("=" * 70)
-
-log.info(
-    "Timeframe: %s",
-    TIMEFRAME
-)
-
-log.info(
-    "Top symbols: %s",
-    TOP_SYMBOLS
-)
-
-log.info(
-    "BUY: RSI50 > 50 AND RSI3 < 10"
-)
-
-log.info(
-    "BUY amount: %s USDT",
-    decimal_string(BUY_USDT)
-)
-
-log.info(
-    "SELL: RSI3 crossing above 80"
-)
-
-log.info(
-    "Initial SL: %.2f%%",
-    float(
-        STOP_LOSS_PERCENT * 100
-    )
-)
-
-log.info(
-    "WebSocket: 1 combined connection"
-)
-
-log.info(
-    "REST klines: startup only"
-)
-
-log.info(
-    "Local RSI: ENABLED"
-)
-
-log.info(
-    "Pandas: NOT USED"
-)
-
-log.info(
-    "Server time sync: DISABLED"
-)
-
-log.info(
-    "Anti-418 protection: ENABLED"
-)
-
-# --------------------------------------------------------
-# EXCHANGE INFO
-# --------------------------------------------------------
-
-try:
-
-    exchange_info = (
-        load_exchange_info()
-    )
-
-except Exception as e:
-
-    log.error(
-        "Exchange info failed: %s",
-        e
-    )
-
-    return False
-
-time.sleep(
-    REST_DELAY
-)
-
-# --------------------------------------------------------
-# SYMBOLS
-# --------------------------------------------------------
-
-try:
-
-    symbols = select_symbols(
-        exchange_info
-    )
-
-except Exception as e:
-
-    log.error(
-        "Symbol selection failed: %s",
-        e
-    )
-
-    return False
-
-# --------------------------------------------------------
-# HISTORY
-# --------------------------------------------------------
-
-if not initialize_history():
-
-    log.error(
-        "RSI history initialization failed."
-    )
-
-    return False
-
-# --------------------------------------------------------
-# WEBSOCKET
-# --------------------------------------------------------
-
-bot_ready = True
-
-threading.Thread(
-    target=websocket_worker,
-    daemon=True,
-    name="BinanceWebSocket"
-).start()
-
-log.info("=" * 70)
-
-log.info(
-    "BOT READY"
-)
-
-log.info("=" * 70)
-
-return True
-```
-
-# ============================================================
-
-# BACKGROUND
-
-# ============================================================
-
-def background_bot():
-
-```
-global bot_initializing
-
-log.info(
-    "BOT BACKGROUND THREAD STARTED"
-)
-
-while not shutdown_event.is_set():
-
-    if bot_ready:
-
-        time.sleep(60)
-
-        continue
-
-    if bot_initializing:
-
-        time.sleep(5)
-
-        continue
-
-    bot_initializing = True
-
-    try:
-
-        success = (
-            initialize_bot()
-        )
-
-        if success:
-
-            while (
-                bot_ready
-                and not shutdown_event.is_set()
-            ):
-
-                time.sleep(30)
-
-        else:
-
-            remaining = (
-                cooldown_remaining()
-            )
-
-            if remaining > 0:
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+
+                if retry_after:
+                    try:
+                        wait_seconds = float(retry_after)
+                    except Exception:
+                        wait_seconds = 5
+                else:
+                    wait_seconds = 5
 
                 log.warning(
-                    "Waiting for Binance cooldown: %s seconds",
-                    remaining
+                    "Binance 429 rate limit. Sleeping %.2f seconds.",
+                    wait_seconds,
                 )
 
-                time.sleep(
-                    min(
-                        60,
-                        remaining
-                    )
+                time.sleep(wait_seconds)
+                continue
+
+            if response.status_code == 418:
+                log.error(
+                    "Binance returned HTTP 418 IP BAN. "
+                    "Stopping REST requests."
+                )
+
+                raise RuntimeError("BINANCE_IP_BANNED")
+
+            response.raise_for_status()
+
+            return response.json()
+
+        except Exception as e:
+            log.warning(
+                "Public REST error %d/%d: %s",
+                attempt + 1,
+                REST_RETRIES,
+                e,
+            )
+
+            if attempt < REST_RETRIES - 1:
+                time.sleep(2 + attempt * 2)
+
+    raise RuntimeError(f"REST failed: {path}")
+
+
+def signed_request(method, path, params=None):
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET missing")
+
+    params = dict(params or {})
+
+    params["timestamp"] = server_timestamp_ms()
+    params["recvWindow"] = 5000
+
+    query_string = sign_params(params)
+
+    headers = {
+        "X-MBX-APIKEY": API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    url = BASE_URL + path
+
+    for attempt in range(REST_RETRIES):
+        try:
+            time.sleep(REST_DELAY)
+
+            if method == "GET":
+                response = session.get(
+                    url + "?" + query_string,
+                    headers=headers,
+                    timeout=15,
+                )
+
+            elif method == "POST":
+                response = session.post(
+                    url,
+                    data=query_string,
+                    headers=headers,
+                    timeout=15,
+                )
+
+            elif method == "DELETE":
+                response = session.delete(
+                    url + "?" + query_string,
+                    headers=headers,
+                    timeout=15,
                 )
 
             else:
+                raise ValueError("Unsupported HTTP method")
 
+            if response.status_code == 429:
                 log.warning(
-                    "Initialization failed. Retry in 60 seconds."
+                    "Signed request received 429. "
+                    "Backing off before retry."
                 )
 
-                time.sleep(60)
+                time.sleep(5 + attempt * 5)
+                continue
+
+            if response.status_code == 418:
+                log.error(
+                    "BINANCE HTTP 418. "
+                    "Do NOT continue hammering the API."
+                )
+
+                raise RuntimeError("BINANCE_IP_BANNED")
+
+            if response.status_code >= 500:
+                # 5XX order response can have unknown execution status.
+                # Do not blindly duplicate an order.
+                raise RuntimeError(
+                    f"Binance server error {response.status_code}"
+                )
+
+            if response.status_code >= 400:
+                try:
+                    error_data = response.json()
+                except Exception:
+                    error_data = response.text
+
+                raise RuntimeError(
+                    f"Binance API error {response.status_code}: "
+                    f"{error_data}"
+                )
+
+            return response.json()
+
+        except Exception as e:
+            log.warning(
+                "Signed REST error %d/%d: %s",
+                attempt + 1,
+                REST_RETRIES,
+                e,
+            )
+
+            if attempt < REST_RETRIES - 1:
+                time.sleep(2 + attempt * 2)
+
+    raise RuntimeError(f"Signed REST failed: {path}")
+
+
+# ============================================================
+# EXCHANGE INFO
+# ============================================================
+
+def load_exchange_info():
+    global symbol_info
+
+    data = public_get("/api/v3/exchangeInfo")
+
+    result = {}
+
+    for item in data.get("symbols", []):
+
+        symbol = item.get("symbol")
+
+        if not symbol:
+            continue
+
+        if item.get("status") != "TRADING":
+            continue
+
+        if item.get("quoteAsset") != "USDT":
+            continue
+
+        if item.get("isSpotTradingAllowed") is False:
+            continue
+
+        base_asset = item.get("baseAsset", "")
+
+        if base_asset in EXCLUDED_BASE_ASSETS:
+            continue
+
+        filters = {}
+
+        for f in item.get("filters", []):
+            filters[f["filterType"]] = f
+
+        result[symbol] = {
+            "symbol": symbol,
+            "baseAsset": base_asset,
+            "quoteAsset": item.get("quoteAsset"),
+            "filters": filters,
+        }
+
+    symbol_info = result
+
+    log.info(
+        "Eligible USDT spot symbols: %d",
+        len(symbol_info),
+    )
+
+
+# ============================================================
+# TOP 150
+# ============================================================
+
+def select_top_symbols():
+    global symbols
+
+    ticker_data = public_get("/api/v3/ticker/24hr")
+
+    eligible = []
+
+    for item in ticker_data:
+
+        symbol = item.get("symbol")
+
+        if symbol not in symbol_info:
+            continue
+
+        try:
+            quote_volume = Decimal(item.get("quoteVolume", "0"))
+        except Exception:
+            continue
+
+        if quote_volume <= 0:
+            continue
+
+        eligible.append(
+            (
+                symbol,
+                quote_volume,
+            )
+        )
+
+    eligible.sort(
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    selected = [
+        x[0]
+        for x in eligible[:TOP_SYMBOLS]
+    ]
+
+    symbols = selected
+
+    log.info(
+        "Selected TOP %d symbols",
+        len(symbols),
+    )
+
+    log.info(
+        "Top symbols: %s",
+        ", ".join(symbols),
+    )
+
+    return symbols
+
+
+# ============================================================
+# DECIMAL / QUANTITY HELPERS
+# ============================================================
+
+def decimal_from_filter(filters, filter_name, key, default="0"):
+    f = filters.get(filter_name)
+
+    if not f:
+        return Decimal(default)
+
+    value = f.get(key)
+
+    if value is None:
+        return Decimal(default)
+
+    return Decimal(str(value))
+
+
+def floor_to_step(value, step):
+    value = Decimal(str(value))
+    step = Decimal(str(step))
+
+    if step <= 0:
+        return value
+
+    return (
+        value / step
+    ).to_integral_value(
+        rounding=ROUND_DOWN
+    ) * step
+
+
+def format_decimal(value):
+    value = Decimal(str(value))
+
+    text = format(
+        value,
+        "f",
+    )
+
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+
+    return text if text else "0"
+
+
+def get_sell_step(symbol):
+    info = symbol_info[symbol]
+
+    filters = info["filters"]
+
+    market_lot = filters.get("MARKET_LOT_SIZE")
+
+    if market_lot:
+        step = Decimal(
+            market_lot.get(
+                "stepSize",
+                "0",
+            )
+        )
+
+        if step > 0:
+            return step
+
+    lot = filters.get("LOT_SIZE")
+
+    if lot:
+        return Decimal(
+            lot.get(
+                "stepSize",
+                "0",
+            )
+        )
+
+    return Decimal("0")
+
+
+def validate_notional_for_buy(symbol):
+    info = symbol_info[symbol]
+
+    filters = info["filters"]
+
+    minimum = Decimal("0")
+
+    if "NOTIONAL" in filters:
+        minimum = Decimal(
+            filters["NOTIONAL"].get(
+                "minNotional",
+                "0",
+            )
+        )
+
+    elif "MIN_NOTIONAL" in filters:
+        minimum = Decimal(
+            filters["MIN_NOTIONAL"].get(
+                "minNotional",
+                "0",
+            )
+        )
+
+    if minimum > 0 and BUY_USDT < minimum:
+        log.warning(
+            "%s | Buy %.2f USDT is below minimum notional %.2f",
+            symbol,
+            BUY_USDT,
+            minimum,
+        )
+
+        return False
+
+    return True
+
+
+# ============================================================
+# RSI - WILDER
+# ============================================================
+
+def calculate_wilder_rsi(closes, period):
+    """
+    Wilder RSI calculation.
+
+    This uses:
+        Initial average gain/loss = SMA
+        Next values = Wilder RMA:
+            avg = (previous_avg * (period - 1) + current) / period
+
+    Returns the RSI value of the latest closed candle.
+    """
+
+    if len(closes) < period + 1:
+        return None
+
+    values = [
+        Decimal(str(x))
+        for x in closes
+    ]
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+
+        if change > 0:
+            gains.append(change)
+            losses.append(Decimal("0"))
+
+        else:
+            gains.append(Decimal("0"))
+            losses.append(abs(change))
+
+    if len(gains) < period:
+        return None
+
+    avg_gain = (
+        sum(gains[:period])
+        / Decimal(period)
+    )
+
+    avg_loss = (
+        sum(losses[:period])
+        / Decimal(period)
+    )
+
+    for i in range(period, len(gains)):
+
+        avg_gain = (
+            (
+                avg_gain
+                * Decimal(period - 1)
+            )
+            + gains[i]
+        ) / Decimal(period)
+
+        avg_loss = (
+            (
+                avg_loss
+                * Decimal(period - 1)
+            )
+            + losses[i]
+        ) / Decimal(period)
+
+    if avg_loss == 0:
+        if avg_gain == 0:
+            return Decimal("50")
+
+        return Decimal("100")
+
+    rs = avg_gain / avg_loss
+
+    rsi = Decimal("100") - (
+        Decimal("100")
+        / (Decimal("1") + rs)
+    )
+
+    return rsi
+
+
+# ============================================================
+# INITIAL HISTORICAL DATA
+# ============================================================
+
+def load_initial_klines(symbol):
+    """
+    Load enough 5m closed candles to calculate RSI(50).
+
+    We request 120 candles.
+    The last candle may still be open, so it is removed.
+    """
+
+    data = public_get(
+        "/api/v3/klines",
+        {
+            "symbol": symbol,
+            "interval": TIMEFRAME,
+            "limit": HISTORY_LIMIT,
+        },
+    )
+
+    closes = []
+
+    now_ms = server_timestamp_ms()
+
+    for kline in data:
+
+        open_time = int(kline[0])
+        close_time = int(kline[6])
+
+        close_price = Decimal(str(kline[4]))
+
+        # Only closed candles
+        if close_time < now_ms:
+            closes.append(close_price)
+
+    if len(closes) < RSI_SLOW_PERIOD + 2:
+        raise RuntimeError(
+            f"{symbol}: insufficient historical candles"
+        )
+
+    with state_lock:
+        market_data[symbol] = {
+            "closes": closes[-HISTORY_LIMIT:],
+            "last_closed_time": 0,
+            "rsi3": None,
+            "rsi50": None,
+        }
+
+    return True
+
+
+def load_all_initial_data():
+    log.info(
+        "Loading initial %d-candle history for %d symbols...",
+        HISTORY_LIMIT,
+        len(symbols),
+    )
+
+    success = 0
+
+    for index, symbol in enumerate(symbols, start=1):
+
+        try:
+            load_initial_klines(symbol)
+
+            success += 1
+
+            if index % 10 == 0:
+                log.info(
+                    "Historical data loaded: %d/%d",
+                    index,
+                    len(symbols),
+                )
+
+        except Exception as e:
+            log.error(
+                "%s | Initial history error: %s",
+                symbol,
+                e,
+            )
+
+        # Keep REST request rate conservative
+        time.sleep(0.15)
+
+    log.info(
+        "Historical initialization complete: %d/%d",
+        success,
+        len(symbols),
+    )
+
+    if success < len(symbols) * 0.90:
+        raise RuntimeError(
+            "Too many symbols failed initial history loading"
+        )
+
+
+# ============================================================
+# BUY / SELL POSITION STATE
+# ============================================================
+
+def has_position(symbol):
+    with state_lock:
+        return symbol in positions
+
+
+def save_position(symbol, qty, order_id):
+    with state_lock:
+        positions[symbol] = {
+            "qty": str(qty),
+            "buy_order_id": order_id,
+            "buy_time": int(time.time()),
+        }
+
+
+def remove_position(symbol):
+    with state_lock:
+        positions.pop(symbol, None)
+
+
+# ============================================================
+# MARKET BUY
+# ============================================================
+
+def market_buy(symbol):
+    if has_position(symbol):
+        log.info(
+            "%s | BUY skipped - position already exists",
+            symbol,
+        )
+        return False
+
+    if not validate_notional_for_buy(symbol):
+        return False
+
+    client_order_id = (
+        "RSI3B" + str(int(time.time() * 1000))[-18:]
+    )
+
+    if DRY_RUN:
+        log.warning(
+            "%s | DRY RUN BUY %.2f USDT",
+            symbol,
+            BUY_USDT,
+        )
+
+        # Fake quantity for state testing is intentionally NOT saved.
+        # This prevents accidental fake position from becoming a real sell.
+        return True
+
+    params = {
+        "symbol": symbol,
+        "side": "BUY",
+        "type": "MARKET",
+        "quoteOrderQty": format_decimal(BUY_USDT),
+        "newOrderRespType": "FULL",
+        "newClientOrderId": client_order_id,
+    }
+
+    log.warning(
+        "%s | MARKET BUY %.2f USDT",
+        symbol,
+        BUY_USDT,
+    )
+
+    try:
+        result = signed_request(
+            "POST",
+            "/api/v3/order",
+            params,
+        )
+
+    except Exception as e:
+        log.error(
+            "%s | BUY order failed: %s",
+            symbol,
+            e,
+        )
+        return False
+
+    executed_qty = Decimal(
+        str(
+            result.get(
+                "executedQty",
+                "0",
+            )
+        )
+    )
+
+    if executed_qty <= 0:
+
+        log.error(
+            "%s | BUY returned zero executed quantity",
+            symbol,
+        )
+
+        return False
+
+    # If commission was charged in BASE asset,
+    # subtract it from the sellable quantity.
+    base_asset = symbol_info[symbol]["baseAsset"]
+
+    base_commission = Decimal("0")
+
+    for fill in result.get("fills", []):
+
+        commission_asset = fill.get(
+            "commissionAsset"
+        )
+
+        if commission_asset == base_asset:
+
+            base_commission += Decimal(
+                str(
+                    fill.get(
+                        "commission",
+                        "0",
+                    )
+                )
+            )
+
+    sellable_qty = (
+        executed_qty
+        - base_commission
+    )
+
+    if sellable_qty <= 0:
+        log.error(
+            "%s | No sellable quantity after commission",
+            symbol,
+        )
+        return False
+
+    step = get_sell_step(symbol)
+
+    sellable_qty = floor_to_step(
+        sellable_qty,
+        step,
+    )
+
+    if sellable_qty <= 0:
+        log.error(
+            "%s | Quantity became zero after LOT_SIZE rounding",
+            symbol,
+        )
+        return False
+
+    order_id = result.get("orderId")
+
+    save_position(
+        symbol,
+        sellable_qty,
+        order_id,
+    )
+
+    log.warning(
+        "%s | BUY FILLED | qty=%s | orderId=%s",
+        symbol,
+        format_decimal(sellable_qty),
+        order_id,
+    )
+
+    return True
+
+
+# ============================================================
+# MARKET SELL
+# ============================================================
+
+def market_sell(symbol):
+    with state_lock:
+        position = positions.get(symbol)
+
+    if not position:
+        return False
+
+    stored_qty = Decimal(
+        str(position["qty"])
+    )
+
+    step = get_sell_step(symbol)
+
+    sell_qty = floor_to_step(
+        stored_qty,
+        step,
+    )
+
+    if sell_qty <= 0:
+        log.error(
+            "%s | SELL quantity is zero",
+            symbol,
+        )
+        return False
+
+    client_order_id = (
+        "RSI3S" + str(int(time.time() * 1000))[-18:]
+    )
+
+    if DRY_RUN:
+
+        log.warning(
+            "%s | DRY RUN SELL qty=%s",
+            symbol,
+            format_decimal(sell_qty),
+        )
+
+        return True
+
+    params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "type": "MARKET",
+        "quantity": format_decimal(sell_qty),
+        "newOrderRespType": "FULL",
+        "newClientOrderId": client_order_id,
+    }
+
+    log.warning(
+        "%s | MARKET SELL qty=%s",
+        symbol,
+        format_decimal(sell_qty),
+    )
+
+    try:
+        result = signed_request(
+            "POST",
+            "/api/v3/order",
+            params,
+        )
+
+    except Exception as e:
+
+        log.error(
+            "%s | SELL order failed: %s",
+            symbol,
+            e,
+        )
+
+        return False
+
+    executed_qty = Decimal(
+        str(
+            result.get(
+                "executedQty",
+                "0",
+            )
+        )
+    )
+
+    if executed_qty <= 0:
+
+        log.error(
+            "%s | SELL returned zero executed quantity",
+            symbol,
+        )
+
+        return False
+
+    log.warning(
+        "%s | SELL FILLED | qty=%s | orderId=%s",
+        symbol,
+        format_decimal(executed_qty),
+        result.get("orderId"),
+    )
+
+    # Position closed.
+    remove_position(symbol)
+
+    return True
+
+
+# ============================================================
+# PROCESS CLOSED CANDLE
+# ============================================================
+
+def process_closed_candle(symbol, candle):
+    """
+    candle:
+        [
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            close_time,
+            ...
+        ]
+    """
+
+    open_time = int(candle[0])
+    close_time = int(candle[6])
+
+    close_price = Decimal(
+        str(candle[4])
+    )
+
+    with state_lock:
+
+        data = market_data.get(symbol)
+
+        if not data:
+            return
+
+        # Duplicate candle protection
+        if (
+            data["last_closed_time"]
+            == close_time
+        ):
+            return
+
+        data["last_closed_time"] = close_time
+
+        data["closes"].append(
+            close_price
+        )
+
+        if len(data["closes"]) > HISTORY_LIMIT:
+            data["closes"] = data["closes"][
+                -HISTORY_LIMIT:
+            ]
+
+        closes = list(
+            data["closes"]
+        )
+
+    # Calculate RSI outside lock
+    rsi3 = calculate_wilder_rsi(
+        closes,
+        RSI_FAST_PERIOD,
+    )
+
+    rsi50 = calculate_wilder_rsi(
+        closes,
+        RSI_SLOW_PERIOD,
+    )
+
+    if rsi3 is None or rsi50 is None:
+        return
+
+    with state_lock:
+
+        old_rsi3 = data.get(
+            "rsi3"
+        )
+
+        data["rsi3"] = rsi3
+        data["rsi50"] = rsi50
+
+    log.info(
+        "%s | CLOSED 5m | Close=%s | RSI3=%.4f | RSI50=%.4f",
+        symbol,
+        format_decimal(close_price),
+        float(rsi3),
+        float(rsi50),
+    )
+
+    # ========================================================
+    # SELL FIRST
+    # ========================================================
+
+    if has_position(symbol):
+
+        if (
+            old_rsi3 is not None
+            and old_rsi3 <= SELL_RSI_LEVEL
+            and rsi3 > SELL_RSI_LEVEL
+        ):
+
+            log.warning(
+                "%s | SELL SIGNAL | RSI3 %.4f -> %.4f",
+                symbol,
+                float(old_rsi3),
+                float(rsi3),
+            )
+
+            # Sell immediately in this same candle event.
+            market_sell(symbol)
+
+        return
+
+    # ========================================================
+    # BUY
+    # ========================================================
+
+    buy_signal = (
+        rsi50 > BUY_RSI_SLOW_MIN
+        and rsi3 < BUY_RSI_FAST_MAX
+    )
+
+    if buy_signal:
+
+        log.warning(
+            "%s | BUY SIGNAL | RSI50=%.4f > %.2f | RSI3=%.4f < %.2f",
+            symbol,
+            float(rsi50),
+            float(BUY_RSI_SLOW_MIN),
+            float(rsi3),
+            float(BUY_RSI_FAST_MAX),
+        )
+
+        market_buy(symbol)
+
+
+# ============================================================
+# WEBSOCKET
+# ============================================================
+
+def build_stream_url(group):
+    streams = []
+
+    for symbol in group:
+
+        streams.append(
+            f"{symbol.lower()}@kline_{TIMEFRAME}"
+        )
+
+    return WS_BASE_URL + "/".join(streams)
+
+
+def websocket_on_open(ws):
+    log.info(
+        "WebSocket connected."
+    )
+
+
+def websocket_on_message(ws, message):
+
+    try:
+
+        payload = json.loads(message)
+
+        data = payload.get("data")
+
+        if not data:
+            return
+
+        if data.get("e") != "kline":
+            return
+
+        kline = data.get("k")
+
+        if not kline:
+            return
+
+        # Binance:
+        # x = true means candle is closed
+        if not kline.get("x", False):
+            return
+
+        symbol = kline.get("s")
+
+        if not symbol:
+            return
+
+        candle = [
+            int(kline["t"]),
+            kline["o"],
+            kline["h"],
+            kline["l"],
+            kline["c"],
+            kline["v"],
+            int(kline["T"]),
+        ]
+
+        process_closed_candle(
+            symbol,
+            candle,
+        )
 
     except Exception as e:
 
         log.exception(
-            "Background bot error: %s",
-            e
+            "WebSocket message processing error: %s",
+            e,
         )
 
-        time.sleep(60)
 
-    finally:
+def websocket_on_error(ws, error):
 
-        bot_initializing = False
-```
-
-# ============================================================
-
-# FLASK ROUTES
-
-# ============================================================
-
-@app.route(
-"/",
-methods=["GET", "HEAD"]
-)
-def home():
-
-```
-return jsonify({
-    "status": "online",
-    "bot": "RSI50 + RSI3",
-    "ready": bot_ready,
-    "symbols": len(symbols),
-    "positions": len(positions),
-    "binance_cooldown_seconds":
-        cooldown_remaining()
-})
-```
-
-@app.route(
-"/health",
-methods=["GET", "HEAD"]
-)
-def health():
-
-```
-return jsonify({
-    "status": "healthy",
-    "bot_ready": bot_ready
-}), 200
-```
-
-@app.route(
-"/status",
-methods=["GET"]
-)
-def status():
-
-```
-output_positions = {}
-
-for symbol, data in positions.items():
-
-    output_positions[
-        symbol
-    ] = {
-        "qty": decimal_string(
-            data.get(
-                "qty",
-                0
-            )
-        ),
-        "entry_price": decimal_string(
-            data.get(
-                "entry_price",
-                0
-            )
-        )
-    }
-
-return jsonify({
-    "bot_ready": bot_ready,
-    "symbols": len(symbols),
-    "positions":
-        output_positions,
-    "binance_cooldown_seconds":
-        cooldown_remaining()
-})
-```
-
-# ============================================================
-
-# START BACKGROUND THREAD
-
-# ============================================================
-
-threading.Thread(
-target=background_bot,
-daemon=True,
-name="BotBackground"
-).start()
-
-# ============================================================
-
-# LOCAL DEVELOPMENT
-
-# ============================================================
-
-if **name** == "**main**":
-
-```
-port = int(
-    os.environ.get(
-        "PORT",
-        "10000"
+    log.error(
+        "WebSocket error: %s",
+        error,
     )
-)
 
-app.run(
-    host="0.0.0.0",
-    port=port
-)
-```
+
+def websocket_on_close(
+    ws,
+    close_status_code,
+    close_msg,
+):
+
+    log.warning(
+        "WebSocket closed | code=%s | message=%s",
+        close_status_code,
+        close_msg,
+    )
+
+
+def run_websocket_group(group, group_number):
+
+    url = build_stream_url(group)
+
+    log.info(
+        "Starting WebSocket group %d | %d symbols",
+        group_number,
+        len(group),
+    )
+
+    while True:
+
+        try:
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=websocket_on_open,
+                on_message=websocket_on_message,
+                on_error=websocket_on_error,
+                on_close=websocket_on_close,
+            )
+
+            ws.run_forever(
+                ping_interval=WS_PING_INTERVAL,
+                ping_timeout=WS_PING_TIMEOUT,
+                ping_payload="ping",
+                skip_utf8_validation=True,
+            )
+
+        except Exception as e:
+
+            log.exception(
+                "WebSocket group %d crashed: %s",
+                group_number,
+                e,
+            )
+
+        log.warning(
+            "WebSocket group %d reconnecting in %d seconds...",
+            group_number,
+            WS_RECONNECT_DELAY,
+        )
+
+        time.sleep(
+            WS_RECONNECT_DELAY
+        )
+
+
+def start_websocket_groups():
+
+    global ws_threads
+
+    ws_threads = []
+
+    groups = [
+        symbols[i:i + GROUP_SIZE]
+        for i in range(
+            0,
+            len(symbols),
+            GROUP_SIZE,
+        )
+    ]
+
+    log.info(
+        "Creating %d WebSocket groups...",
+        len(groups),
+    )
+
+    for number, group in enumerate(
+        groups,
+        start=1,
+    ):
+
+        thread = threading.Thread(
+            target=run_websocket_group,
+            args=(group, number),
+            daemon=True,
+            name=f"WS-GROUP-{number}",
+        )
+
+        thread.start()
+
+        ws_threads.append(
+            thread
+        )
+
+        # Avoid simultaneous connection burst
+        time.sleep(2)
+
+    log.info(
+        "All WebSocket groups started."
+    )
+
+
+# ============================================================
+# SERVER TIME MAINTENANCE
+# ============================================================
+
+def server_time_loop():
+
+    while True:
+
+        try:
+            update_server_time()
+
+        except Exception as e:
+            log.error(
+                "Server time maintenance error: %s",
+                e,
+            )
+
+        # Very low frequency REST request
+        time.sleep(30 * 60)
+
+
+# ============================================================
+# TOP SYMBOL REFRESH
+# ============================================================
+
+def symbol_refresh_loop():
+
+    global symbols
+
+    while True:
+
+        time.sleep(
+            TOP_SYMBOL_REFRESH_SECONDS
+        )
+
+        try:
+
+            log.info(
+                "Refreshing Top 150 symbols..."
+            )
+
+            load_exchange_info()
+
+            new_symbols = select_top_symbols()
+
+            if new_symbols != symbols:
+
+                log.warning(
+                    "Top 150 changed. "
+                    "Bot restart/reconnect required for new stream set."
+                )
+
+                # Do NOT automatically kill active WS threads.
+                #
+                # A full process restart is safer than accidentally
+                # running old and new streams simultaneously.
+                #
+                # Therefore we only log the change here.
+                #
+                # The current 150 continue running safely.
+
+        except Exception as e:
+
+            log.error(
+                "Top symbol refresh failed: %s",
+                e,
+            )
+
+
+# ============================================================
+# POSITION RECOVERY
+# ============================================================
+
+def check_account_connection():
+
+    try:
+
+        data = signed_request(
+            "GET",
+            "/api/v3/account",
+            {},
+        )
+
+        if data.get("accountType"):
+
+            log.info(
+                "Binance account connection OK | accountType=%s",
+                data.get("accountType"),
+            )
+
+        else:
+
+            log.info(
+                "Binance account connection OK."
+            )
+
+        return True
+
+    except Exception as e:
+
+        log.error(
+            "Binance account connection failed: %s",
+            e,
+        )
+
+        return False
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def initialize_bot():
+
+    log.info("=" * 70)
+    log.info(
+        "STARTING BINANCE SPOT RSI3 + RSI50 BOT"
+    )
+    log.info("=" * 70)
+
+    log.info(
+        "Timeframe: %s",
+        TIMEFRAME,
+    )
+
+    log.info(
+        "Top symbols: %d",
+        TOP_SYMBOLS,
+    )
+
+    log.info(
+        "BUY: RSI50 > %s AND RSI3 < %s",
+        BUY_RSI_SLOW_MIN,
+        BUY_RSI_FAST_MAX,
+    )
+
+    log.info(
+        "SELL: RSI3 crosses above %s",
+        SELL_RSI_LEVEL,
+    )
+
+    log.info(
+        "BUY amount: %s USDT",
+        BUY_USDT,
+    )
+
+    log.info(
+        "DRY_RUN: %s",
+        DRY_RUN,
+    )
+
+    if not API_KEY or not API_SECRET:
+
+        raise RuntimeError(
+            "BINANCE_API_KEY and BINANCE_API_SECRET "
+            "must be set in Render Environment Variables."
+        )
+
+    # Sync server clock
+    if not update_server_time():
+
+        raise RuntimeError(
+            "Could not synchronize Binance server time."
+        )
+
+    # Exchange information
+    load_exchange_info()
+
+    # Select Top 150
+    select_top_symbols()
+
+    if len(symbols) == 0:
+
+        raise RuntimeError(
+            "No eligible symbols found."
+        )
+
+    # Account connection
+    if not check_account_connection():
+
+        raise RuntimeError(
+            "Binance account/API connection failed."
+        )
+
+    # Historical RSI data
+    load_all_initial_data()
+
+    # Start background time sync
+    threading.Thread(
+        target=server_time_loop,
+        daemon=True,
+        name="SERVER-TIME",
+    ).start()
+
+    # Start Top 150 monitor
+    threading.Thread(
+        target=symbol_refresh_loop,
+        daemon=True,
+        name="SYMBOL-REFRESH",
+    ).start()
+
+    # Start exactly 3 groups for 150 symbols
+    start_websocket_groups()
+
+    bot_started.set()
+
+    log.info("=" * 70)
+    log.info(
+        "BOT IS RUNNING"
+    )
+    log.info("=" * 70)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def start_background_bot():
+
+    try:
+
+        initialize_bot()
+
+    except Exception as e:
+
+        log.exception(
+            "FATAL BOT INITIALIZATION ERROR: %s",
+            e,
+        )
+
+
+if __name__ == "__main__":
+
+    # Start bot in background
+    threading.Thread(
+        target=start_background_bot,
+        daemon=True,
+        name="BOT-MAIN",
+    ).start()
+
+    # Render supplies PORT.
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
+
+    log.info(
+        "Flask server starting on port %d",
+        port,
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True,
+        use_reloader=False,
+    )
