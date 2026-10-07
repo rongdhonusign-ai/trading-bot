@@ -37,9 +37,16 @@ RSI_FAST_PERIOD = 3
 RSI_SLOW_PERIOD = 50
 
 BUY_RSI50_MIN = Decimal("52")
-BUY_RSI3_MAX = Decimal("10")
+BUY_RSI3_MAX = Decimal("2")
 
 SELL_RSI3_LEVEL = Decimal("80")
+
+# Exchange-side 1% protective stop loss
+STOP_LOSS_PERCENT = Decimal("1")
+
+# Live RSI3 cross detection: sell as soon as the live 5m candle RSI3
+# crosses above 80, instead of waiting for candle close.
+LIVE_RSI_SELL = True
 
 # RSI50-এর জন্য পর্যাপ্ত history
 HISTORY_CANDLES = 200
@@ -61,7 +68,7 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 
 # RSI3 কত হলে near-signal হিসেবে log করবে
-NEAR_RSI3_LEVEL = Decimal("20")
+NEAR_RSI3_LEVEL = Decimal("10")
 
 # RSI50 কত হলে near-signal হিসেবে log করবে
 NEAR_RSI50_LEVEL = Decimal("48")
@@ -116,6 +123,9 @@ _bot_thread_lock = threading.Lock()
 websocket_status = {}
 last_ws_message_time = {}
 last_closed_candle_time = {}
+
+# Prevent duplicate live-cross submissions on the same candle.
+live_sell_triggered_candle = {}
 
 last_signal_time = None
 last_buy_signal = None
@@ -826,6 +836,177 @@ def get_order_by_client_id(symbol, client_order_id):
 
 
 # ============================================================
+# ORDER / STOP-LOSS HELPERS
+# ============================================================
+
+def get_step_size(symbol, market=True):
+
+    filters = symbol_info[symbol]["filters"]
+
+    if market:
+        f = filters.get("MARKET_LOT_SIZE")
+        if f:
+            step = d(f.get("stepSize", "0"))
+            if step > 0:
+                return step
+
+    f = filters.get("LOT_SIZE")
+    if f:
+        step = d(f.get("stepSize", "0"))
+        if step > 0:
+            return step
+
+    return Decimal("0")
+
+
+def get_price_tick_size(symbol):
+
+    filters = symbol_info[symbol]["filters"]
+    f = filters.get("PRICE_FILTER")
+
+    if f:
+        tick = d(f.get("tickSize", "0"))
+        if tick > 0:
+            return tick
+
+    return Decimal("0")
+
+
+def cancel_order(symbol, order_id=None, client_order_id=None):
+
+    params = {"symbol": symbol}
+
+    if order_id is not None:
+        params["orderId"] = order_id
+    elif client_order_id:
+        params["origClientOrderId"] = client_order_id
+    else:
+        return None
+
+    try:
+        response = signed_request(
+            "DELETE",
+            "/api/v3/order",
+            params,
+        )
+        log.info(
+            "Order canceled | %s | orderId=%s | clientId=%s",
+            symbol,
+            response.get("orderId"),
+            response.get("clientOrderId"),
+        )
+        return response
+    except Exception as exc:
+        log.warning(
+            "Cancel order failed | %s | orderId=%s | clientId=%s | %s",
+            symbol,
+            order_id,
+            client_order_id,
+            exc,
+        )
+        return None
+
+
+def place_stop_loss(symbol, quantity, entry_price):
+    """Place a Binance Spot STOP_LOSS MARKET sell 1% below entry."""
+
+    if DRY_RUN:
+        return None, None
+
+    if quantity <= 0 or entry_price <= 0:
+        return None, None
+
+    stop_price = entry_price * (
+        Decimal("1") - STOP_LOSS_PERCENT / Decimal("100")
+    )
+
+    tick = get_price_tick_size(symbol)
+    if tick > 0:
+        stop_price = floor_to_step(stop_price, tick)
+
+    quantity = floor_to_step(
+        quantity,
+        get_step_size(symbol),
+    )
+
+    if stop_price <= 0 or quantity <= 0:
+        return None, None
+
+    client_order_id = create_client_order_id("RSISL_")
+
+    params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "type": "STOP_LOSS",
+        "quantity": decimal_to_string(quantity),
+        "stopPrice": decimal_to_string(stop_price),
+        "newOrderRespType": "FULL",
+        "newClientOrderId": client_order_id,
+    }
+
+    try:
+        response = signed_request(
+            "POST",
+            "/api/v3/order",
+            params,
+        )
+
+        log.warning(
+            "🛡️ 1%% STOP LOSS PLACED | %s | entry=%s | stop=%s | qty=%s | orderId=%s",
+            symbol,
+            decimal_to_string(entry_price),
+            decimal_to_string(stop_price),
+            decimal_to_string(quantity),
+            response.get("orderId"),
+        )
+
+        return response.get("orderId"), client_order_id
+
+    except Exception as exc:
+        log.error(
+            "STOP LOSS ORDER FAILED | %s | entry=%s | stop=%s | qty=%s | %s",
+            symbol,
+            decimal_to_string(entry_price),
+            decimal_to_string(stop_price),
+            decimal_to_string(quantity),
+            exc,
+        )
+        return None, None
+
+
+def get_live_rsi3(symbol, live_close):
+    """Calculate RSI3 using closed candles + current live candle close."""
+
+    with state_lock:
+        history = list(candle_history.get(symbol, []))
+
+    if len(history) < RSI_FAST_PERIOD + 2:
+        return None
+
+    closes = [c["close"] for c in history]
+    previous_values = calculate_rsi_wilder(
+        closes,
+        RSI_FAST_PERIOD,
+    )
+
+    live_values = calculate_rsi_wilder(
+        closes + [d(live_close)],
+        RSI_FAST_PERIOD,
+    )
+
+    if not previous_values or not live_values:
+        return None
+
+    previous_rsi3 = previous_values[-1]
+    live_rsi3 = live_values[-1]
+
+    if previous_rsi3 is None or live_rsi3 is None:
+        return None
+
+    return previous_rsi3, live_rsi3
+
+
+# ============================================================
 # BUY
 # ============================================================
 
@@ -1026,20 +1207,55 @@ def execute_buy(symbol, indicators):
             "PARTIALLY_FILLED",
         ) and net_quantity > 0:
 
-            with state_lock:
+            cumulative_quote = d(
+                response.get("cummulativeQuoteQty", "0")
+            )
 
+            if cumulative_quote > 0 and executed_qty > 0:
+                entry_price = cumulative_quote / executed_qty
+            else:
+                total_quote = Decimal("0")
+                total_qty = Decimal("0")
+                for fill in response.get("fills", []):
+                    price = d(fill.get("price", "0"))
+                    qty = d(fill.get("qty", "0"))
+                    total_quote += price * qty
+                    total_qty += qty
+                entry_price = (
+                    total_quote / total_qty
+                    if total_qty > 0
+                    else Decimal("0")
+                )
+
+            with state_lock:
                 positions[symbol] = {
                     "quantity": net_quantity,
                     "entry_time": time.time(),
                     "order_id": order_id,
+                    "entry_price": entry_price,
+                    "stop_order_id": None,
+                    "stop_client_order_id": None,
                 }
 
             log.warning(
-                "BUY CONFIRMED | %s | quantity=%s | orderId=%s",
+                "BUY CONFIRMED | %s | quantity=%s | entry=%s | orderId=%s",
                 symbol,
                 net_quantity,
+                decimal_to_string(entry_price),
                 order_id,
             )
+
+            # Exchange-side 1% stop loss.
+            stop_order_id, stop_client_order_id = place_stop_loss(
+                symbol,
+                net_quantity,
+                entry_price,
+            )
+
+            with state_lock:
+                if symbol in positions:
+                    positions[symbol]["stop_order_id"] = stop_order_id
+                    positions[symbol]["stop_client_order_id"] = stop_client_order_id
 
         else:
 
@@ -1071,7 +1287,9 @@ def execute_sell(symbol, indicators):
 
     with state_lock:
 
-        if symbol not in positions:
+        position = positions.get(symbol)
+
+        if position is None:
             return
 
         if symbol in selling_symbols:
@@ -1081,105 +1299,79 @@ def execute_sell(symbol, indicators):
 
     try:
 
-        log.warning(
-            "=================================================="
-        )
+        log.warning("==================================================")
 
         log.warning(
             "SELL SIGNAL | %s | RSI3 %.4f -> %.4f",
             symbol,
-            indicators["previous_rsi3"],
-            indicators["rsi3"],
+            indicators.get("previous_rsi3", Decimal("0")),
+            indicators.get("rsi3", Decimal("0")),
         )
 
         if DRY_RUN:
-
-            log.warning(
-                "DRY_RUN=True | SELL NOT SENT | %s",
-                symbol,
-            )
-
+            log.warning("DRY_RUN=True | SELL NOT SENT | %s", symbol)
             with state_lock:
                 positions.pop(symbol, None)
-
             return
 
-        base_asset = symbol_info[symbol]["baseAsset"]
+        # Cancel the protective stop before manual RSI sell.
+        stop_order_id = position.get("stop_order_id")
+        stop_client_order_id = position.get("stop_client_order_id")
 
-        balance = get_asset_balance(
-            base_asset
-        )
+        if stop_order_id or stop_client_order_id:
+            canceled = cancel_order(
+                symbol,
+                order_id=stop_order_id,
+                client_order_id=stop_client_order_id,
+            )
+
+            # If the stop already triggered/filled, do not send a second sell.
+            if canceled is None:
+                stop_status = get_order_by_client_id(
+                    symbol,
+                    stop_client_order_id,
+                ) if stop_client_order_id else None
+
+                if stop_status and stop_status.get("status") in (
+                    "FILLED",
+                    "PARTIALLY_FILLED",
+                ):
+                    log.warning(
+                        "STOP LOSS already executed | %s | orderId=%s",
+                        symbol,
+                        stop_status.get("orderId"),
+                    )
+                    with state_lock:
+                        positions.pop(symbol, None)
+                    return
+
+        base_asset = symbol_info[symbol]["baseAsset"]
+        balance = get_asset_balance(base_asset)
 
         if balance <= 0:
-
             log.warning(
                 "SELL skipped | %s | free balance=%s",
                 symbol,
                 balance,
             )
-
             with state_lock:
                 positions.pop(symbol, None)
-
             return
 
-        filters = symbol_info[symbol]["filters"]
-
-        market_lot = filters.get(
-            "MARKET_LOT_SIZE"
-        )
-
-        lot = filters.get(
-            "LOT_SIZE"
-        )
-
-        step = None
-
-        if market_lot:
-            step = d(
-                market_lot.get(
-                    "stepSize",
-                    "0",
-                )
-            )
-
-        if not step and lot:
-            step = d(
-                lot.get(
-                    "stepSize",
-                    "0",
-                )
-            )
-
-        quantity = balance
-
-        if step and step > 0:
-
-            quantity = floor_to_step(
-                quantity,
-                step,
-            )
+        step = get_step_size(symbol)
+        quantity = floor_to_step(balance, step) if step > 0 else balance
 
         if quantity <= 0:
-
-            log.warning(
-                "SELL quantity <= 0 | %s",
-                symbol,
-            )
-
+            log.warning("SELL quantity <= 0 | %s", symbol)
             return
 
-        client_order_id = create_client_order_id(
-            "RSISELL_"
-        )
+        client_order_id = create_client_order_id("RSISELL_")
 
         params = {
             "symbol": symbol,
             "side": "SELL",
             "type": "MARKET",
-            "quantity": decimal_to_string(
-                quantity
-            ),
+            "quantity": decimal_to_string(quantity),
             "newOrderRespType": "FULL",
             "newClientOrderId": client_order_id,
         }
@@ -1191,60 +1383,28 @@ def execute_sell(symbol, indicators):
         )
 
         try:
-
             response = signed_request(
                 "POST",
                 "/api/v3/order",
                 params,
             )
-
         except Exception as exc:
-
-            log.error(
-                "SELL request error | %s | %s",
-                symbol,
-                exc,
-            )
-
-            found = get_order_by_client_id(
-                symbol,
-                client_order_id,
-            )
-
+            log.error("SELL request error | %s | %s", symbol, exc)
+            found = get_order_by_client_id(symbol, client_order_id)
             if found:
-
                 response = found
-
                 log.warning(
                     "SELL order found after request error | %s | orderId=%s",
                     symbol,
                     found.get("orderId"),
                 )
-
             else:
-
-                log.error(
-                    "SELL NOT CONFIRMED | %s",
-                    symbol,
-                )
-
+                log.error("SELL NOT CONFIRMED | %s", symbol)
                 return
 
-        status = response.get(
-            "status",
-            "UNKNOWN",
-        )
-
-        order_id = response.get(
-            "orderId"
-        )
-
-        executed_qty = d(
-            response.get(
-                "executedQty",
-                "0",
-            )
-        )
+        status = response.get("status", "UNKNOWN")
+        order_id = response.get("orderId")
+        executed_qty = d(response.get("executedQty", "0"))
 
         log.warning(
             "SELL RESPONSE | %s | status=%s | orderId=%s | executedQty=%s",
@@ -1254,11 +1414,7 @@ def execute_sell(symbol, indicators):
             executed_qty,
         )
 
-        if status in (
-            "FILLED",
-            "PARTIALLY_FILLED",
-        ):
-
+        if status in ("FILLED", "PARTIALLY_FILLED"):
             with state_lock:
                 positions.pop(symbol, None)
 
@@ -1269,7 +1425,6 @@ def execute_sell(symbol, indicators):
             )
 
     except Exception as exc:
-
         log.exception(
             "SELL execution exception | %s | %s",
             symbol,
@@ -1277,7 +1432,6 @@ def execute_sell(symbol, indicators):
         )
 
     finally:
-
         with state_lock:
             selling_symbols.discard(symbol)
 
@@ -1302,7 +1456,7 @@ def update_candle_summary(
 
             candle_summary[key] = {
                 "processed": 0,
-                "rsi3_below_10": 0,
+                "rsi3_below_2": 0,
                 "rsi50_above_52": 0,
                 "buy_signals": 0,
                 "sell_signals": 0,
@@ -1313,7 +1467,7 @@ def update_candle_summary(
         item["processed"] += 1
 
         if indicators["rsi3"] < BUY_RSI3_MAX:
-            item["rsi3_below_10"] += 1
+            item["rsi3_below_2"] += 1
 
         if indicators["rsi50"] > BUY_RSI50_MIN:
             item["rsi50_above_52"] += 1
@@ -1329,11 +1483,11 @@ def update_candle_summary(
 
             log.warning(
                 "CANDLE SUMMARY | candle=%s | processed=%d/%d | "
-                "RSI3<10=%d | RSI50>52=%d | BUY=%d | SELL=%d",
+                "RSI3<2=%d | RSI50>52=%d | BUY=%d | SELL=%d",
                 candle_time,
                 item["processed"],
                 len(symbols),
-                item["rsi3_below_10"],
+                item["rsi3_below_2"],
                 item["rsi50_above_52"],
                 item["buy_signals"],
                 item["sell_signals"],
@@ -1469,7 +1623,7 @@ def process_closed_candle(
 
         log.warning(
             "🔥🔥 BUY CONDITIONS TRUE 🔥🔥 | "
-            "%s | RSI50=%.4f > 52 | RSI3=%.4f < 10",
+            "%s | RSI50=%.4f > 52 | RSI3=%.4f < 2",
             symbol,
             rsi50,
             rsi3,
@@ -1517,6 +1671,119 @@ def process_closed_candle(
 
 
 # ============================================================
+# SOFTWARE STOP-LOSS FALLBACK
+# ============================================================
+
+def process_live_stop_loss(symbol, kline):
+    """Fallback 1% stop if the exchange-side stop could not be placed."""
+
+    with state_lock:
+        position = positions.get(symbol)
+
+    if not position or position.get("stop_order_id"):
+        return
+
+    entry_price = d(position.get("entry_price", "0"))
+    if entry_price <= 0:
+        return
+
+    stop_price = entry_price * (
+        Decimal("1") - STOP_LOSS_PERCENT / Decimal("100")
+    )
+
+    live_low = d(kline.get("l", "0"))
+
+    if live_low > 0 and live_low <= stop_price:
+        log.warning(
+            "🛡️ SOFTWARE 1%% STOP LOSS TRIGGERED | %s | entry=%s | stop=%s | low=%s",
+            symbol,
+            decimal_to_string(entry_price),
+            decimal_to_string(stop_price),
+            decimal_to_string(live_low),
+        )
+
+        indicators = {
+            "previous_rsi3": Decimal("0"),
+            "rsi3": Decimal("0"),
+            "rsi50": Decimal("0"),
+        }
+
+        order_executor.submit(
+            execute_sell,
+            symbol,
+            indicators,
+        )
+
+
+# ============================================================
+# LIVE RSI3 SELL CROSS
+# ============================================================
+
+def process_live_kline(symbol, kline):
+    """Sell immediately when live RSI3 crosses above 80."""
+
+    if not LIVE_RSI_SELL:
+        return
+
+    # If exchange-side protection is unavailable, use a software fallback.
+    process_live_stop_loss(symbol, kline)
+
+    with state_lock:
+        has_position = symbol in positions
+
+    if not has_position or symbol in selling_symbols:
+        return
+
+    open_time = int(kline["t"])
+    live_close = d(kline["c"])
+
+    # One trigger per candle is enough. If the order fails, selling_symbols
+    # is cleared and the next live update can retry while RSI3 remains >80.
+    if live_sell_triggered_candle.get(symbol) == open_time:
+        return
+
+    values = get_live_rsi3(symbol, live_close)
+    if values is None:
+        return
+
+    previous_rsi3, live_rsi3 = values
+
+    if previous_rsi3 <= SELL_RSI3_LEVEL and live_rsi3 > SELL_RSI3_LEVEL:
+
+        live_sell_triggered_candle[symbol] = open_time
+
+        indicators = {
+            "previous_rsi3": previous_rsi3,
+            "rsi3": live_rsi3,
+            "rsi50": Decimal("0"),
+        }
+
+        global last_signal_time, last_sell_signal
+        last_signal_time = time.time()
+        last_sell_signal = {
+            "symbol": symbol,
+            "time": time.time(),
+            "candle_time": open_time,
+            "previous_rsi3": decimal_to_string(previous_rsi3),
+            "rsi3": decimal_to_string(live_rsi3),
+            "live": True,
+        }
+
+        log.warning(
+            "🔥🔥 LIVE RSI3 CROSS ABOVE 80 🔥🔥 | %s | RSI3 %.4f -> %.4f | SELL NOW",
+            symbol,
+            previous_rsi3,
+            live_rsi3,
+        )
+
+        order_executor.submit(
+            execute_sell,
+            symbol,
+            indicators,
+        )
+
+
+# ============================================================
 # WEBSOCKET MESSAGE
 # ============================================================
 
@@ -1552,8 +1819,9 @@ def on_ws_message(group_id, message):
 
         last_ws_message_time[symbol] = time.time()
 
-        # শুধুমাত্র CLOSED candle
+        # Live candle: detect RSI3 crossing above 80 immediately.
         if not kline.get("x", False):
+            process_live_kline(symbol, kline)
             return
 
         candle = {
@@ -1833,11 +2101,11 @@ def run_bot():
     )
 
     log.info(
-        "BUY: RSI50 > 52 AND RSI3 < 10"
+        "BUY: RSI50 > 52 AND RSI3 < 2"
     )
 
     log.info(
-        "SELL: RSI3 crosses above 80"
+        "SELL: LIVE RSI3 crossing above 80"
     )
 
     log.info(
@@ -1995,8 +2263,8 @@ def home():
     return jsonify({
         "status": "online",
         "bot": "BINANCE RSI3 + RSI50",
-        "strategy": "RSI50 > 52 AND RSI3 < 10",
-        "sell": "RSI3 crosses above 80",
+        "strategy": "RSI50 > 52 AND RSI3 < 2",
+        "sell": "LIVE RSI3 crosses above 80",
         "timeframe": TIMEFRAME,
         "symbols": len(symbols),
         "dry_run": DRY_RUN,
@@ -2018,9 +2286,14 @@ def health():
 
     with state_lock:
 
-        position_list = list(
-            positions.keys()
-        )
+        position_list = list(positions.keys())
+        position_details = {}
+        for sym, pos in positions.items():
+            position_details[sym] = {
+                "quantity": decimal_to_string(pos.get("quantity", Decimal("0"))),
+                "entry_price": decimal_to_string(pos.get("entry_price", Decimal("0"))),
+                "stop_order_id": pos.get("stop_order_id"),
+            }
 
     latest_closed = {}
 
@@ -2049,9 +2322,9 @@ def health():
 
         "open_positions": position_list,
 
-        "position_count": len(
-            position_list
-        ),
+        "position_count": len(position_list),
+
+        "position_details": position_details,
 
         "buying": list(
             buying_symbols
@@ -2073,6 +2346,11 @@ def health():
             server_time_offset_ms,
 
         "dry_run": DRY_RUN,
+
+        "buy_rsi3_max": decimal_to_string(BUY_RSI3_MAX),
+        "sell_rsi3_level": decimal_to_string(SELL_RSI3_LEVEL),
+        "stop_loss_percent": decimal_to_string(STOP_LOSS_PERCENT),
+        "live_rsi_sell": LIVE_RSI_SELL,
 
         "debug_mode": DEBUG_MODE,
 
