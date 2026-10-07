@@ -124,8 +124,9 @@ websocket_status = {}
 last_ws_message_time = {}
 last_closed_candle_time = {}
 
-# Prevent duplicate live-cross submissions on the same candle.
+# Prevent duplicate live signal submissions on the same candle.
 live_sell_triggered_candle = {}
+live_buy_triggered_candle = {}
 
 last_signal_time = None
 last_buy_signal = None
@@ -974,36 +975,75 @@ def place_stop_loss(symbol, quantity, entry_price):
         return None, None
 
 
-def get_live_rsi3(symbol, live_close):
-    """Calculate RSI3 using closed candles + current live candle close."""
+def get_live_indicators(symbol, live_close):
+    """
+    Calculate live RSI3 and live RSI50 by adding the current
+    5m candle close to the closed-candle history.
+
+    RSI3 is used for the deep-oversold live BUY trigger and
+    live SELL cross. RSI50 is also calculated from the live
+    candle so BOTH BUY conditions are checked at the moment
+    the live signal occurs.
+    """
 
     with state_lock:
         history = list(candle_history.get(symbol, []))
 
-    if len(history) < RSI_FAST_PERIOD + 2:
+    if len(history) < RSI_SLOW_PERIOD + 2:
         return None
 
     closes = [c["close"] for c in history]
-    previous_values = calculate_rsi_wilder(
+    live_closes = closes + [d(live_close)]
+
+    previous_rsi3_values = calculate_rsi_wilder(
         closes,
         RSI_FAST_PERIOD,
     )
 
-    live_values = calculate_rsi_wilder(
-        closes + [d(live_close)],
+    live_rsi3_values = calculate_rsi_wilder(
+        live_closes,
         RSI_FAST_PERIOD,
     )
 
-    if not previous_values or not live_values:
+    live_rsi50_values = calculate_rsi_wilder(
+        live_closes,
+        RSI_SLOW_PERIOD,
+    )
+
+    if (
+        not previous_rsi3_values
+        or not live_rsi3_values
+        or not live_rsi50_values
+    ):
         return None
 
-    previous_rsi3 = previous_values[-1]
-    live_rsi3 = live_values[-1]
+    previous_rsi3 = previous_rsi3_values[-1]
+    live_rsi3 = live_rsi3_values[-1]
+    live_rsi50 = live_rsi50_values[-1]
 
-    if previous_rsi3 is None or live_rsi3 is None:
+    if (
+        previous_rsi3 is None
+        or live_rsi3 is None
+        or live_rsi50 is None
+    ):
         return None
 
-    return previous_rsi3, live_rsi3
+    return {
+        "previous_rsi3": previous_rsi3,
+        "rsi3": live_rsi3,
+        "rsi50": live_rsi50,
+    }
+
+
+def get_live_rsi3(symbol, live_close):
+    """Backward-compatible helper returning previous RSI3 and live RSI3."""
+
+    values = get_live_indicators(symbol, live_close)
+
+    if values is None:
+        return None
+
+    return values["previous_rsi3"], values["rsi3"]
 
 
 # ============================================================
@@ -1525,6 +1565,14 @@ def process_closed_candle(
 
     last_closed_candle_time[symbol] = candle_time
 
+    # Keep only the current candle's live BUY/SELL locks for this symbol.
+    # The next candle will naturally use a new open_time.
+    if live_buy_triggered_candle.get(symbol) != candle_time:
+        live_buy_triggered_candle.pop(symbol, None)
+
+    if live_sell_triggered_candle.get(symbol) != candle_time:
+        live_sell_triggered_candle.pop(symbol, None)
+
     indicators = get_current_indicators(
         symbol
     )
@@ -1558,6 +1606,7 @@ def process_closed_candle(
 
     buy_signal = (
         (not has_position)
+        and live_buy_triggered_candle.get(symbol) != candle_time
         and rsi50 > BUY_RSI50_MIN
         and rsi3 < BUY_RSI3_MAX
     )
@@ -1716,17 +1765,125 @@ def process_live_stop_loss(symbol, kline):
 
 
 # ============================================================
+# LIVE RSI3 + RSI50 BUY
+# ============================================================
+
+def process_live_buy(symbol, kline):
+    """
+    BUY immediately during the live 5m candle when BOTH conditions
+    become true:
+
+        RSI50 > 52
+        RSI3  < 2
+
+    The values are calculated with the current live candle close.
+    One BUY trigger is allowed per candle to prevent duplicate orders.
+    """
+
+    with state_lock:
+        has_position = symbol in positions
+        is_buying = symbol in buying_symbols
+
+    if has_position or is_buying:
+        return
+
+    open_time = int(kline["t"])
+    live_close = d(kline["c"])
+
+    # Do not submit more than one live BUY for the same 5m candle.
+    if live_buy_triggered_candle.get(symbol) == open_time:
+        return
+
+    values = get_live_indicators(symbol, live_close)
+
+    if values is None:
+        return
+
+    previous_rsi3 = values["previous_rsi3"]
+    live_rsi3 = values["rsi3"]
+    live_rsi50 = values["rsi50"]
+
+    buy_signal = (
+        live_rsi50 > BUY_RSI50_MIN
+        and live_rsi3 < BUY_RSI3_MAX
+    )
+
+    if not buy_signal:
+        return
+
+    # Lock the candle BEFORE submitting the order. This prevents
+    # duplicate BUY submissions from rapid WebSocket updates.
+    live_buy_triggered_candle[symbol] = open_time
+
+    indicators = {
+        "previous_rsi3": previous_rsi3,
+        "rsi3": live_rsi3,
+        "rsi50": live_rsi50,
+        "live": True,
+        "candle_time": open_time,
+    }
+
+    global last_signal_time, last_buy_signal
+
+    last_signal_time = time.time()
+
+    last_buy_signal = {
+        "symbol": symbol,
+        "time": time.time(),
+        "candle_time": open_time,
+        "rsi3": decimal_to_string(live_rsi3),
+        "rsi50": decimal_to_string(live_rsi50),
+        "live": True,
+    }
+
+    log.warning(
+        "🔥🔥 LIVE BUY CONDITIONS TRUE 🔥🔥 | %s | "
+        "RSI50=%.4f > 52 | RSI3=%.4f < 2 | BUY NOW",
+        symbol,
+        live_rsi50,
+        live_rsi3,
+    )
+
+    order_executor.submit(
+        execute_buy,
+        symbol,
+        indicators,
+    )
+
+
+# ============================================================
 # LIVE RSI3 SELL CROSS
 # ============================================================
 
 def process_live_kline(symbol, kline):
-    """Sell immediately when live RSI3 crosses above 80."""
+    """
+    Process every live 5m candle update.
 
-    if not LIVE_RSI_SELL:
-        return
+    Order of checks:
+      1) Software stop-loss fallback
+      2) Live BUY: RSI50 > 52 AND RSI3 < 2
+      3) Live SELL: RSI3 crosses above 80
+
+    BUY and SELL remain independently protected against duplicate
+    submissions on the same candle.
+    """
 
     # If exchange-side protection is unavailable, use a software fallback.
     process_live_stop_loss(symbol, kline)
+
+    # --------------------------------------------------------
+    # LIVE BUY
+    # --------------------------------------------------------
+    # This runs on every live kline update, so a temporary RSI3
+    # dip below 2 cannot be missed just because the candle later
+    # closes above 2.
+    process_live_buy(symbol, kline)
+
+    # --------------------------------------------------------
+    # LIVE SELL
+    # --------------------------------------------------------
+    if not LIVE_RSI_SELL:
+        return
 
     with state_lock:
         has_position = symbol in positions
@@ -1737,16 +1894,20 @@ def process_live_kline(symbol, kline):
     open_time = int(kline["t"])
     live_close = d(kline["c"])
 
-    # One trigger per candle is enough. If the order fails, selling_symbols
-    # is cleared and the next live update can retry while RSI3 remains >80.
+    # One trigger per candle is enough. If the order fails,
+    # selling_symbols is cleared, but this candle remains locked
+    # to avoid duplicate SELL submissions.
     if live_sell_triggered_candle.get(symbol) == open_time:
         return
 
-    values = get_live_rsi3(symbol, live_close)
+    values = get_live_indicators(symbol, live_close)
+
     if values is None:
         return
 
-    previous_rsi3, live_rsi3 = values
+    previous_rsi3 = values["previous_rsi3"]
+    live_rsi3 = values["rsi3"]
+    live_rsi50 = values["rsi50"]
 
     if previous_rsi3 <= SELL_RSI3_LEVEL and live_rsi3 > SELL_RSI3_LEVEL:
 
@@ -1755,7 +1916,9 @@ def process_live_kline(symbol, kline):
         indicators = {
             "previous_rsi3": previous_rsi3,
             "rsi3": live_rsi3,
-            "rsi50": Decimal("0"),
+            "rsi50": live_rsi50,
+            "live": True,
+            "candle_time": open_time,
         }
 
         global last_signal_time, last_sell_signal
@@ -1766,14 +1929,17 @@ def process_live_kline(symbol, kline):
             "candle_time": open_time,
             "previous_rsi3": decimal_to_string(previous_rsi3),
             "rsi3": decimal_to_string(live_rsi3),
+            "rsi50": decimal_to_string(live_rsi50),
             "live": True,
         }
 
         log.warning(
-            "🔥🔥 LIVE RSI3 CROSS ABOVE 80 🔥🔥 | %s | RSI3 %.4f -> %.4f | SELL NOW",
+            "🔥🔥 LIVE RSI3 CROSS ABOVE 80 🔥🔥 | %s | "
+            "RSI3 %.4f -> %.4f | RSI50=%.4f | SELL NOW",
             symbol,
             previous_rsi3,
             live_rsi3,
+            live_rsi50,
         )
 
         order_executor.submit(
@@ -2101,7 +2267,7 @@ def run_bot():
     )
 
     log.info(
-        "BUY: RSI50 > 52 AND RSI3 < 2"
+        "BUY: LIVE RSI50 > 52 AND LIVE RSI3 < 2"
     )
 
     log.info(
@@ -2160,7 +2326,11 @@ def run_bot():
     )
 
     log.info(
-        "Waiting for CLOSED 5m candles..."
+        "LIVE BUY enabled: RSI50 > 52 AND RSI3 < 2 during live 5m candle"
+    )
+
+    log.info(
+        "Closed-candle BUY fallback remains enabled when no live BUY was triggered."
     )
 
     # server time sync প্রতি 30 মিনিটে
@@ -2263,7 +2433,7 @@ def home():
     return jsonify({
         "status": "online",
         "bot": "BINANCE RSI3 + RSI50",
-        "strategy": "RSI50 > 52 AND RSI3 < 2",
+        "strategy": "LIVE RSI50 > 52 AND LIVE RSI3 < 2",
         "sell": "LIVE RSI3 crosses above 80",
         "timeframe": TIMEFRAME,
         "symbols": len(symbols),
@@ -2351,6 +2521,9 @@ def health():
         "sell_rsi3_level": decimal_to_string(SELL_RSI3_LEVEL),
         "stop_loss_percent": decimal_to_string(STOP_LOSS_PERCENT),
         "live_rsi_sell": LIVE_RSI_SELL,
+
+        "live_rsi_buy": True,
+        "live_buy_rsi50_min": decimal_to_string(BUY_RSI50_MIN),
 
         "debug_mode": DEBUG_MODE,
 
