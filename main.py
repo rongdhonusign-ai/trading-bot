@@ -51,13 +51,33 @@ LIVE_RSI_SELL = True
 # RSI50-এর জন্য পর্যাপ্ত history
 HISTORY_CANDLES = 200
 
-STARTUP_KLINE_DELAY = 0.15
-
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 10
 
 REQUEST_TIMEOUT = 15
-MAX_RETRIES = 5
+MAX_RETRIES = 3
+
+# ------------------------------------------------------------
+# Render Free / Binance rate-limit protection
+# ------------------------------------------------------------
+# Keep REST startup data on disk so a normal process restart does
+# not immediately repeat the heaviest public requests.
+CACHE_DIR = os.getenv("BOT_CACHE_DIR", ".bot_cache")
+EXCHANGE_CACHE_FILE = os.path.join(CACHE_DIR, "exchange_info.json")
+SYMBOL_CACHE_FILE = os.path.join(CACHE_DIR, "top_symbols.json")
+HISTORY_CACHE_FILE = os.path.join(CACHE_DIR, "history.json")
+
+# Exchange metadata / TOP-150 do not need to be refreshed on every restart.
+EXCHANGE_CACHE_TTL = 6 * 60 * 60
+SYMBOL_CACHE_TTL = 30 * 60
+HISTORY_CACHE_TTL = 30 * 60
+
+# Minimum cooldowns after Binance tells us to slow down.
+RATE_LIMIT_MIN_COOLDOWN_418 = 300
+RATE_LIMIT_MIN_COOLDOWN_429 = 30
+
+# A little slower than the previous 0.15s startup loop.
+STARTUP_KLINE_DELAY = 0.50
 
 WORKER_THREADS = 4
 
@@ -240,9 +260,58 @@ def decimal_to_string(value):
 # REST REQUEST
 # ============================================================
 
+class BinanceRateLimitError(RuntimeError):
+    def __init__(self, status_code, wait_seconds, path):
+        self.status_code = int(status_code)
+        self.wait_seconds = max(1, int(wait_seconds))
+        self.path = path
+        super().__init__(
+            f"Binance HTTP {self.status_code} rate limit on {path}; "
+            f"cooldown={self.wait_seconds}s"
+        )
+
+
+def ensure_cache_dir():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except Exception as exc:
+        log.warning("Cache directory unavailable: %s", exc)
+
+
+def cache_age(path):
+    try:
+        return max(0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return float("inf")
+
+
+def load_json_cache(path, max_age):
+    if cache_age(path) > max_age:
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        log.warning("Cache read failed | %s | %s", path, exc)
+        return None
+
+
+def save_json_cache(path, data):
+    try:
+        ensure_cache_dir()
+        temp = path + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.replace(temp, path)
+        return True
+    except Exception as exc:
+        log.warning("Cache write failed | %s | %s", path, exc)
+        return False
+
+
 def public_get(path, params=None):
     url = BASE_URL + path
-
     last_error = None
 
     for attempt in range(MAX_RETRIES):
@@ -259,53 +328,56 @@ def public_get(path, params=None):
             if response.status_code in (418, 429):
                 retry_after = response.headers.get("Retry-After")
 
-                if retry_after:
-                    try:
-                        wait = float(retry_after)
-                    except ValueError:
-                        wait = 2.0
+                try:
+                    wait = float(retry_after) if retry_after else 0
+                except (TypeError, ValueError):
+                    wait = 0
+
+                if response.status_code == 418:
+                    wait = max(wait, RATE_LIMIT_MIN_COOLDOWN_418)
                 else:
-                    wait = min(10, 2 ** attempt)
+                    wait = max(wait, RATE_LIMIT_MIN_COOLDOWN_429)
 
-                wait += random.uniform(0.2, 0.8)
+                wait += random.uniform(0.5, 1.5)
 
-                log.warning(
-                    "Binance rate limit %s | waiting %.2fs",
+                log.error(
+                    "Binance HTTP %s | %s | cooldown %.0fs | NO rapid retry",
                     response.status_code,
+                    path,
                     wait,
                 )
 
-                time.sleep(wait)
-                continue
+                # Do not keep hammering the same endpoint inside this call.
+                raise BinanceRateLimitError(
+                    response.status_code,
+                    wait,
+                    path,
+                )
 
             if response.status_code >= 500:
-                wait = min(8, 1.5 ** attempt) + random.uniform(0.2, 0.7)
-
+                wait = min(10, 1.5 ** attempt) + random.uniform(0.2, 0.8)
                 log.warning(
-                    "Binance server error %s | retry %.2fs",
+                    "Binance server error %s | %s | retry %.2fs",
                     response.status_code,
+                    path,
                     wait,
                 )
-
                 time.sleep(wait)
                 continue
 
             response.raise_for_status()
 
+        except BinanceRateLimitError:
+            raise
+
         except Exception as exc:
             last_error = exc
-
-            wait = min(
-                8,
-                1.5 ** attempt
-            ) + random.uniform(0.2, 0.7)
-
+            wait = min(8, 1.5 ** attempt) + random.uniform(0.2, 0.7)
             log.warning(
-                "REST error %s | retry %.2fs",
+                "REST error | %s | retry %.2fs",
                 exc,
                 wait,
             )
-
             time.sleep(wait)
 
     raise RuntimeError(
@@ -357,6 +429,31 @@ def signed_request(method, path, params=None):
     if response.status_code == 200:
         return response.json()
 
+    if response.status_code in (418, 429):
+        retry_after = response.headers.get("Retry-After")
+        try:
+            wait = float(retry_after) if retry_after else 0
+        except (TypeError, ValueError):
+            wait = 0
+
+        if response.status_code == 418:
+            wait = max(wait, RATE_LIMIT_MIN_COOLDOWN_418)
+        else:
+            wait = max(wait, RATE_LIMIT_MIN_COOLDOWN_429)
+
+        wait += random.uniform(0.5, 1.5)
+        log.error(
+            "Binance signed HTTP %s | %s | cooldown %.0fs",
+            response.status_code,
+            path,
+            wait,
+        )
+        raise BinanceRateLimitError(
+            response.status_code,
+            wait,
+            path,
+        )
+
     raise RuntimeError(
         f"Signed request failed: "
         f"{response.status_code} | {response.text}"
@@ -390,36 +487,36 @@ def sync_server_time():
 def load_exchange_info():
     global symbol_info
 
-    log.info("Loading Binance exchange information...")
+    cached = load_json_cache(EXCHANGE_CACHE_FILE, EXCHANGE_CACHE_TTL)
+    if cached and isinstance(cached, dict):
+        symbol_info = cached
+        log.info(
+            "Loaded exchange information from cache | eligible=%d | age=%.0fs",
+            len(symbol_info),
+            cache_age(EXCHANGE_CACHE_FILE),
+        )
+        return
+
+    log.info("Loading Binance exchange information (REST)...")
 
     data = public_get("/api/v3/exchangeInfo")
-
     result = {}
 
-    eligible = 0
-
     for item in data.get("symbols", []):
-
         symbol = item.get("symbol")
         status = item.get("status")
         quote_asset = item.get("quoteAsset")
 
-        if status != "TRADING":
+        if status != "TRADING" or quote_asset != "USDT":
             continue
-
-        if quote_asset != "USDT":
-            continue
-
         if item.get("isSpotTradingAllowed") is False:
             continue
 
         base_asset = item.get("baseAsset")
-
         if base_asset in EXCLUDED_ASSETS:
             continue
 
         filters = {}
-
         for f in item.get("filters", []):
             filters[f.get("filterType")] = f
 
@@ -430,14 +527,10 @@ def load_exchange_info():
             "filters": filters,
         }
 
-        eligible += 1
-
     symbol_info = result
+    save_json_cache(EXCHANGE_CACHE_FILE, result)
 
-    log.info(
-        "Eligible USDT spot symbols: %d",
-        eligible,
-    )
+    log.info("Eligible USDT spot symbols: %d", len(symbol_info))
 
 
 # ============================================================
@@ -447,53 +540,41 @@ def load_exchange_info():
 def select_top_symbols():
     global symbols
 
-    log.info("Loading 24h ticker data...")
+    cached = load_json_cache(SYMBOL_CACHE_FILE, SYMBOL_CACHE_TTL)
+    if cached and isinstance(cached, list):
+        valid = [x for x in cached if x in symbol_info]
+        if len(valid) >= TOP_SYMBOLS:
+            symbols = valid[:TOP_SYMBOLS]
+            log.info(
+                "Loaded TOP-%d symbols from cache | age=%.0fs",
+                len(symbols),
+                cache_age(SYMBOL_CACHE_FILE),
+            )
+            if DEBUG_MODE:
+                log.info("TOP SYMBOLS: %s", ", ".join(symbols))
+            return
 
+    log.info("Loading 24h ticker data (REST)...")
     tickers = public_get("/api/v3/ticker/24hr")
-
     eligible = []
 
     for ticker in tickers:
-
         symbol = ticker.get("symbol")
-
         if symbol not in symbol_info:
             continue
-
         try:
-            quote_volume = d(
-                ticker.get("quoteVolume", "0")
-            )
+            quote_volume = d(ticker.get("quoteVolume", "0"))
         except Exception:
             continue
+        eligible.append((symbol, quote_volume))
 
-        eligible.append(
-            (
-                symbol,
-                quote_volume,
-            )
-        )
+    eligible.sort(key=lambda x: x[1], reverse=True)
+    symbols = [item[0] for item in eligible[:TOP_SYMBOLS]]
+    save_json_cache(SYMBOL_CACHE_FILE, symbols)
 
-    eligible.sort(
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-    symbols = [
-        item[0]
-        for item in eligible[:TOP_SYMBOLS]
-    ]
-
-    log.info(
-        "Selected TOP %d symbols",
-        len(symbols),
-    )
-
+    log.info("Selected TOP %d symbols", len(symbols))
     if DEBUG_MODE:
-        log.info(
-            "TOP SYMBOLS: %s",
-            ", ".join(symbols),
-        )
+        log.info("TOP SYMBOLS: %s", ", ".join(symbols))
 
 
 # ============================================================
@@ -628,19 +709,87 @@ def add_closed_candle(symbol, candle):
 # HISTORICAL DATA
 # ============================================================
 
+def _serialize_history():
+    with state_lock:
+        return {
+            symbol: [
+                {
+                    "open_time": int(c["open_time"]),
+                    "open": decimal_to_string(c["open"]),
+                    "high": decimal_to_string(c["high"]),
+                    "low": decimal_to_string(c["low"]),
+                    "close": decimal_to_string(c["close"]),
+                    "volume": decimal_to_string(c["volume"]),
+                    "close_time": int(c["close_time"]),
+                }
+                for c in history
+            ]
+            for symbol, history in candle_history.items()
+        }
+
+
+def _load_history_cache():
+    cached = load_json_cache(HISTORY_CACHE_FILE, HISTORY_CACHE_TTL)
+    if not isinstance(cached, dict):
+        return 0
+
+    loaded = 0
+    with state_lock:
+        for symbol in symbols:
+            rows = cached.get(symbol)
+            if not isinstance(rows, list) or len(rows) < RSI_SLOW_PERIOD + 2:
+                continue
+            try:
+                history = deque(maxlen=HISTORY_CANDLES)
+                for row in rows:
+                    history.append({
+                        "open_time": int(row["open_time"]),
+                        "open": d(row["open"]),
+                        "high": d(row["high"]),
+                        "low": d(row["low"]),
+                        "close": d(row["close"]),
+                        "volume": d(row["volume"]),
+                        "close_time": int(row["close_time"]),
+                    })
+                candle_history[symbol] = history
+                loaded += 1
+            except Exception:
+                continue
+
+    if loaded:
+        log.info(
+            "Loaded historical candles from cache | %d/%d symbols | age=%.0fs",
+            loaded,
+            len(symbols),
+            cache_age(HISTORY_CACHE_FILE),
+        )
+    return loaded
+
+
 def load_historical_data():
+    loaded_from_cache = _load_history_cache()
+
+    # A fresh cache is enough for a normal Render restart. This avoids
+    # another 150 REST klines burst immediately after a restart.
+    if loaded_from_cache >= len(symbols):
+        log.info("Historical REST loading skipped: cache is fresh and complete.")
+        return
+
     log.info(
-        "Loading initial %d-candle history for %d symbols...",
+        "Loading missing initial history | %d candles | %d symbols...",
         HISTORY_CANDLES,
-        len(symbols),
+        len(symbols) - loaded_from_cache,
     )
 
-    success = 0
+    success = loaded_from_cache
 
     for index, symbol in enumerate(symbols, start=1):
+        with state_lock:
+            already_loaded = len(candle_history.get(symbol, [])) >= RSI_SLOW_PERIOD + 2
+        if already_loaded:
+            continue
 
         try:
-
             data = public_get(
                 "/api/v3/klines",
                 {
@@ -650,17 +799,11 @@ def load_historical_data():
                 },
             )
 
-            history = deque(
-                maxlen=HISTORY_CANDLES
-            )
-
+            history = deque(maxlen=HISTORY_CANDLES)
             now_ms = int(time.time() * 1000)
 
             for item in data:
-
                 candle = candle_to_dict(item)
-
-                # শুধুমাত্র closed candle
                 if candle["close_time"] < now_ms:
                     history.append(candle)
 
@@ -670,16 +813,12 @@ def load_historical_data():
             if len(history) >= RSI_SLOW_PERIOD + 1:
                 success += 1
 
+        except BinanceRateLimitError:
+            raise
         except Exception as exc:
-
-            log.error(
-                "%s | Historical data error: %s",
-                symbol,
-                exc,
-            )
+            log.error("%s | Historical data error: %s", symbol, exc)
 
         if index % 25 == 0 or index == len(symbols):
-
             log.info(
                 "Historical loading progress: %d/%d",
                 index,
@@ -687,6 +826,8 @@ def load_historical_data():
             )
 
         time.sleep(STARTUP_KLINE_DELAY)
+
+    save_json_cache(HISTORY_CACHE_FILE, _serialize_history())
 
     log.info(
         "Historical initialization complete: %d/%d",
@@ -2247,115 +2388,68 @@ def start_websockets():
 # ============================================================
 
 def run_bot():
+    log.info("============================================================")
+    log.info("STARTING BINANCE SPOT RSI3 + RSI50 BOT")
+    log.info("Timeframe: %s", TIMEFRAME)
+    log.info("Top symbols: %d", TOP_SYMBOLS)
+    log.info("BUY: LIVE RSI50 > 52 AND LIVE RSI3 < 2")
+    log.info("SELL: LIVE RSI3 crossing above 80")
+    log.info("BUY amount: %s USDT", BUY_USDT)
+    log.info("History candles: %d", HISTORY_CANDLES)
+    log.info("REST cache: %s", CACHE_DIR)
+    log.info("DEBUG_MODE: %s", DEBUG_MODE)
+    log.info("DRY_RUN: %s", DRY_RUN)
+    log.info("============================================================")
 
-    log.info(
-        "============================================================"
-    )
-
-    log.info(
-        "STARTING BINANCE SPOT RSI3 + RSI50 BOT"
-    )
-
-    log.info(
-        "Timeframe: %s",
-        TIMEFRAME,
-    )
-
-    log.info(
-        "Top symbols: %d",
-        TOP_SYMBOLS,
-    )
-
-    log.info(
-        "BUY: LIVE RSI50 > 52 AND LIVE RSI3 < 2"
-    )
-
-    log.info(
-        "SELL: LIVE RSI3 crossing above 80"
-    )
-
-    log.info(
-        "BUY amount: %s USDT",
-        BUY_USDT,
-    )
-
-    log.info(
-        "History candles: %d",
-        HISTORY_CANDLES,
-    )
-
-    log.info(
-        "DEBUG_MODE: %s",
-        DEBUG_MODE,
-    )
-
-    log.info(
-        "DRY_RUN: %s",
-        DRY_RUN,
-    )
-
-    log.info(
-        "============================================================"
-    )
-
+    # One signed-time sync per real startup. Periodic sync remains below.
     sync_server_time()
 
     load_exchange_info()
-
     select_top_symbols()
 
     if not symbols:
-
-        raise RuntimeError(
-            "No eligible symbols found."
-        )
+        raise RuntimeError("No eligible symbols found.")
 
     if not verify_account():
-
-        raise RuntimeError(
-            "Binance account verification failed."
-        )
+        raise RuntimeError("Binance account verification failed.")
 
     load_historical_data()
 
-    # WebSocket
     start_websockets()
 
-    log.info(
-        "BOT IS RUNNING"
-    )
+    log.info("BOT IS RUNNING")
+    log.info("LIVE BUY: RSI50 > 52 AND RSI3 < 2 during live 5m candle")
+    log.info("LIVE SELL: RSI3 crossing above 80")
+    log.info("1%% exchange-side stop loss enabled")
 
-    log.info(
-        "LIVE BUY enabled: RSI50 > 52 AND RSI3 < 2 during live 5m candle"
-    )
-
-    log.info(
-        "Closed-candle BUY fallback remains enabled when no live BUY was triggered."
-    )
-
-    # server time sync প্রতি 30 মিনিটে
     last_sync = time.time()
+    last_cache_save = time.time()
 
     while True:
-
         time.sleep(10)
 
-        if (
-            time.time() - last_sync
-            > 1800
-        ):
-
+        # Keep the candle cache reasonably fresh so a normal Render restart
+        # does not require another 150-klines startup burst.
+        if time.time() - last_cache_save > 900:
             try:
-
-                sync_server_time()
-
+                save_json_cache(HISTORY_CACHE_FILE, _serialize_history())
+                last_cache_save = time.time()
+                log.info("Historical cache refreshed.")
             except Exception as exc:
+                log.warning("Historical cache refresh failed: %s", exc)
 
-                log.warning(
-                    "Periodic server time sync failed: %s",
-                    exc,
+        if time.time() - last_sync > 1800:
+            try:
+                sync_server_time()
+            except BinanceRateLimitError as exc:
+                # Do not turn a periodic 418 into a restart loop.
+                log.error(
+                    "Periodic time-sync rate limited | cooldown=%ss",
+                    exc.wait_seconds,
                 )
-
+                time.sleep(exc.wait_seconds)
+            except Exception as exc:
+                log.warning("Periodic server time sync failed: %s", exc)
             last_sync = time.time()
 
 
@@ -2364,62 +2458,54 @@ def run_bot():
 # ============================================================
 
 def start_background_bot():
-
     global _bot_thread_started
 
     with _bot_thread_lock:
-
         if _bot_thread_started:
             return
-
         _bot_thread_started = True
 
-    log.info(
-        "STARTING BINANCE BOT BACKGROUND THREAD"
-    )
+    log.info("STARTING BINANCE BOT BACKGROUND THREAD")
 
     def supervisor():
-
-        restart_delay = 5
+        restart_delay = 30
 
         while True:
-
             try:
-
                 run_bot()
+                log.warning("Bot main loop returned unexpectedly.")
+                restart_delay = 30
 
-                # run_bot সাধারণত return করবে না
-                log.warning(
-                    "Bot main loop returned unexpectedly."
+            except BinanceRateLimitError as exc:
+                # Critical difference from the old version: 418/429 does not
+                # cause a 5s -> 10s -> 20s request storm. We honor the server
+                # cooldown once, then make one controlled restart attempt.
+                cooldown = max(exc.wait_seconds, 30)
+                log.error(
+                    "🚫 BINANCE RATE LIMIT | HTTP %s | endpoint=%s | sleeping %ss before next startup",
+                    exc.status_code,
+                    exc.path,
+                    cooldown,
                 )
+                time.sleep(cooldown)
+                restart_delay = 30
+                continue
 
             except Exception as exc:
-
-                log.exception(
-                    "BOT CRASHED: %s",
-                    exc,
-                )
+                log.exception("BOT CRASHED: %s", exc)
 
             log.warning(
                 "Bot restarting in %d seconds...",
                 restart_delay,
             )
-
-            time.sleep(
-                restart_delay
-            )
-
-            restart_delay = min(
-                restart_delay * 2,
-                60,
-            )
+            time.sleep(restart_delay)
+            restart_delay = min(restart_delay * 2, 300)
 
     thread = threading.Thread(
         target=supervisor,
         daemon=True,
         name="BINANCE-BOT",
     )
-
     thread.start()
 
 
@@ -2526,6 +2612,10 @@ def health():
         "live_buy_rsi50_min": decimal_to_string(BUY_RSI50_MIN),
 
         "debug_mode": DEBUG_MODE,
+        "cache_dir": CACHE_DIR,
+        "exchange_cache_age_sec": None if cache_age(EXCHANGE_CACHE_FILE) == float("inf") else round(cache_age(EXCHANGE_CACHE_FILE), 1),
+        "symbol_cache_age_sec": None if cache_age(SYMBOL_CACHE_FILE) == float("inf") else round(cache_age(SYMBOL_CACHE_FILE), 1),
+        "history_cache_age_sec": None if cache_age(HISTORY_CACHE_FILE) == float("inf") else round(cache_age(HISTORY_CACHE_FILE), 1),
 
         "time": time.time(),
     })
