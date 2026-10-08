@@ -6,13 +6,12 @@ import hashlib
 import logging
 import threading
 import random
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from decimal import Decimal, ROUND_DOWN
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import websocket
-
 from flask import Flask, jsonify
 
 
@@ -36,12 +35,17 @@ BUY_USDT = Decimal("15")
 RSI_FAST_PERIOD = 3
 RSI_SLOW_PERIOD = 50
 
+
 # ============================================================
 # BUY SETTINGS
 # ============================================================
 
-BUY_RSI50_MIN = Decimal("52")
-BUY_RSI3_MAX = Decimal("6")
+# RSI50 এখন 50-এর উপরে হলেই trend filter pass
+BUY_RSI50_MIN = Decimal("50")
+
+# RSI3 আগে 10-এর নিচে যেতে হবে
+BUY_RSI3_MAX = Decimal("10")
+
 
 # ============================================================
 # SELL SETTINGS
@@ -49,27 +53,31 @@ BUY_RSI3_MAX = Decimal("6")
 
 SELL_RSI3_LEVEL = Decimal("80")
 
+
 # ============================================================
 # STOP LOSS
 # ============================================================
 
 STOP_LOSS_PERCENT = Decimal("1.00")
 
+
 # ============================================================
 # HISTORY
 # ============================================================
 
-# RSI(50) এর জন্য যথেষ্ট history রাখা হচ্ছে
-HISTORY_CANDLES = 120
+# RSI50 calculation-এর জন্য বেশি history
+HISTORY_CANDLES = 200
 
-# Startup এ Binance-কে একসাথে বেশি request না দিতে
+# Startup rate control
 STARTUP_KLINE_DELAY = 0.20
+
 
 # ============================================================
 # THREADS
 # ============================================================
 
 WORKER_THREADS = 4
+
 
 # ============================================================
 # WEBSOCKET
@@ -81,13 +89,18 @@ WS_PING_TIMEOUT = 10
 WS_RECONNECT_MIN = 3
 WS_RECONNECT_MAX = 30
 
+
 # ============================================================
 # DEBUG
 # ============================================================
 
-DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
+DEBUG_MODE = (
+    os.getenv("DEBUG_MODE", "true").lower() == "true"
+)
 
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+DRY_RUN = (
+    os.getenv("DRY_RUN", "false").lower() == "true"
+)
 
 
 # ============================================================
@@ -142,6 +155,8 @@ bot_live = False
 
 shutdown_event = threading.Event()
 
+last_processed_candle = {}
+
 
 # ============================================================
 # HTTP SESSION HEADERS
@@ -185,7 +200,7 @@ def fmt_decimal(value):
 
 
 # ============================================================
-# BINANCE SERVER TIME
+# SERVER TIME
 # ============================================================
 
 def sync_server_time():
@@ -209,9 +224,13 @@ def sync_server_time():
 
         server_time = int(data["serverTime"])
 
-        local_mid = (local_before + local_after) // 2
+        local_mid = (
+            local_before + local_after
+        ) // 2
 
-        server_time_offset = server_time - local_mid
+        server_time_offset = (
+            server_time - local_mid
+        )
 
         logger.info(
             "Server time offset: %s ms",
@@ -243,6 +262,12 @@ def signed_request(
 
     if params is None:
         params = {}
+
+    if not BINANCE_API_SECRET:
+        logger.error(
+            "BINANCE_API_SECRET missing"
+        )
+        return None
 
     params = dict(params)
 
@@ -299,13 +324,13 @@ def signed_request(
                 )
 
             if response.status_code == 200:
-
                 return response.json()
 
-            # Time sync error
+            # Timestamp error
             if response.status_code == 400:
 
                 try:
+
                     data = response.json()
 
                     if data.get("code") == -1021:
@@ -333,11 +358,14 @@ def signed_request(
                 wait_time = 10
 
                 if retry_after:
+
                     try:
+
                         wait_time = max(
                             5,
                             int(float(retry_after))
                         )
+
                     except Exception:
                         pass
 
@@ -415,11 +443,14 @@ def public_get(
                 wait_time = 10
 
                 if retry_after:
+
                     try:
+
                         wait_time = max(
                             5,
                             int(float(retry_after))
                         )
+
                     except Exception:
                         pass
 
@@ -503,7 +534,9 @@ def load_exchange_info():
 
         for f in item.get("filters", []):
 
-            filter_type = f.get("filterType")
+            filter_type = f.get(
+                "filterType"
+            )
 
             if filter_type:
                 filters[filter_type] = f
@@ -597,24 +630,15 @@ def load_top_symbols():
         if base in STABLE_ASSETS:
             continue
 
-        if base in {
-            "BTC",
-            "ETH"
-        }:
+        if base in {"BTC", "ETH"}:
             continue
 
-        try:
-
-            quote_volume = d(
-                ticker.get(
-                    "quoteVolume",
-                    "0"
-                )
+        quote_volume = d(
+            ticker.get(
+                "quoteVolume",
+                "0"
             )
-
-        except Exception:
-
-            quote_volume = Decimal("0")
+        )
 
         if quote_volume <= 0:
             continue
@@ -690,7 +714,6 @@ def fetch_klines(symbol):
             open_time = int(k[0])
             close_time = int(k[6])
 
-            # শুধু closed candle
             if close_time >= current_time:
                 continue
 
@@ -726,7 +749,7 @@ def fetch_klines(symbol):
 
 
 # ============================================================
-# INITIALIZE ALL SYMBOLS
+# INITIALIZE CANDLES
 # ============================================================
 
 def initialize_candles():
@@ -738,17 +761,21 @@ def initialize_candles():
 
     success = 0
 
-    for index, symbol in enumerate(symbols, 1):
+    for index, symbol in enumerate(
+        symbols,
+        1
+    ):
 
         if shutdown_event.is_set():
             break
 
-        ok = fetch_klines(symbol)
-
-        if ok:
+        if fetch_klines(symbol):
             success += 1
 
-        if index % 10 == 0 or index == len(symbols):
+        if (
+            index % 10 == 0
+            or index == len(symbols)
+        ):
 
             logger.info(
                 "Historical initialization: %d/%d",
@@ -773,28 +800,43 @@ def initialize_candles():
 # WILDER RSI
 # ============================================================
 
-def calculate_rsi_wilder(values, period):
+def calculate_rsi_wilder(
+    values,
+    period
+):
 
     if len(values) < period + 1:
-
         return []
 
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
+    for i in range(
+        1,
+        len(values)
+    ):
 
-        change = values[i] - values[i - 1]
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         if change > 0:
 
             gains.append(change)
-            losses.append(Decimal("0"))
+            losses.append(
+                Decimal("0")
+            )
 
         else:
 
-            gains.append(Decimal("0"))
-            losses.append(abs(change))
+            gains.append(
+                Decimal("0")
+            )
+
+            losses.append(
+                abs(change)
+            )
 
     if len(gains) < period:
         return []
@@ -825,10 +867,14 @@ def calculate_rsi_wilder(values, period):
 
         rs = gain / loss
 
-        return Decimal("100") - (
+        return (
             Decimal("100")
-            / (
-                Decimal("1") + rs
+            - (
+                Decimal("100")
+                / (
+                    Decimal("1")
+                    + rs
+                )
             )
         )
 
@@ -871,7 +917,7 @@ def calculate_rsi_wilder(values, period):
 
 
 # ============================================================
-# INDICATOR CALCULATION
+# INDICATOR
 # ============================================================
 
 def get_rsi_values(symbol):
@@ -914,12 +960,14 @@ def get_rsi_values(symbol):
         "rsi3_current": rsi3[-1],
         "rsi50": rsi50[-1],
         "close": closes[-1],
-        "last_candle_time": data[-1]["close_time"]
+        "last_candle_time": data[-1][
+            "close_time"
+        ]
     }
 
 
 # ============================================================
-# QUANTITY FILTER HELPERS
+# FILTER HELPERS
 # ============================================================
 
 def get_symbol_filter(
@@ -949,8 +997,7 @@ def round_step(
         return quantity
 
     return (
-        quantity
-        / step
+        quantity / step
     ).to_integral_value(
         rounding=ROUND_DOWN
     ) * step
@@ -998,6 +1045,78 @@ def calculate_buy_quantity(
     if qty < min_qty:
         return Decimal("0")
 
+    # Check minimum notional
+    min_notional_filter = (
+        get_symbol_filter(
+            symbol,
+            "MIN_NOTIONAL"
+        )
+    )
+
+    if min_notional_filter:
+
+        min_notional = d(
+            min_notional_filter.get(
+                "minNotional",
+                "0"
+            )
+        )
+
+        if (
+            qty * price
+            < min_notional
+        ):
+
+            logger.warning(
+                "%s BUY skipped: "
+                "notional %s < minimum %s",
+                symbol,
+                fmt_decimal(
+                    qty * price
+                ),
+                fmt_decimal(
+                    min_notional
+                )
+            )
+
+            return Decimal("0")
+
+    # Newer Binance symbols may use NOTIONAL
+    notional_filter = (
+        get_symbol_filter(
+            symbol,
+            "NOTIONAL"
+        )
+    )
+
+    if notional_filter:
+
+        min_notional = d(
+            notional_filter.get(
+                "minNotional",
+                "0"
+            )
+        )
+
+        if (
+            qty * price
+            < min_notional
+        ):
+
+            logger.warning(
+                "%s BUY skipped: "
+                "notional %s < minimum %s",
+                symbol,
+                fmt_decimal(
+                    qty * price
+                ),
+                fmt_decimal(
+                    min_notional
+                )
+            )
+
+            return Decimal("0")
+
     return qty
 
 
@@ -1035,8 +1154,10 @@ def calculate_sell_quantity(
         )
     )
 
-    # সামান্য buffer রাখা
-    qty = available_qty * Decimal("0.999")
+    qty = (
+        available_qty
+        * Decimal("0.999")
+    )
 
     qty = round_step(
         qty,
@@ -1050,12 +1171,15 @@ def calculate_sell_quantity(
 
 
 # ============================================================
-# ACCOUNT INFO
+# ACCOUNT
 # ============================================================
 
 def get_account():
 
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    if (
+        not BINANCE_API_KEY
+        or not BINANCE_API_SECRET
+    ):
         return None
 
     return signed_request(
@@ -1064,9 +1188,7 @@ def get_account():
     )
 
 
-def get_asset_balance(
-    asset
-):
+def get_asset_balance(asset):
 
     account = get_account()
 
@@ -1078,9 +1200,7 @@ def get_asset_balance(
         []
     ):
 
-        if balance.get(
-            "asset"
-        ) == asset:
+        if balance.get("asset") == asset:
 
             return d(
                 balance.get(
@@ -1096,9 +1216,7 @@ def get_asset_balance(
 # MARKET PRICE
 # ============================================================
 
-def get_market_price(
-    symbol
-):
+def get_market_price(symbol):
 
     data = public_get(
         "/api/v3/ticker/price",
@@ -1139,9 +1257,18 @@ def place_buy(
 
     try:
 
-        price = d(
-            signal_data["close"]
-        )
+        # Market order-এর আগে fresh price
+        price = get_market_price(symbol)
+
+        if price <= 0:
+
+            logger.warning(
+                "%s BUY skipped: "
+                "could not get market price",
+                symbol
+            )
+
+            return False
 
         quantity = calculate_buy_quantity(
             symbol,
@@ -1158,9 +1285,11 @@ def place_buy(
             return False
 
         logger.info(
-            "BUY SIGNAL | %s | "
-            "RSI50=%.4f | RSI3 prev=%.4f | "
-            "RSI3 current=%.4f | price=%s | qty=%s",
+            "🔥 BUY SIGNAL | %s | "
+            "RSI50=%.4f | "
+            "RSI3 prev=%.4f | "
+            "RSI3 current=%.4f | "
+            "price=%s | qty=%s",
             symbol,
             signal_data["rsi50"],
             signal_data["rsi3_previous"],
@@ -1168,6 +1297,10 @@ def place_buy(
             fmt_decimal(price),
             fmt_decimal(quantity)
         )
+
+        # ----------------------------------------------------
+        # DRY RUN
+        # ----------------------------------------------------
 
         if DRY_RUN:
 
@@ -1195,6 +1328,10 @@ def place_buy(
                 }
 
             return True
+
+        # ----------------------------------------------------
+        # REAL BUY
+        # ----------------------------------------------------
 
         order = signed_request(
             "POST",
@@ -1237,7 +1374,10 @@ def place_buy(
             )
         )
 
-        if executed_qty > 0 and quote_qty > 0:
+        if (
+            executed_qty > 0
+            and quote_qty > 0
+        ):
 
             entry_price = (
                 quote_qty
@@ -1271,7 +1411,8 @@ def place_buy(
             }
 
         logger.info(
-            "✅ BUY FILLED | %s | qty=%s | entry=%s | SL=%s",
+            "✅ BUY FILLED | %s | "
+            "qty=%s | entry=%s | SL=%s",
             symbol,
             fmt_decimal(executed_qty),
             fmt_decimal(entry_price),
@@ -1293,6 +1434,7 @@ def place_buy(
     finally:
 
         with state_lock:
+
             buying_symbols.discard(
                 symbol
             )
@@ -1333,6 +1475,10 @@ def place_sell(
         if quantity <= 0:
             return False
 
+        # ----------------------------------------------------
+        # DRY RUN
+        # ----------------------------------------------------
+
         if DRY_RUN:
 
             logger.info(
@@ -1342,12 +1488,17 @@ def place_sell(
             )
 
             with state_lock:
+
                 positions.pop(
                     symbol,
                     None
                 )
 
             return True
+
+        # ----------------------------------------------------
+        # REAL SELL
+        # ----------------------------------------------------
 
         info = symbol_filters.get(
             symbol
@@ -1372,7 +1523,8 @@ def place_sell(
         if sell_qty <= 0:
 
             logger.warning(
-                "SELL skipped %s: no valid balance",
+                "SELL skipped %s: "
+                "no valid balance",
                 symbol
             )
 
@@ -1406,7 +1558,8 @@ def place_sell(
             return False
 
         logger.info(
-            "✅ SELL FILLED | %s | reason=%s | qty=%s",
+            "✅ SELL FILLED | %s | "
+            "reason=%s | qty=%s",
             symbol,
             reason,
             fmt_decimal(sell_qty)
@@ -1434,13 +1587,14 @@ def place_sell(
     finally:
 
         with state_lock:
+
             selling_symbols.discard(
                 symbol
             )
 
 
 # ============================================================
-# STOP LOSS CHECK
+# STOP LOSS
 # ============================================================
 
 def check_stop_loss(
@@ -1488,12 +1642,7 @@ def check_stop_loss(
 # RSI SIGNAL PROCESSING
 # ============================================================
 
-last_processed_candle = {}
-
-
-def process_symbol(
-    symbol
-):
+def process_symbol(symbol):
 
     indicator = get_rsi_values(
         symbol
@@ -1518,7 +1667,10 @@ def process_symbol(
         "last_candle_time"
     ]
 
-    # একই closed candle বারবার process না করা
+    # --------------------------------------------------------
+    # One processing per closed candle
+    # --------------------------------------------------------
+
     with state_lock:
 
         previous_processed = (
@@ -1546,7 +1698,7 @@ def process_symbol(
 
     if has_position:
 
-        # RSI3 <= 80 থেকে > 80 cross
+        # RSI3 <= 80 থেকে >80 cross
         sell_cross = (
             rsi3_previous <= SELL_RSI3_LEVEL
             and
@@ -1557,7 +1709,8 @@ def process_symbol(
 
             logger.info(
                 "🔥 SELL CROSS | %s | "
-                "RSI3 %.4f -> %.4f | crossed above 80",
+                "RSI3 %.4f -> %.4f | "
+                "crossed above 80",
                 symbol,
                 rsi3_previous,
                 rsi3_current
@@ -1575,19 +1728,14 @@ def process_symbol(
     # BUY
     # ========================================================
 
-    # RSI3 আগে 6-এর নিচে ছিল
-    was_deep_oversold = (
+    # RSI3 আগের candle-এ 10-এর নিচে ছিল
+    was_oversold = (
         rsi3_previous < BUY_RSI3_MAX
     )
 
-    # বর্তমান RSI3 আগের চেয়ে উপরে উঠছে
+    # RSI3 এখন আগের চেয়ে উপরে উঠছে
     rsi_turning_up = (
         rsi3_current > rsi3_previous
-    )
-
-    # এখনও 6-এর নিচে
-    still_deep_oversold = (
-        rsi3_current < BUY_RSI3_MAX
     )
 
     # RSI50 trend filter
@@ -1595,23 +1743,31 @@ def process_symbol(
         rsi50 > BUY_RSI50_MIN
     )
 
+    # --------------------------------------------------------
+    # NEW BUY RULE
+    #
+    # RSI50 > 50
+    # AND previous RSI3 < 10
+    # AND current RSI3 > previous RSI3
+    #
+    # Current RSI3 10-এর নিচে থাকা বাধ্যতামূলক নয়।
+    # --------------------------------------------------------
+
     buy_signal = (
         trend_ok
         and
-        was_deep_oversold
+        was_oversold
         and
         rsi_turning_up
-        and
-        still_deep_oversold
     )
 
     if buy_signal:
 
         logger.info(
             "🔥🔥 BUY CONDITIONS TRUE 🔥🔥 | %s | "
-            "RSI50=%.4f > 52 | "
+            "RSI50=%.4f > 50 | "
             "RSI3 %.4f -> %.4f | "
-            "deep oversold + upward turn",
+            "oversold recovery",
             symbol,
             rsi50,
             rsi3_previous,
@@ -1626,9 +1782,9 @@ def process_symbol(
 
     elif DEBUG_MODE:
 
-        # কাছাকাছি signal হলে log করা
+        # Near signal
         near_signal = (
-            rsi50 > Decimal("48")
+            rsi50 > Decimal("45")
             and
             rsi3_current < Decimal("20")
         )
@@ -1693,7 +1849,7 @@ def update_candle(
         )
 
         # ====================================================
-        # LIVE PRICE / STOP LOSS
+        # LIVE STOP LOSS
         # ====================================================
 
         check_stop_loss(
@@ -1702,7 +1858,7 @@ def update_candle(
         )
 
         # ====================================================
-        # CLOSED CANDLE
+        # ONLY CLOSED CANDLE FOR RSI
         # ====================================================
 
         if not is_closed:
@@ -1732,18 +1888,23 @@ def update_candle(
 
                 candles[symbol] = history
 
-            # duplicate candle protection
             if history:
 
-                if history[-1][
-                    "open_time"
-                ] == open_time:
+                if (
+                    history[-1][
+                        "open_time"
+                    ]
+                    == open_time
+                ):
 
                     history[-1] = candle
 
-                elif open_time > history[-1][
-                    "open_time"
-                ]:
+                elif (
+                    open_time
+                    > history[-1][
+                        "open_time"
+                    ]
+                ):
 
                     history.append(
                         candle
@@ -1755,10 +1916,7 @@ def update_candle(
                     candle
                 )
 
-        # ====================================================
-        # PROCESS ONLY CLOSED CANDLE
-        # ====================================================
-
+        # Process closed candle
         process_symbol(
             symbol
         )
@@ -1805,11 +1963,7 @@ def make_ws_callbacks(
                 data
             )
 
-            stream_type = payload.get(
-                "e"
-            )
-
-            if stream_type != "kline":
+            if payload.get("e") != "kline":
                 return
 
             symbol = payload.get(
@@ -1831,7 +1985,8 @@ def make_ws_callbacks(
         except Exception as e:
 
             logger.warning(
-                "WebSocket message error group %d: %s",
+                "WebSocket message error "
+                "group %d: %s",
                 group_number,
                 e
             )
@@ -1854,7 +2009,8 @@ def make_ws_callbacks(
     ):
 
         logger.warning(
-            "WebSocket group %d closed | code=%s | msg=%s",
+            "WebSocket group %d closed | "
+            "code=%s | msg=%s",
             group_number,
             close_status_code,
             close_msg
@@ -1897,8 +2053,6 @@ def websocket_group_loop(
             group_number
         )
 
-        ws = None
-
         try:
 
             ws = websocket.WebSocketApp(
@@ -1938,7 +2092,8 @@ def websocket_group_loop(
         )
 
         logger.info(
-            "WebSocket group %d reconnecting in %.1fs",
+            "WebSocket group %d reconnecting "
+            "in %.1fs",
             group_number,
             wait_time
         )
@@ -2009,15 +2164,19 @@ def start_websockets():
 
 
 # ============================================================
-# ACCOUNT CONNECTION CHECK
+# ACCOUNT CONNECTION
 # ============================================================
 
 def check_account_connection():
 
-    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    if (
+        not BINANCE_API_KEY
+        or not BINANCE_API_SECRET
+    ):
 
         logger.error(
-            "BINANCE_API_KEY / BINANCE_API_SECRET missing"
+            "BINANCE_API_KEY / "
+            "BINANCE_API_SECRET missing"
         )
 
         return False
@@ -2040,19 +2199,10 @@ def check_account_connection():
 
 
 # ============================================================
-# BASIC POSITION RECOVERY
+# POSITION RECOVERY
 # ============================================================
 
 def recover_positions():
-
-    """
-    Restart-এর পরে selected symbols-এর existing balance
-    detect করার চেষ্টা করে।
-
-    Binance account API cost basis দেয় না, তাই existing
-    balance পাওয়া গেলে current market price-কে recovery
-    reference price হিসেবে ব্যবহার করা হচ্ছে।
-    """
 
     if DRY_RUN:
         return
@@ -2103,9 +2253,6 @@ def recover_positions():
         if symbol not in selected_set:
             continue
 
-        # Existing selected symbol balance
-        # কিন্তু BTC/ETH/stablecoins selected list-এ নেই
-
         price = get_market_price(
             symbol
         )
@@ -2136,8 +2283,8 @@ def recover_positions():
         recovered += 1
 
         logger.warning(
-            "RECOVERED POSITION | %s | qty=%s | "
-            "reference price=%s | SL=%s",
+            "RECOVERED POSITION | %s | "
+            "qty=%s | reference price=%s | SL=%s",
             symbol,
             fmt_decimal(total),
             fmt_decimal(price),
@@ -2195,17 +2342,15 @@ def start_bot():
     )
 
     logger.info(
-        "BUY: RSI50 > %s AND "
+        "BUY RULE: RSI50 > %s AND "
         "previous RSI3 < %s AND "
-        "current RSI3 > previous RSI3 AND "
-        "current RSI3 < %s",
+        "current RSI3 > previous RSI3",
         BUY_RSI50_MIN,
-        BUY_RSI3_MAX,
         BUY_RSI3_MAX
     )
 
     logger.info(
-        "SELL: RSI3 crosses above %s",
+        "SELL RULE: RSI3 crosses above %s",
         SELL_RSI3_LEVEL
     )
 
@@ -2226,7 +2371,7 @@ def start_bot():
     try:
 
         # ----------------------------------------------------
-        # SERVER TIME
+        # TIME
         # ----------------------------------------------------
 
         sync_server_time()
@@ -2274,7 +2419,7 @@ def start_bot():
         time.sleep(1)
 
         # ----------------------------------------------------
-        # POSITION RECOVERY
+        # RECOVERY
         # ----------------------------------------------------
 
         recover_positions()
@@ -2288,7 +2433,8 @@ def start_bot():
         if not initialize_candles():
 
             logger.error(
-                "BOT STOPPED: historical candle initialization failed"
+                "BOT STOPPED: historical candle "
+                "initialization failed"
             )
 
             return
@@ -2341,25 +2487,37 @@ def home():
     with state_lock:
 
         return jsonify({
+
             "status": "running",
+
             "bot_live": bot_live,
+
             "symbols": len(symbols),
+
             "positions": len(positions),
+
             "timeframe": TIMEFRAME,
+
             "buy_usdt": fmt_decimal(
                 BUY_USDT
             ),
-            "buy_rsi50": f"> {BUY_RSI50_MIN}",
-            "buy_rsi3": (
-                f"< {BUY_RSI3_MAX} "
-                "and upward turn"
+
+            "buy_rule": (
+                f"RSI50 > {BUY_RSI50_MIN} "
+                f"+ previous RSI3 < "
+                f"{BUY_RSI3_MAX} "
+                f"+ RSI3 turning upward"
             ),
-            "sell_rsi3": (
-                f"cross above {SELL_RSI3_LEVEL}"
+
+            "sell_rule": (
+                f"RSI3 cross above "
+                f"{SELL_RSI3_LEVEL}"
             ),
+
             "stop_loss": (
                 f"{STOP_LOSS_PERCENT}%"
             ),
+
             "dry_run": DRY_RUN
         })
 
@@ -2370,13 +2528,19 @@ def health():
     with state_lock:
 
         return jsonify({
+
             "ok": True,
+
             "bot_live": bot_live,
+
             "symbols": len(symbols),
+
             "positions": len(positions),
+
             "websocket_groups": len(
                 ws_threads
             ),
+
             "timestamp": int(
                 time.time()
             )
@@ -2393,18 +2557,21 @@ def get_positions():
         for symbol, position in positions.items():
 
             data[symbol] = {
+
                 "quantity": fmt_decimal(
                     position.get(
                         "quantity",
                         "0"
                     )
                 ),
+
                 "entry_price": fmt_decimal(
                     position.get(
                         "entry_price",
                         "0"
                     )
                 ),
+
                 "stop_price": fmt_decimal(
                     position.get(
                         "stop_price",
@@ -2417,7 +2584,7 @@ def get_positions():
 
 
 # ============================================================
-# GUNICORN START
+# GUNICORN / RENDER START
 # ============================================================
 
 def start_bot_background():
@@ -2430,9 +2597,6 @@ def start_bot_background():
 
     thread.start()
 
-
-# Gunicorn একাধিক worker ব্যবহার না করার জন্য
-# Render start command অবশ্যই 1 worker রাখবেন.
 
 if __name__ == "__main__":
 
@@ -2450,5 +2614,5 @@ if __name__ == "__main__":
 
 else:
 
-    # Gunicorn import হলে bot background-এ start হবে
+    # Gunicorn import হলে background bot start
     start_bot_background()
