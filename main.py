@@ -37,11 +37,14 @@ BUY_USDT = Decimal("15")
 RSI_FAST_PERIOD = 3
 RSI_SLOW_PERIOD = 50
 
+# BUY RULE
 BUY_RSI50_MIN = Decimal("52")
-BUY_RSI3_MAX = Decimal("2")
+BUY_RSI3_MAX = Decimal("6")
 
+# SELL RULE
 SELL_RSI3_LEVEL = Decimal("80")
 
+# STOP LOSS
 STOP_LOSS_PERCENT = Decimal("1")
 
 # Live BUY / SELL
@@ -152,6 +155,7 @@ STABLE_BASE_ASSETS = {
     "NOK",
     "SEK",
 }
+
 
 # ============================================================
 # LOGGING
@@ -1109,14 +1113,15 @@ def load_historical_data():
         )
 
         if not valid:
+
             missing.append(symbol)
             continue
 
-        # Remove any candle that is still open
         while candles and (
             candles[-1]["close_time"]
             >= now_ms
         ):
+
             candles.pop()
 
     if missing:
@@ -1149,7 +1154,6 @@ def load_historical_data():
                 for candle in candles:
 
                     if candle["close_time"] < current_ms:
-
                         closed.append(candle)
 
                 history[symbol] = deque(
@@ -1184,7 +1188,6 @@ def load_historical_data():
                     e
                 )
 
-    # Ensure all selected symbols have deque
     for symbol in symbols:
 
         if symbol not in history:
@@ -1507,11 +1510,13 @@ def get_order(
     }
 
     if order_id is not None:
+
         params["orderId"] = int(
             order_id
         )
 
     if orig_client_order_id:
+
         params[
             "origClientOrderId"
         ] = orig_client_order_id
@@ -1534,11 +1539,13 @@ def cancel_order(
     }
 
     if order_id is not None:
+
         params["orderId"] = int(
             order_id
         )
 
     if orig_client_order_id:
+
         params[
             "origClientOrderId"
         ] = orig_client_order_id
@@ -1586,6 +1593,7 @@ def market_sell(
     )
 
     if qty <= 0:
+
         raise Exception(
             f"{symbol}: sell quantity below minimum"
         )
@@ -1625,6 +1633,7 @@ def place_stop_loss(
     )
 
     if qty <= 0:
+
         raise Exception(
             f"{symbol}: stop quantity below minimum"
         )
@@ -1723,6 +1732,7 @@ def extract_avg_price(order):
         )
 
     if total_qty > 0:
+
         return (
             total_quote /
             total_qty
@@ -1900,7 +1910,6 @@ def execute_buy(
             ),
         }
 
-        # Save position immediately after BUY
         with position_lock:
 
             positions[symbol] = position
@@ -1921,7 +1930,6 @@ def execute_buy(
             )
         )
 
-        # Place exchange-side stop
         try:
 
             stop_order = place_stop_loss(
@@ -1961,8 +1969,6 @@ def execute_buy(
                 e
             )
 
-            # Software fallback remains active
-
         return True
 
     except BinanceRateLimitError:
@@ -1981,6 +1987,7 @@ def execute_buy(
     finally:
 
         with position_lock:
+
             buying_symbols.discard(
                 symbol
             )
@@ -2021,7 +2028,6 @@ def execute_sell(
             "stop_order_id"
         )
 
-        # Cancel exchange stop first
         if (
             not DRY_RUN
             and stop_order_id
@@ -2048,7 +2054,6 @@ def execute_sell(
                     e
                 )
 
-                # Check whether stop already filled
                 try:
 
                     status = get_order(
@@ -2066,6 +2071,7 @@ def execute_sell(
                         )
 
                         with position_lock:
+
                             positions.pop(
                                 symbol,
                                 None
@@ -2101,7 +2107,6 @@ def execute_sell(
 
             return True
 
-        # Get current free balance
         balances = get_free_balances()
 
         base_asset = position.get(
@@ -2124,7 +2129,6 @@ def execute_sell(
             )
         )
 
-        # Small safety buffer
         sell_qty = floor_quantity(
             symbol,
             free_qty
@@ -2195,6 +2199,7 @@ def execute_sell(
     finally:
 
         with position_lock:
+
             selling_symbols.discard(
                 symbol
             )
@@ -2228,8 +2233,6 @@ def process_live_stop_loss(
             )
         )
 
-    # If exchange stop exists, Binance should handle it.
-    # Software fallback is only used if no exchange stop exists.
     if stop_order_id:
         return False
 
@@ -2385,11 +2388,21 @@ def process_closed_candle(
             RSI_FAST_PERIOD
         )
 
+    # ========================================================
+    # BUY RULE
+    # RSI50 > 52 AND RSI3 < 6
+    # ========================================================
+
     buy_signal = (
         rsi50 > BUY_RSI50_MIN
         and
         rsi3 < BUY_RSI3_MAX
     )
+
+    # ========================================================
+    # SELL RULE
+    # RSI3 crosses ABOVE 80
+    # ========================================================
 
     sell_signal = (
         previous_rsi3 is not None
@@ -2461,7 +2474,6 @@ def process_live_buy(
         "open_time"
     ]
 
-    # Only one BUY trigger per candle
     with state_lock:
 
         if (
@@ -2483,6 +2495,11 @@ def process_live_buy(
 
     rsi3 = indicators["rsi3"]
     rsi50 = indicators["rsi50"]
+
+    # ========================================================
+    # LIVE BUY RULE
+    # RSI50 > 52 AND RSI3 < 6
+    # ========================================================
 
     buy_signal = (
         rsi50 > BUY_RSI50_MIN
@@ -2570,7 +2587,6 @@ def process_live_sell(
         "rsi3"
     ]
 
-    # Current live RSI state
     with state_lock:
 
         state = live_rsi_state.get(
@@ -2584,8 +2600,6 @@ def process_live_sell(
             ) != candle_open_time
         ):
 
-            # First tick of this candle:
-            # use previous closed RSI as baseline
             candles = history.get(
                 symbol
             )
@@ -2623,7 +2637,6 @@ def process_live_sell(
                 "last_rsi3"
             )
 
-    # Detect actual live cross
     cross_up = (
         previous_live_rsi3 is not None
         and
@@ -2632,7 +2645,6 @@ def process_live_sell(
         current_rsi3 > SELL_RSI3_LEVEL
     )
 
-    # Update current live RSI
     with state_lock:
 
         live_rsi_state[
@@ -2703,7 +2715,6 @@ def process_live_kline(
             candle,
             history
         ):
-
             return
 
     # Live SELL
@@ -2810,7 +2821,6 @@ def append_closed_candle(
             symbol
         ]
 
-        # Avoid duplicate candle
         if candles:
 
             last_open = candles[-1][
@@ -3036,8 +3046,6 @@ def websocket_group_worker(
                 skip_utf8_validation=True,
             )
 
-            # If connection was successful and closed normally,
-            # reset reconnect delay.
             if not stop_event.is_set():
 
                 reconnect_delay = (
@@ -3057,9 +3065,11 @@ def websocket_group_worker(
             with state_lock:
 
                 try:
+
                     websocket_apps.remove(
                         ws_app
                     )
+
                 except ValueError:
                     pass
 
@@ -3101,7 +3111,6 @@ def close_all_websockets():
     for ws in apps:
 
         try:
-
             ws.close()
 
         except Exception:
@@ -3168,8 +3177,6 @@ def candle_summary(
 
             if has_position:
 
-                # Summary sell count is only an informational
-                # closed-candle cross count.
                 candles = history.get(
                     symbol
                 )
@@ -3193,6 +3200,7 @@ def candle_summary(
                         and
                         rsi3 > SELL_RSI3_LEVEL
                     ):
+
                         sell_count += 1
 
         logger.warning(
@@ -3240,7 +3248,6 @@ def reconcile_recovered_positions():
         )
 
     if not recovered_symbols:
-
         return
 
     try:
@@ -3409,7 +3416,6 @@ def run_bot():
 
     history = load_historical_data()
 
-    # Recover positions saved before restart
     load_positions()
 
     reconcile_recovered_positions()
@@ -3622,7 +3628,6 @@ def start_background_bot():
     with _bot_start_lock:
 
         if _bot_thread_started:
-
             return
 
         if stop_event.is_set():
@@ -3662,21 +3667,15 @@ def handle_shutdown_signal(
         signum
     )
 
-    # Do not immediately kill internal state.
-    # Save what we can and close websocket connections.
     stop_event.set()
 
     try:
-
         save_positions()
-
     except Exception:
         pass
 
     try:
-
         close_all_websockets()
-
     except Exception:
         pass
 
@@ -3727,25 +3726,44 @@ def home():
         )
 
     return jsonify({
+
         "status": "online",
-        "bot": "RSI3-RSI50-BINANCE-SPOT",
-        "timeframe": TIMEFRAME,
-        "symbols": len(symbols),
-        "positions": active_positions,
-        "buy_rule": (
-            f"RSI50 > {BUY_RSI50_MIN} "
-            f"AND RSI3 < {BUY_RSI3_MAX}"
-        ),
-        "sell_rule": (
-            f"RSI3 crosses above "
-            f"{SELL_RSI3_LEVEL}"
-        ),
-        "stop_loss": (
-            f"{STOP_LOSS_PERCENT}%"
-        ),
-        "live_buy": LIVE_RSI_BUY,
-        "live_sell": LIVE_RSI_SELL,
-        "dry_run": DRY_RUN,
+
+        "bot":
+            "RSI3-RSI50-BINANCE-SPOT",
+
+        "timeframe":
+            TIMEFRAME,
+
+        "symbols":
+            len(symbols),
+
+        "positions":
+            active_positions,
+
+        "buy_rule":
+            (
+                f"RSI50 > {BUY_RSI50_MIN} "
+                f"AND RSI3 < {BUY_RSI3_MAX}"
+            ),
+
+        "sell_rule":
+            (
+                f"RSI3 crosses above "
+                f"{SELL_RSI3_LEVEL}"
+            ),
+
+        "stop_loss":
+            f"{STOP_LOSS_PERCENT}%",
+
+        "live_buy":
+            LIVE_RSI_BUY,
+
+        "live_sell":
+            LIVE_RSI_SELL,
+
+        "dry_run":
+            DRY_RUN,
     })
 
 
@@ -3759,23 +3777,34 @@ def health():
         )
 
     return jsonify({
-        "status": "ok",
+
+        "status":
+            "ok",
+
         "bot_thread_started":
             _bot_thread_started,
+
         "stop_requested":
             stop_event.is_set(),
+
         "symbols":
             len(symbols),
+
         "positions":
             len(active_positions),
+
         "position_symbols":
             active_positions,
+
         "websocket_status":
             websocket_status,
+
         "last_ws_message_time":
             last_ws_message_time,
+
         "server_time_offset_ms":
             server_time_offset_ms,
+
         "rate_limit_active":
             time.time() < rate_limit_until,
     })
@@ -3791,20 +3820,25 @@ def positions_route():
         for symbol, p in positions.items():
 
             output[symbol] = {
+
                 "quantity":
                     decimal_to_string(
                         p.get("quantity")
                     ),
+
                 "entry_price":
                     decimal_to_string(
                         p.get("entry_price")
                     ),
+
                 "stop_price":
                     decimal_to_string(
                         p.get("stop_price")
                     ),
+
                 "stop_order_id":
                     p.get("stop_order_id"),
+
                 "entry_time":
                     p.get("entry_time"),
             }
