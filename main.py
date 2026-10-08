@@ -2477,28 +2477,41 @@ def start_background_bot():
                 restart_delay = 30
 
             except BinanceRateLimitError as exc:
-                # Critical difference from the old version: 418/429 does not
-                # cause a 5s -> 10s -> 20s request storm. We honor the server
-                # cooldown once, then make one controlled restart attempt.
-                cooldown = max(exc.wait_seconds, 30)
+                # 418/429 never causes a rapid restart loop.
+                # Only this daemon thread sleeps; Flask/Gunicorn stays alive.
+                cooldown = max(exc.wait_seconds, 60)
+
                 log.error(
-                    "🚫 BINANCE RATE LIMIT | HTTP %s | endpoint=%s | sleeping %ss before next startup",
+                    "🚫 BINANCE RATE LIMIT | HTTP %s | endpoint=%s | "
+                    "sleeping %ss in background; Flask stays ONLINE",
                     exc.status_code,
                     exc.path,
                     cooldown,
                 )
-                time.sleep(cooldown)
+
+                try:
+                    time.sleep(cooldown)
+                except Exception:
+                    pass
+
                 restart_delay = 30
                 continue
 
             except Exception as exc:
+                # Keep every bot exception inside the daemon supervisor.
+                # It must never terminate Gunicorn/Flask.
                 log.exception("BOT CRASHED: %s", exc)
 
             log.warning(
                 "Bot restarting in %d seconds...",
                 restart_delay,
             )
-            time.sleep(restart_delay)
+
+            try:
+                time.sleep(restart_delay)
+            except Exception:
+                pass
+
             restart_delay = min(restart_delay * 2, 300)
 
     thread = threading.Thread(
@@ -2518,6 +2531,7 @@ def home():
 
     return jsonify({
         "status": "online",
+        "web_server": "ONLINE",
         "bot": "BINANCE RSI3 + RSI50",
         "strategy": "LIVE RSI50 > 52 AND LIVE RSI3 < 2",
         "sell": "LIVE RSI3 crosses above 80",
@@ -2567,6 +2581,7 @@ def health():
         "status": "ok",
 
         "bot_started": _bot_thread_started,
+        "web_server": "ONLINE",
 
         "timeframe": TIMEFRAME,
 
@@ -2622,16 +2637,26 @@ def health():
 
 
 # ============================================================
-# IMPORTANT FOR GUNICORN
+# IMPORTANT FOR GUNICORN / RENDER
+# ============================================================
+#
+# Do NOT contact Binance while Gunicorn is importing this module.
+# Render must first see a healthy HTTP listener on PORT.
+#
+# The first HTTP request (normally Render health check / root request)
+# starts the Binance bot in a separate daemon thread. If Binance returns
+# HTTP 418/429, only that background bot thread sleeps; Flask/Gunicorn
+# remains alive and continues serving / and /health.
 # ============================================================
 
 log.info(
-    "GUNICORN IMPORT DETECTED"
+    "GUNICORN IMPORT DETECTED | Flask app ready | Binance bot not started yet"
 )
 
-ensure_bot_started = start_background_bot
 
-ensure_bot_started()
+@app.before_request
+def _start_bot_after_web_server_is_ready():
+    start_background_bot()
 
 
 # ============================================================
