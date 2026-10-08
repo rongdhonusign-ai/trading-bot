@@ -6,12 +6,14 @@ import hashlib
 import logging
 import threading
 import random
+import signal
 from decimal import Decimal, ROUND_DOWN
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import websocket
+
 from flask import Flask, jsonify
 
 
@@ -40,10 +42,7 @@ RSI_SLOW_PERIOD = 50
 # BUY SETTINGS
 # ============================================================
 
-# RSI50 এখন 50-এর উপরে হলেই trend filter pass
 BUY_RSI50_MIN = Decimal("50")
-
-# RSI3 আগে 10-এর নিচে যেতে হবে
 BUY_RSI3_MAX = Decimal("10")
 
 
@@ -65,10 +64,8 @@ STOP_LOSS_PERCENT = Decimal("1.00")
 # HISTORY
 # ============================================================
 
-# RSI50 calculation-এর জন্য বেশি history
 HISTORY_CANDLES = 200
 
-# Startup rate control
 STARTUP_KLINE_DELAY = 0.20
 
 
@@ -88,6 +85,18 @@ WS_PING_TIMEOUT = 10
 
 WS_RECONNECT_MIN = 3
 WS_RECONNECT_MAX = 30
+
+
+# ============================================================
+# WATCHDOG
+# ============================================================
+
+WATCHDOG_INTERVAL = 15
+
+STARTUP_RETRY_MIN = 10
+STARTUP_RETRY_MAX = 60
+
+TIME_SYNC_INTERVAL = 30 * 60
 
 
 # ============================================================
@@ -142,6 +151,9 @@ positions = {}
 buying_symbols = set()
 selling_symbols = set()
 
+# USDT that has already been reserved for pending BUY orders
+reserved_usdt = Decimal("0")
+
 state_lock = threading.RLock()
 
 executor = ThreadPoolExecutor(
@@ -150,6 +162,15 @@ executor = ThreadPoolExecutor(
 
 ws_threads = []
 
+# group_number -> thread
+ws_thread_map = {}
+
+# group_number -> last successful message time
+ws_last_message = {}
+
+# group_number -> websocket object
+ws_objects = {}
+
 bot_started = False
 bot_live = False
 
@@ -157,12 +178,19 @@ shutdown_event = threading.Event()
 
 last_processed_candle = {}
 
+last_time_sync = 0
+
+startup_lock = threading.Lock()
+
+watchdog_thread = None
+
 
 # ============================================================
 # HTTP SESSION HEADERS
 # ============================================================
 
 if BINANCE_API_KEY:
+
     session.headers.update({
         "X-MBX-APIKEY": BINANCE_API_KEY
     })
@@ -173,30 +201,56 @@ if BINANCE_API_KEY:
 # ============================================================
 
 def d(value):
+
     try:
         return Decimal(str(value))
+
     except Exception:
+
         return Decimal("0")
 
 
 def now_ms():
+
     return int(time.time() * 1000)
 
 
 def binance_time_ms():
+
     return int(time.time() * 1000) + server_time_offset
 
 
 def fmt_decimal(value):
+
     if not isinstance(value, Decimal):
+
         value = d(value)
 
     text = format(value, "f")
 
     if "." in text:
+
         text = text.rstrip("0").rstrip(".")
 
     return text or "0"
+
+
+# ============================================================
+# SAFE SLEEP
+# ============================================================
+
+def safe_sleep(seconds):
+
+    end_time = time.time() + seconds
+
+    while (
+        time.time() < end_time
+        and not shutdown_event.is_set()
+    ):
+
+        time.sleep(
+            min(1, end_time - time.time())
+        )
 
 
 # ============================================================
@@ -206,6 +260,7 @@ def fmt_decimal(value):
 def sync_server_time():
 
     global server_time_offset
+    global last_time_sync
 
     try:
 
@@ -222,15 +277,21 @@ def sync_server_time():
 
         data = response.json()
 
-        server_time = int(data["serverTime"])
+        server_time = int(
+            data["serverTime"]
+        )
 
         local_mid = (
-            local_before + local_after
+            local_before
+            + local_after
         ) // 2
 
         server_time_offset = (
-            server_time - local_mid
+            server_time
+            - local_mid
         )
+
+        last_time_sync = time.time()
 
         logger.info(
             "Server time offset: %s ms",
@@ -241,12 +302,30 @@ def sync_server_time():
 
     except Exception as e:
 
-        logger.error(
+        logger.warning(
             "Server time sync failed: %s",
             e
         )
 
         return False
+
+
+# ============================================================
+# SIGNATURE
+# ============================================================
+
+def make_signature(params):
+
+    query_string = "&".join(
+        f"{key}={params[key]}"
+        for key in params
+    )
+
+    return hmac.new(
+        BINANCE_API_SECRET.encode(),
+        query_string.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
 
 # ============================================================
@@ -261,59 +340,74 @@ def signed_request(
 ):
 
     if params is None:
+
         params = {}
 
+    if not BINANCE_API_KEY:
+
+        logger.error(
+            "BINANCE_API_KEY missing"
+        )
+
+        return None
+
     if not BINANCE_API_SECRET:
+
         logger.error(
             "BINANCE_API_SECRET missing"
         )
+
         return None
-
-    params = dict(params)
-
-    params["timestamp"] = binance_time_ms()
-    params["recvWindow"] = 10000
-
-    query_string = "&".join(
-        f"{key}={params[key]}"
-        for key in params
-    )
-
-    signature = hmac.new(
-        BINANCE_API_SECRET.encode(),
-        query_string.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    params["signature"] = signature
 
     url = BASE_URL + path
 
     for attempt in range(retries):
 
+        if shutdown_event.is_set():
+
+            return None
+
+        request_params = dict(params)
+
+        # IMPORTANT:
+        # Generate fresh timestamp on EVERY retry.
+        request_params["timestamp"] = (
+            binance_time_ms()
+        )
+
+        request_params["recvWindow"] = 10000
+
+        request_params["signature"] = (
+            make_signature(
+                request_params
+            )
+        )
+
         try:
 
-            if method.upper() == "GET":
+            method_upper = method.upper()
+
+            if method_upper == "GET":
 
                 response = session.get(
                     url,
-                    params=params,
+                    params=request_params,
                     timeout=15
                 )
 
-            elif method.upper() == "POST":
+            elif method_upper == "POST":
 
                 response = session.post(
                     url,
-                    params=params,
+                    params=request_params,
                     timeout=15
                 )
 
-            elif method.upper() == "DELETE":
+            elif method_upper == "DELETE":
 
                 response = session.delete(
                     url,
-                    params=params,
+                    params=request_params,
                     timeout=15
                 )
 
@@ -324,35 +418,83 @@ def signed_request(
                 )
 
             if response.status_code == 200:
-                return response.json()
 
+                try:
+
+                    return response.json()
+
+                except Exception:
+
+                    logger.error(
+                        "Invalid JSON response: %s",
+                        response.text[:500]
+                    )
+
+                    return None
+
+            # ------------------------------------------------
             # Timestamp error
+            # ------------------------------------------------
+
             if response.status_code == 400:
 
                 try:
 
                     data = response.json()
 
-                    if data.get("code") == -1021:
+                    code = data.get(
+                        "code"
+                    )
+
+                    # Timestamp problem
+                    if code == -1021:
 
                         logger.warning(
-                            "Timestamp error. Resyncing time..."
+                            "Timestamp error. "
+                            "Resyncing server time..."
                         )
 
                         sync_server_time()
 
-                        time.sleep(1)
+                        safe_sleep(1)
 
                         continue
 
+                    # ------------------------------------------------
+                    # Insufficient balance
+                    #
+                    # DO NOT repeatedly retry this.
+                    # ------------------------------------------------
+
+                    if code == -2010:
+
+                        logger.warning(
+                            "Binance order rejected -2010: %s",
+                            data.get(
+                                "msg",
+                                "unknown"
+                            )
+                        )
+
+                        return data
+
                 except Exception:
+
                     pass
 
+            # ------------------------------------------------
             # Rate limit
-            if response.status_code in (418, 429):
+            # ------------------------------------------------
 
-                retry_after = response.headers.get(
-                    "Retry-After"
+            if response.status_code in (
+                418,
+                429
+            ):
+
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
                 )
 
                 wait_time = 10
@@ -363,10 +505,15 @@ def signed_request(
 
                         wait_time = max(
                             5,
-                            int(float(retry_after))
+                            int(
+                                float(
+                                    retry_after
+                                )
+                            )
                         )
 
                     except Exception:
+
                         pass
 
                 wait_time += random.uniform(
@@ -381,7 +528,9 @@ def signed_request(
                     wait_time
                 )
 
-                time.sleep(wait_time)
+                safe_sleep(
+                    wait_time
+                )
 
                 continue
 
@@ -391,7 +540,7 @@ def signed_request(
                 response.text[:500]
             )
 
-            time.sleep(
+            safe_sleep(
                 2 + attempt * 2
             )
 
@@ -402,7 +551,18 @@ def signed_request(
                 e
             )
 
-            time.sleep(
+            safe_sleep(
+                2 + attempt * 2
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Signed request exception: %s",
+                e
+            )
+
+            safe_sleep(
                 2 + attempt * 2
             )
 
@@ -423,6 +583,10 @@ def public_get(
 
     for attempt in range(retries):
 
+        if shutdown_event.is_set():
+
+            return None
+
         try:
 
             response = session.get(
@@ -432,12 +596,22 @@ def public_get(
             )
 
             if response.status_code == 200:
+
                 return response.json()
 
-            if response.status_code in (418, 429):
+            # ------------------------------------------------
+            # Rate limit
+            # ------------------------------------------------
 
-                retry_after = response.headers.get(
-                    "Retry-After"
+            if response.status_code in (
+                418,
+                429
+            ):
+
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
                 )
 
                 wait_time = 10
@@ -448,10 +622,15 @@ def public_get(
 
                         wait_time = max(
                             5,
-                            int(float(retry_after))
+                            int(
+                                float(
+                                    retry_after
+                                )
+                            )
                         )
 
                     except Exception:
+
                         pass
 
                 wait_time += random.uniform(
@@ -466,7 +645,9 @@ def public_get(
                     wait_time
                 )
 
-                time.sleep(wait_time)
+                safe_sleep(
+                    wait_time
+                )
 
                 continue
 
@@ -476,7 +657,7 @@ def public_get(
                 response.text[:300]
             )
 
-            time.sleep(
+            safe_sleep(
                 2 + attempt * 2
             )
 
@@ -487,7 +668,7 @@ def public_get(
                 e
             )
 
-            time.sleep(
+            safe_sleep(
                 2 + attempt * 2
             )
 
@@ -523,28 +704,52 @@ def load_exchange_info():
 
     symbol_filters.clear()
 
-    for item in data.get("symbols", []):
+    for item in data.get(
+        "symbols",
+        []
+    ):
 
-        symbol = item.get("symbol")
+        symbol = item.get(
+            "symbol"
+        )
 
         if not symbol:
+
             continue
 
         filters = {}
 
-        for f in item.get("filters", []):
+        for f in item.get(
+            "filters",
+            []
+        ):
 
             filter_type = f.get(
                 "filterType"
             )
 
             if filter_type:
-                filters[filter_type] = f
 
-        symbol_filters[symbol] = {
-            "status": item.get("status"),
-            "baseAsset": item.get("baseAsset"),
-            "quoteAsset": item.get("quoteAsset"),
+                filters[
+                    filter_type
+                ] = f
+
+        symbol_filters[
+            symbol
+        ] = {
+
+            "status": item.get(
+                "status"
+            ),
+
+            "baseAsset": item.get(
+                "baseAsset"
+            ),
+
+            "quoteAsset": item.get(
+                "quoteAsset"
+            ),
+
             "filters": filters
         }
 
@@ -557,10 +762,11 @@ def load_exchange_info():
 
 
 # ============================================================
-# SYMBOL SELECTION
+# STABLE ASSETS
 # ============================================================
 
 STABLE_ASSETS = {
+
     "USDT",
     "USDC",
     "BUSD",
@@ -568,6 +774,7 @@ STABLE_ASSETS = {
     "TUSD",
     "USDP",
     "DAI",
+
     "EUR",
     "TRY",
     "BRL",
@@ -584,6 +791,10 @@ STABLE_ASSETS = {
     "IDRT"
 }
 
+
+# ============================================================
+# TOP SYMBOLS
+# ============================================================
 
 def load_top_symbols():
 
@@ -609,28 +820,41 @@ def load_top_symbols():
 
     for ticker in ticker_data:
 
-        symbol = ticker.get("symbol")
+        symbol = ticker.get(
+            "symbol"
+        )
 
         if not symbol:
+
             continue
 
-        info = symbol_filters.get(symbol)
+        info = symbol_filters.get(
+            symbol
+        )
 
         if not info:
+
             continue
 
         if info["status"] != "TRADING":
+
             continue
 
         if info["quoteAsset"] != "USDT":
+
             continue
 
         base = info["baseAsset"]
 
         if base in STABLE_ASSETS:
+
             continue
 
-        if base in {"BTC", "ETH"}:
+        if base in {
+            "BTC",
+            "ETH"
+        }:
+
             continue
 
         quote_volume = d(
@@ -641,6 +865,7 @@ def load_top_symbols():
         )
 
         if quote_volume <= 0:
+
             continue
 
         candidates.append(
@@ -657,10 +882,13 @@ def load_top_symbols():
 
     selected = [
         x[0]
-        for x in candidates[:TOP_SYMBOLS]
+        for x in candidates[
+            :TOP_SYMBOLS
+        ]
     ]
 
     with state_lock:
+
         symbols = selected
 
     logger.info(
@@ -677,7 +905,9 @@ def load_top_symbols():
 
         logger.info(
             "First symbols: %s",
-            ", ".join(selected[:20])
+            ", ".join(
+                selected[:20]
+            )
         )
 
     return len(selected) > 0
@@ -699,6 +929,7 @@ def fetch_klines(symbol):
     )
 
     if not data:
+
         return False
 
     result = deque(
@@ -715,24 +946,37 @@ def fetch_klines(symbol):
             close_time = int(k[6])
 
             if close_time >= current_time:
+
                 continue
 
             candle = {
+
                 "open_time": open_time,
+
                 "open": d(k[1]),
+
                 "high": d(k[2]),
+
                 "low": d(k[3]),
+
                 "close": d(k[4]),
+
                 "volume": d(k[5]),
+
                 "close_time": close_time
             }
 
-            result.append(candle)
+            result.append(
+                candle
+            )
 
         except Exception:
+
             continue
 
-    if len(result) < RSI_SLOW_PERIOD + 5:
+    if len(result) < (
+        RSI_SLOW_PERIOD + 5
+    ):
 
         logger.warning(
             "%s insufficient candle history: %d",
@@ -743,6 +987,7 @@ def fetch_klines(symbol):
         return False
 
     with state_lock:
+
         candles[symbol] = result
 
     return True
@@ -767,10 +1012,22 @@ def initialize_candles():
     ):
 
         if shutdown_event.is_set():
+
             break
 
-        if fetch_klines(symbol):
-            success += 1
+        try:
+
+            if fetch_klines(symbol):
+
+                success += 1
+
+        except Exception as e:
+
+            logger.warning(
+                "Historical fetch failed %s: %s",
+                symbol,
+                e
+            )
 
         if (
             index % 10 == 0
@@ -783,7 +1040,7 @@ def initialize_candles():
                 len(symbols)
             )
 
-        time.sleep(
+        safe_sleep(
             STARTUP_KLINE_DELAY
         )
 
@@ -806,6 +1063,7 @@ def calculate_rsi_wilder(
 ):
 
     if len(values) < period + 1:
+
         return []
 
     gains = []
@@ -823,7 +1081,10 @@ def calculate_rsi_wilder(
 
         if change > 0:
 
-            gains.append(change)
+            gains.append(
+                change
+            )
+
             losses.append(
                 Decimal("0")
             )
@@ -839,6 +1100,7 @@ def calculate_rsi_wilder(
             )
 
     if len(gains) < period:
+
         return []
 
     avg_gain = (
@@ -861,6 +1123,7 @@ def calculate_rsi_wilder(
         if loss == 0:
 
             if gain == 0:
+
                 return Decimal("50")
 
             return Decimal("100")
@@ -893,7 +1156,9 @@ def calculate_rsi_wilder(
         avg_gain = (
             (
                 avg_gain
-                * Decimal(period - 1)
+                * Decimal(
+                    period - 1
+                )
             )
             + gains[i]
         ) / Decimal(period)
@@ -901,7 +1166,9 @@ def calculate_rsi_wilder(
         avg_loss = (
             (
                 avg_loss
-                * Decimal(period - 1)
+                * Decimal(
+                    period - 1
+                )
             )
             + losses[i]
         ) / Decimal(period)
@@ -917,7 +1184,7 @@ def calculate_rsi_wilder(
 
 
 # ============================================================
-# INDICATOR
+# INDICATORS
 # ============================================================
 
 def get_rsi_values(symbol):
@@ -931,7 +1198,10 @@ def get_rsi_values(symbol):
             )
         )
 
-    if len(data) < RSI_SLOW_PERIOD + 5:
+    if len(data) < (
+        RSI_SLOW_PERIOD + 5
+    ):
+
         return None
 
     closes = [
@@ -950,16 +1220,23 @@ def get_rsi_values(symbol):
     )
 
     if len(rsi3) < 2:
+
         return None
 
     if len(rsi50) < 1:
+
         return None
 
     return {
+
         "rsi3_previous": rsi3[-2],
+
         "rsi3_current": rsi3[-1],
+
         "rsi50": rsi50[-1],
+
         "close": closes[-1],
+
         "last_candle_time": data[-1][
             "close_time"
         ]
@@ -975,9 +1252,12 @@ def get_symbol_filter(
     filter_type
 ):
 
-    info = symbol_filters.get(symbol)
+    info = symbol_filters.get(
+        symbol
+    )
 
     if not info:
+
         return None
 
     return info["filters"].get(
@@ -994,6 +1274,7 @@ def round_step(
     step = d(step)
 
     if step <= 0:
+
         return quantity
 
     return (
@@ -1003,6 +1284,10 @@ def round_step(
     ) * step
 
 
+# ============================================================
+# BUY QUANTITY
+# ============================================================
+
 def calculate_buy_quantity(
     symbol,
     price
@@ -1011,9 +1296,13 @@ def calculate_buy_quantity(
     price = d(price)
 
     if price <= 0:
+
         return Decimal("0")
 
-    raw_qty = BUY_USDT / price
+    raw_qty = (
+        BUY_USDT
+        / price
+    )
 
     lot_filter = get_symbol_filter(
         symbol,
@@ -1021,6 +1310,7 @@ def calculate_buy_quantity(
     )
 
     if not lot_filter:
+
         return raw_qty
 
     step_size = d(
@@ -1043,9 +1333,13 @@ def calculate_buy_quantity(
     )
 
     if qty < min_qty:
+
         return Decimal("0")
 
-    # Check minimum notional
+    # --------------------------------------------------------
+    # MIN NOTIONAL
+    # --------------------------------------------------------
+
     min_notional_filter = (
         get_symbol_filter(
             symbol,
@@ -1081,7 +1375,10 @@ def calculate_buy_quantity(
 
             return Decimal("0")
 
-    # Newer Binance symbols may use NOTIONAL
+    # --------------------------------------------------------
+    # NOTIONAL
+    # --------------------------------------------------------
+
     notional_filter = (
         get_symbol_filter(
             symbol,
@@ -1120,6 +1417,10 @@ def calculate_buy_quantity(
     return qty
 
 
+# ============================================================
+# SELL QUANTITY
+# ============================================================
+
 def calculate_sell_quantity(
     symbol,
     available_qty
@@ -1130,6 +1431,7 @@ def calculate_sell_quantity(
     )
 
     if available_qty <= 0:
+
         return Decimal("0")
 
     lot_filter = get_symbol_filter(
@@ -1138,6 +1440,7 @@ def calculate_sell_quantity(
     )
 
     if not lot_filter:
+
         return available_qty
 
     step_size = d(
@@ -1154,6 +1457,7 @@ def calculate_sell_quantity(
         )
     )
 
+    # Keep a small buffer for commission/dust.
     qty = (
         available_qty
         * Decimal("0.999")
@@ -1165,6 +1469,7 @@ def calculate_sell_quantity(
     )
 
     if qty < min_qty:
+
         return Decimal("0")
 
     return qty
@@ -1180,6 +1485,7 @@ def get_account():
         not BINANCE_API_KEY
         or not BINANCE_API_SECRET
     ):
+
         return None
 
     return signed_request(
@@ -1188,11 +1494,21 @@ def get_account():
     )
 
 
-def get_asset_balance(asset):
+# ============================================================
+# ASSET BALANCE
+# ============================================================
 
-    account = get_account()
+def get_asset_balance(
+    asset,
+    account=None
+):
+
+    if account is None:
+
+        account = get_account()
 
     if not account:
+
         return Decimal("0")
 
     for balance in account.get(
@@ -1200,7 +1516,9 @@ def get_asset_balance(asset):
         []
     ):
 
-        if balance.get("asset") == asset:
+        if balance.get(
+            "asset"
+        ) == asset:
 
             return d(
                 balance.get(
@@ -1213,10 +1531,30 @@ def get_asset_balance(asset):
 
 
 # ============================================================
+# AVAILABLE USDT
+# ============================================================
+
+def get_available_usdt():
+
+    account = get_account()
+
+    if not account:
+
+        return Decimal("0")
+
+    return get_asset_balance(
+        "USDT",
+        account
+    )
+
+
+# ============================================================
 # MARKET PRICE
 # ============================================================
 
-def get_market_price(symbol):
+def get_market_price(
+    symbol
+):
 
     data = public_get(
         "/api/v3/ticker/price",
@@ -1226,6 +1564,7 @@ def get_market_price(symbol):
     )
 
     if not data:
+
         return Decimal("0")
 
     return d(
@@ -1237,6 +1576,83 @@ def get_market_price(symbol):
 
 
 # ============================================================
+# RESERVE BUY BALANCE
+# ============================================================
+
+def reserve_buy_balance():
+
+    global reserved_usdt
+
+    # --------------------------------------------------------
+    # Get fresh Binance balance
+    # --------------------------------------------------------
+
+    available = (
+        get_available_usdt()
+    )
+
+    if available <= 0:
+
+        return False
+
+    with state_lock:
+
+        remaining = (
+            available
+            - reserved_usdt
+        )
+
+        # Keep a small safety buffer.
+        required = (
+            BUY_USDT
+            + Decimal("0.10")
+        )
+
+        if remaining < required:
+
+            logger.warning(
+                "BUY skipped: insufficient "
+                "available USDT | "
+                "free=%s | reserved=%s | "
+                "required≈%s",
+                fmt_decimal(available),
+                fmt_decimal(
+                    reserved_usdt
+                ),
+                fmt_decimal(required)
+            )
+
+            return False
+
+        reserved_usdt += BUY_USDT
+
+        logger.info(
+            "USDT reserved: %s | total reserved=%s",
+            fmt_decimal(BUY_USDT),
+            fmt_decimal(reserved_usdt)
+        )
+
+        return True
+
+
+# ============================================================
+# RELEASE BUY RESERVATION
+# ============================================================
+
+def release_buy_balance():
+
+    global reserved_usdt
+
+    with state_lock:
+
+        reserved_usdt -= BUY_USDT
+
+        if reserved_usdt < 0:
+
+            reserved_usdt = Decimal("0")
+
+
+# ============================================================
 # PLACE BUY
 # ============================================================
 
@@ -1245,20 +1661,41 @@ def place_buy(
     signal_data
 ):
 
+    reserved = False
+
     with state_lock:
 
         if symbol in positions:
+
             return False
 
         if symbol in buying_symbols:
+
             return False
 
-        buying_symbols.add(symbol)
+        buying_symbols.add(
+            symbol
+        )
 
     try:
 
-        # Market order-এর আগে fresh price
-        price = get_market_price(symbol)
+        # ----------------------------------------------------
+        # Reserve USDT BEFORE order
+        # ----------------------------------------------------
+
+        if not reserve_buy_balance():
+
+            return False
+
+        reserved = True
+
+        # ----------------------------------------------------
+        # Fresh market price
+        # ----------------------------------------------------
+
+        price = get_market_price(
+            symbol
+        )
 
         if price <= 0:
 
@@ -1304,28 +1741,41 @@ def place_buy(
 
         if DRY_RUN:
 
-            logger.info(
-                "DRY RUN BUY | %s",
-                symbol
+            entry_price = price
+
+            stop_price = (
+                entry_price
+                * (
+                    Decimal("1")
+                    - (
+                        STOP_LOSS_PERCENT
+                        / Decimal("100")
+                    )
+                )
             )
 
             with state_lock:
 
                 positions[symbol] = {
+
                     "symbol": symbol,
+
                     "quantity": quantity,
-                    "entry_price": price,
-                    "stop_price": (
-                        price
-                        * (
-                            Decimal("1")
-                            - STOP_LOSS_PERCENT
-                            / Decimal("100")
-                        )
-                    ),
+
+                    "entry_price": entry_price,
+
+                    "stop_price": stop_price,
+
                     "buy_time": time.time(),
+
                     "dry_run": True
                 }
+
+            logger.info(
+                "DRY RUN BUY | %s | qty=%s",
+                symbol,
+                fmt_decimal(quantity)
+            )
 
             return True
 
@@ -1338,16 +1788,37 @@ def place_buy(
             "/api/v3/order",
             {
                 "symbol": symbol,
+
                 "side": "BUY",
+
                 "type": "MARKET",
+
                 "quantity": fmt_decimal(
                     quantity
                 ),
+
                 "newOrderRespType": "FULL"
             }
         )
 
         if not order:
+
+            return False
+
+        # ----------------------------------------------------
+        # Binance insufficient balance
+        # ----------------------------------------------------
+
+        if order.get(
+            "code"
+        ) == -2010:
+
+            logger.warning(
+                "❌ BUY rejected due to "
+                "insufficient balance | %s",
+                symbol
+            )
+
             return False
 
         if "orderId" not in order:
@@ -1392,19 +1863,27 @@ def place_buy(
             entry_price
             * (
                 Decimal("1")
-                - STOP_LOSS_PERCENT
-                / Decimal("100")
+                - (
+                    STOP_LOSS_PERCENT
+                    / Decimal("100")
+                )
             )
         )
 
         with state_lock:
 
             positions[symbol] = {
+
                 "symbol": symbol,
+
                 "quantity": executed_qty,
+
                 "entry_price": entry_price,
+
                 "stop_price": stop_price,
+
                 "buy_time": time.time(),
+
                 "order_id": order.get(
                     "orderId"
                 )
@@ -1433,6 +1912,10 @@ def place_buy(
 
     finally:
 
+        if reserved:
+
+            release_buy_balance()
+
         with state_lock:
 
             buying_symbols.discard(
@@ -1452,6 +1935,7 @@ def place_sell(
     with state_lock:
 
         if symbol in selling_symbols:
+
             return False
 
         position = positions.get(
@@ -1459,9 +1943,12 @@ def place_sell(
         )
 
         if not position:
+
             return False
 
-        selling_symbols.add(symbol)
+        selling_symbols.add(
+            symbol
+        )
 
     try:
 
@@ -1473,6 +1960,7 @@ def place_sell(
         )
 
         if quantity <= 0:
+
             return False
 
         # ----------------------------------------------------
@@ -1505,14 +1993,30 @@ def place_sell(
         )
 
         if not info:
+
             return False
 
         base_asset = info.get(
             "baseAsset"
         )
 
-        actual_balance = get_asset_balance(
-            base_asset
+        account = get_account()
+
+        if not account:
+
+            logger.warning(
+                "SELL skipped %s: "
+                "could not read account",
+                symbol
+            )
+
+            return False
+
+        actual_balance = (
+            get_asset_balance(
+                base_asset,
+                account
+            )
         )
 
         sell_qty = calculate_sell_quantity(
@@ -1535,16 +2039,33 @@ def place_sell(
             "/api/v3/order",
             {
                 "symbol": symbol,
+
                 "side": "SELL",
+
                 "type": "MARKET",
+
                 "quantity": fmt_decimal(
                     sell_qty
                 ),
+
                 "newOrderRespType": "FULL"
             }
         )
 
         if not order:
+
+            return False
+
+        if order.get(
+            "code"
+        ):
+
+            logger.error(
+                "SELL failed %s: %s",
+                symbol,
+                order
+            )
+
             return False
 
         if "orderId" not in order:
@@ -1609,6 +2130,7 @@ def check_stop_loss(
         )
 
     if not position:
+
         return
 
     stop_price = d(
@@ -1619,6 +2141,7 @@ def check_stop_loss(
     )
 
     if stop_price <= 0:
+
         return
 
     if current_price <= stop_price:
@@ -1630,6 +2153,12 @@ def check_stop_loss(
             fmt_decimal(current_price),
             fmt_decimal(stop_price)
         )
+
+        with state_lock:
+
+            if symbol in selling_symbols:
+
+                return
 
         executor.submit(
             place_sell,
@@ -1644,165 +2173,189 @@ def check_stop_loss(
 
 def process_symbol(symbol):
 
-    indicator = get_rsi_values(
-        symbol
-    )
+    try:
 
-    if not indicator:
-        return
-
-    rsi3_previous = indicator[
-        "rsi3_previous"
-    ]
-
-    rsi3_current = indicator[
-        "rsi3_current"
-    ]
-
-    rsi50 = indicator[
-        "rsi50"
-    ]
-
-    candle_time = indicator[
-        "last_candle_time"
-    ]
-
-    # --------------------------------------------------------
-    # One processing per closed candle
-    # --------------------------------------------------------
-
-    with state_lock:
-
-        previous_processed = (
-            last_processed_candle.get(
-                symbol
-            )
+        indicator = get_rsi_values(
+            symbol
         )
 
-        if previous_processed == candle_time:
+        if not indicator:
+
             return
 
-        last_processed_candle[
-            symbol
-        ] = candle_time
+        rsi3_previous = indicator[
+            "rsi3_previous"
+        ]
 
-    # ========================================================
-    # SELL
-    # ========================================================
+        rsi3_current = indicator[
+            "rsi3_current"
+        ]
 
-    with state_lock:
+        rsi50 = indicator[
+            "rsi50"
+        ]
 
-        has_position = (
-            symbol in positions
+        candle_time = indicator[
+            "last_candle_time"
+        ]
+
+        # ----------------------------------------------------
+        # One processing per closed candle
+        # ----------------------------------------------------
+
+        with state_lock:
+
+            previous_processed = (
+                last_processed_candle.get(
+                    symbol
+                )
+            )
+
+            if previous_processed == candle_time:
+
+                return
+
+            last_processed_candle[
+                symbol
+            ] = candle_time
+
+        # ====================================================
+        # SELL
+        # ====================================================
+
+        with state_lock:
+
+            has_position = (
+                symbol in positions
+            )
+
+        if has_position:
+
+            sell_cross = (
+
+                rsi3_previous
+                <= SELL_RSI3_LEVEL
+
+                and
+
+                rsi3_current
+                > SELL_RSI3_LEVEL
+            )
+
+            if sell_cross:
+
+                logger.info(
+                    "🔥 SELL CROSS | %s | "
+                    "RSI3 %.4f -> %.4f | "
+                    "crossed above 80",
+                    symbol,
+                    rsi3_previous,
+                    rsi3_current
+                )
+
+                executor.submit(
+                    place_sell,
+                    symbol,
+                    "RSI3 CROSS ABOVE 80"
+                )
+
+            return
+
+        # ====================================================
+        # BUY
+        # ====================================================
+
+        was_oversold = (
+            rsi3_previous
+            < BUY_RSI3_MAX
         )
 
-    if has_position:
+        rsi_turning_up = (
+            rsi3_current
+            > rsi3_previous
+        )
 
-        # RSI3 <= 80 থেকে >80 cross
-        sell_cross = (
-            rsi3_previous <= SELL_RSI3_LEVEL
+        trend_ok = (
+            rsi50
+            > BUY_RSI50_MIN
+        )
+
+        buy_signal = (
+
+            trend_ok
+
             and
-            rsi3_current > SELL_RSI3_LEVEL
+
+            was_oversold
+
+            and
+
+            rsi_turning_up
         )
 
-        if sell_cross:
+        if buy_signal:
 
             logger.info(
-                "🔥 SELL CROSS | %s | "
+                "🔥🔥 BUY CONDITIONS TRUE 🔥🔥 | %s | "
+                "RSI50=%.4f > 50 | "
                 "RSI3 %.4f -> %.4f | "
-                "crossed above 80",
+                "oversold recovery",
                 symbol,
+                rsi50,
                 rsi3_previous,
                 rsi3_current
             )
 
+            with state_lock:
+
+                if (
+                    symbol in positions
+                    or symbol in buying_symbols
+                ):
+
+                    return
+
             executor.submit(
-                place_sell,
+                place_buy,
                 symbol,
-                "RSI3 CROSS ABOVE 80"
+                indicator
             )
 
-        return
+        elif DEBUG_MODE:
 
-    # ========================================================
-    # BUY
-    # ========================================================
+            near_signal = (
 
-    # RSI3 আগের candle-এ 10-এর নিচে ছিল
-    was_oversold = (
-        rsi3_previous < BUY_RSI3_MAX
-    )
+                rsi50
+                > Decimal("45")
 
-    # RSI3 এখন আগের চেয়ে উপরে উঠছে
-    rsi_turning_up = (
-        rsi3_current > rsi3_previous
-    )
+                and
 
-    # RSI50 trend filter
-    trend_ok = (
-        rsi50 > BUY_RSI50_MIN
-    )
-
-    # --------------------------------------------------------
-    # NEW BUY RULE
-    #
-    # RSI50 > 50
-    # AND previous RSI3 < 10
-    # AND current RSI3 > previous RSI3
-    #
-    # Current RSI3 10-এর নিচে থাকা বাধ্যতামূলক নয়।
-    # --------------------------------------------------------
-
-    buy_signal = (
-        trend_ok
-        and
-        was_oversold
-        and
-        rsi_turning_up
-    )
-
-    if buy_signal:
-
-        logger.info(
-            "🔥🔥 BUY CONDITIONS TRUE 🔥🔥 | %s | "
-            "RSI50=%.4f > 50 | "
-            "RSI3 %.4f -> %.4f | "
-            "oversold recovery",
-            symbol,
-            rsi50,
-            rsi3_previous,
-            rsi3_current
-        )
-
-        executor.submit(
-            place_buy,
-            symbol,
-            indicator
-        )
-
-    elif DEBUG_MODE:
-
-        # Near signal
-        near_signal = (
-            rsi50 > Decimal("45")
-            and
-            rsi3_current < Decimal("20")
-        )
-
-        if near_signal:
-
-            logger.info(
-                "NEAR BUY | %s | "
-                "RSI50=%.4f | "
-                "RSI3 prev=%.4f | "
-                "RSI3 current=%.4f | "
-                "turn=%s",
-                symbol,
-                rsi50,
-                rsi3_previous,
-                rsi3_current,
-                rsi_turning_up
+                rsi3_current
+                < Decimal("20")
             )
+
+            if near_signal:
+
+                logger.info(
+                    "NEAR BUY | %s | "
+                    "RSI50=%.4f | "
+                    "RSI3 prev=%.4f | "
+                    "RSI3 current=%.4f | "
+                    "turn=%s",
+                    symbol,
+                    rsi50,
+                    rsi3_previous,
+                    rsi3_current,
+                    rsi_turning_up
+                )
+
+    except Exception as e:
+
+        logger.exception(
+            "Signal processing error %s: %s",
+            symbol,
+            e
+        )
 
 
 # ============================================================
@@ -1850,27 +2403,60 @@ def update_candle(
 
         # ====================================================
         # LIVE STOP LOSS
+        #
+        # IMPORTANT:
+        # Use candle LOW as well as CLOSE.
+        # This makes SL react even when price briefly
+        # goes below the stop during a live 5m candle.
         # ====================================================
 
-        check_stop_loss(
-            symbol,
-            close_price
-        )
+        with state_lock:
+
+            position = positions.get(
+                symbol
+            )
+
+        if position:
+
+            stop_price = d(
+                position.get(
+                    "stop_price",
+                    "0"
+                )
+            )
+
+            if (
+                stop_price > 0
+                and low_price <= stop_price
+            ):
+
+                check_stop_loss(
+                    symbol,
+                    stop_price
+                )
 
         # ====================================================
         # ONLY CLOSED CANDLE FOR RSI
         # ====================================================
 
         if not is_closed:
+
             return
 
         candle = {
+
             "open_time": open_time,
+
             "open": open_price,
+
             "high": high_price,
+
             "low": low_price,
+
             "close": close_price,
+
             "volume": volume,
+
             "close_time": close_time
         }
 
@@ -1886,7 +2472,9 @@ def update_candle(
                     maxlen=HISTORY_CANDLES
                 )
 
-                candles[symbol] = history
+                candles[
+                    symbol
+                ] = history
 
             if history:
 
@@ -1942,10 +2530,20 @@ def make_ws_callbacks(
     def on_open(ws):
 
         logger.info(
-            "WebSocket group %d connected: %d symbols",
+            "WebSocket group %d CONNECTED: %d symbols",
             group_number,
             len(group_symbols)
         )
+
+        with state_lock:
+
+            ws_objects[
+                group_number
+            ] = ws
+
+            ws_last_message[
+                group_number
+            ] = time.time()
 
     def on_message(
         ws,
@@ -1953,6 +2551,12 @@ def make_ws_callbacks(
     ):
 
         try:
+
+            with state_lock:
+
+                ws_last_message[
+                    group_number
+                ] = time.time()
 
             data = json.loads(
                 message
@@ -1963,7 +2567,10 @@ def make_ws_callbacks(
                 data
             )
 
-            if payload.get("e") != "kline":
+            if payload.get(
+                "e"
+            ) != "kline":
+
                 return
 
             symbol = payload.get(
@@ -1975,6 +2582,7 @@ def make_ws_callbacks(
             )
 
             if not symbol or not kline:
+
                 return
 
             update_candle(
@@ -1997,7 +2605,7 @@ def make_ws_callbacks(
     ):
 
         logger.warning(
-            "WebSocket group %d error: %s",
+            "WebSocket group %d ERROR: %s",
             group_number,
             error
         )
@@ -2009,12 +2617,26 @@ def make_ws_callbacks(
     ):
 
         logger.warning(
-            "WebSocket group %d closed | "
+            "WebSocket group %d CLOSED | "
             "code=%s | msg=%s",
             group_number,
             close_status_code,
             close_msg
         )
+
+        with state_lock:
+
+            if (
+                ws_objects.get(
+                    group_number
+                )
+                is ws
+            ):
+
+                ws_objects.pop(
+                    group_number,
+                    None
+                )
 
     return (
         on_open,
@@ -2025,7 +2647,7 @@ def make_ws_callbacks(
 
 
 # ============================================================
-# WEBSOCKET GROUP RUNNER
+# WEBSOCKET GROUP LOOP
 # ============================================================
 
 def websocket_group_loop(
@@ -2034,7 +2656,9 @@ def websocket_group_loop(
 ):
 
     streams = "/".join(
+
         f"{symbol.lower()}@kline_{TIMEFRAME}"
+
         for symbol in group_symbols
     )
 
@@ -2044,9 +2668,18 @@ def websocket_group_loop(
         + streams
     )
 
-    reconnect_delay = WS_RECONNECT_MIN
+    reconnect_delay = (
+        WS_RECONNECT_MIN
+    )
+
+    logger.info(
+        "WebSocket group %d loop started",
+        group_number
+    )
 
     while not shutdown_event.is_set():
+
+        ws = None
 
         callbacks = make_ws_callbacks(
             group_symbols,
@@ -2056,19 +2689,43 @@ def websocket_group_loop(
         try:
 
             ws = websocket.WebSocketApp(
+
                 url,
+
                 on_open=callbacks[0],
+
                 on_message=callbacks[1],
+
                 on_error=callbacks[2],
+
                 on_close=callbacks[3]
             )
 
+            with state_lock:
+
+                ws_objects[
+                    group_number
+                ] = ws
+
+                ws_last_message[
+                    group_number
+                ] = time.time()
+
             ws.run_forever(
+
                 ping_interval=WS_PING_INTERVAL,
-                ping_timeout=WS_PING_TIMEOUT
+
+                ping_timeout=WS_PING_TIMEOUT,
+
+                ping_payload="ping"
             )
 
-            reconnect_delay = WS_RECONNECT_MIN
+            # If connection exits normally,
+            # reconnect.
+
+            reconnect_delay = (
+                WS_RECONNECT_MIN
+            )
 
         except Exception as e:
 
@@ -2078,7 +2735,24 @@ def websocket_group_loop(
                 e
             )
 
+        finally:
+
+            with state_lock:
+
+                if (
+                    ws_objects.get(
+                        group_number
+                    )
+                    is ws
+                ):
+
+                    ws_objects.pop(
+                        group_number,
+                        None
+                    )
+
         if shutdown_event.is_set():
+
             break
 
         wait_time = min(
@@ -2091,21 +2765,87 @@ def websocket_group_loop(
             2
         )
 
-        logger.info(
-            "WebSocket group %d reconnecting "
-            "in %.1fs",
+        logger.warning(
+            "WebSocket group %d disconnected. "
+            "Reconnecting in %.1fs",
             group_number,
             wait_time
         )
 
-        time.sleep(
+        safe_sleep(
             wait_time
         )
 
         reconnect_delay = min(
+
             reconnect_delay * 2,
+
             WS_RECONNECT_MAX
         )
+
+    logger.info(
+        "WebSocket group %d loop stopped",
+        group_number
+    )
+
+
+# ============================================================
+# START ONE WEBSOCKET GROUP
+# ============================================================
+
+def start_one_websocket_group(
+    group_symbols,
+    group_number
+):
+
+    if not group_symbols:
+
+        return
+
+    with state_lock:
+
+        existing = ws_thread_map.get(
+            group_number
+        )
+
+        if (
+            existing
+            and existing.is_alive()
+        ):
+
+            return
+
+    thread = threading.Thread(
+
+        target=websocket_group_loop,
+
+        args=(
+            group_symbols,
+            group_number
+        ),
+
+        daemon=True,
+
+        name=f"WS-{group_number}"
+    )
+
+    thread.start()
+
+    with state_lock:
+
+        ws_thread_map[
+            group_number
+        ] = thread
+
+        ws_threads.append(
+            thread
+        )
+
+    logger.info(
+        "WebSocket group %d STARTED: %d symbols",
+        group_number,
+        len(group_symbols)
+    )
 
 
 # ============================================================
@@ -2114,10 +2854,12 @@ def websocket_group_loop(
 
 def start_websockets():
 
-    global ws_threads
-
     groups = [
-        symbols[i:i + GROUP_SIZE]
+
+        symbols[
+            i:i + GROUP_SIZE
+        ]
+
         for i in range(
             0,
             len(symbols),
@@ -2135,32 +2877,154 @@ def start_websockets():
         1
     ):
 
+        if shutdown_event.is_set():
+
+            break
+
         if not group:
+
             continue
 
-        thread = threading.Thread(
-            target=websocket_group_loop,
-            args=(
-                group,
-                index
-            ),
-            daemon=True,
-            name=f"WS-{index}"
+        start_one_websocket_group(
+            group,
+            index
         )
 
-        thread.start()
+        safe_sleep(1)
 
-        ws_threads.append(
-            thread
+
+# ============================================================
+# WEBSOCKET WATCHDOG
+# ============================================================
+
+def websocket_watchdog():
+
+    while not shutdown_event.is_set():
+
+        try:
+
+            groups = [
+
+                symbols[
+                    i:i + GROUP_SIZE
+                ]
+
+                for i in range(
+                    0,
+                    len(symbols),
+                    GROUP_SIZE
+                )
+            ]
+
+            for index, group in enumerate(
+                groups,
+                1
+            ):
+
+                if not group:
+
+                    continue
+
+                with state_lock:
+
+                    thread = (
+                        ws_thread_map.get(
+                            index
+                        )
+                    )
+
+                    last_message = (
+                        ws_last_message.get(
+                            index,
+                            0
+                        )
+                    )
+
+                # ------------------------------------------------
+                # Thread died
+                # ------------------------------------------------
+
+                if (
+                    thread is None
+                    or not thread.is_alive()
+                ):
+
+                    logger.warning(
+                        "WATCHDOG: WebSocket group %d "
+                        "thread is not alive. Restarting...",
+                        index
+                    )
+
+                    start_one_websocket_group(
+                        group,
+                        index
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # No message for too long
+                #
+                # 5m stream should normally produce updates
+                # frequently. If completely silent for 2 min,
+                # force reconnect.
+                # ------------------------------------------------
+
+                if last_message > 0:
+
+                    silence = (
+                        time.time()
+                        - last_message
+                    )
+
+                    if silence > 120:
+
+                        logger.warning(
+                            "WATCHDOG: WebSocket group %d "
+                            "silent for %.0fs. "
+                            "Forcing reconnect...",
+                            index,
+                            silence
+                        )
+
+                        with state_lock:
+
+                            ws = ws_objects.get(
+                                index
+                            )
+
+                        try:
+
+                            if ws:
+
+                                ws.close()
+
+                        except Exception:
+
+                            pass
+
+            # ------------------------------------------------
+            # Periodic server time sync
+            # ------------------------------------------------
+
+            if (
+                time.time()
+                - last_time_sync
+                > TIME_SYNC_INTERVAL
+            ):
+
+                sync_server_time()
+
+        except Exception as e:
+
+            logger.exception(
+                "WATCHDOG error: %s",
+                e
+            )
+
+        safe_sleep(
+            WATCHDOG_INTERVAL
         )
-
-        logger.info(
-            "WebSocket group %d started: %d symbols",
-            index,
-            len(group)
-        )
-
-        time.sleep(1)
 
 
 # ============================================================
@@ -2195,6 +3059,16 @@ def check_account_connection():
         "Binance account connection OK"
     )
 
+    usdt = get_asset_balance(
+        "USDT",
+        account
+    )
+
+    logger.info(
+        "Available USDT: %s",
+        fmt_decimal(usdt)
+    )
+
     return True
 
 
@@ -2205,11 +3079,18 @@ def check_account_connection():
 def recover_positions():
 
     if DRY_RUN:
+
         return
 
     account = get_account()
 
     if not account:
+
+        logger.warning(
+            "Position recovery skipped: "
+            "account unavailable"
+        )
+
         return
 
     recovered = 0
@@ -2246,11 +3127,16 @@ def recover_positions():
         total = free + locked
 
         if total <= 0:
+
             continue
 
-        symbol = asset + "USDT"
+        symbol = (
+            asset
+            + "USDT"
+        )
 
         if symbol not in selected_set:
+
             continue
 
         price = get_market_price(
@@ -2258,25 +3144,48 @@ def recover_positions():
         )
 
         if price <= 0:
+
             continue
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Recovery does not know original entry price.
+        #
+        # Use current market as reference.
+        # ----------------------------------------------------
+
         stop_price = (
+
             price
+
             * (
+
                 Decimal("1")
-                - STOP_LOSS_PERCENT
-                / Decimal("100")
+
+                - (
+
+                    STOP_LOSS_PERCENT
+                    / Decimal("100")
+                )
             )
         )
 
         with state_lock:
 
-            positions[symbol] = {
+            positions[
+                symbol
+            ] = {
+
                 "symbol": symbol,
+
                 "quantity": total,
+
                 "entry_price": price,
+
                 "stop_price": stop_price,
+
                 "buy_time": time.time(),
+
                 "recovered": True
             }
 
@@ -2298,20 +3207,13 @@ def recover_positions():
 
 
 # ============================================================
-# BOT STARTUP
+# BOT INITIALIZATION
 # ============================================================
 
-def start_bot():
+def initialize_bot_once():
 
-    global bot_started
     global bot_live
-
-    with state_lock:
-
-        if bot_started:
-            return
-
-        bot_started = True
+    global last_time_sync
 
     logger.info(
         "=================================================="
@@ -2368,113 +3270,339 @@ def start_bot():
         "=================================================="
     )
 
-    try:
+    # --------------------------------------------------------
+    # Time
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
-        # TIME
-        # ----------------------------------------------------
+    sync_server_time()
 
-        sync_server_time()
+    safe_sleep(1)
 
-        time.sleep(1)
+    # --------------------------------------------------------
+    # Exchange info
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
-        # EXCHANGE INFO
-        # ----------------------------------------------------
+    if not load_exchange_info():
 
-        if not load_exchange_info():
+        raise RuntimeError(
+            "exchangeInfo failed"
+        )
 
-            logger.error(
-                "BOT STOPPED: exchangeInfo failed"
+    safe_sleep(1)
+
+    # --------------------------------------------------------
+    # Top symbols
+    # --------------------------------------------------------
+
+    if not load_top_symbols():
+
+        raise RuntimeError(
+            "symbol selection failed"
+        )
+
+    # --------------------------------------------------------
+    # Account
+    # --------------------------------------------------------
+
+    if not check_account_connection():
+
+        raise RuntimeError(
+            "account connection failed"
+        )
+
+    safe_sleep(1)
+
+    # --------------------------------------------------------
+    # Position recovery
+    # --------------------------------------------------------
+
+    recover_positions()
+
+    safe_sleep(1)
+
+    # --------------------------------------------------------
+    # Historical candles
+    # --------------------------------------------------------
+
+    if not initialize_candles():
+
+        raise RuntimeError(
+            "historical candle initialization failed"
+        )
+
+    # --------------------------------------------------------
+    # WebSockets
+    # --------------------------------------------------------
+
+    start_websockets()
+
+    # --------------------------------------------------------
+    # Watchdog
+    # --------------------------------------------------------
+
+    start_watchdog()
+
+    bot_live = True
+
+    last_time_sync = time.time()
+
+    logger.info(
+        "=================================================="
+    )
+
+    logger.info(
+        "🚀 BOT IS LIVE"
+    )
+
+    logger.info(
+        "Scanning %d symbols in %d WebSocket groups",
+        len(symbols),
+        (
+            len(symbols)
+            + GROUP_SIZE
+            - 1
+        ) // GROUP_SIZE
+    )
+
+    logger.info(
+        "=================================================="
+    )
+
+
+# ============================================================
+# BOT SUPERVISOR
+# ============================================================
+
+def bot_supervisor():
+
+    global bot_live
+
+    logger.info(
+        "BOT SUPERVISOR STARTED"
+    )
+
+    retry_delay = STARTUP_RETRY_MIN
+
+    while not shutdown_event.is_set():
+
+        try:
+
+            with state_lock:
+
+                currently_live = bot_live
+
+            # ------------------------------------------------
+            # First startup
+            # ------------------------------------------------
+
+            if not currently_live:
+
+                logger.info(
+                    "Bot is not live. "
+                    "Attempting startup..."
+                )
+
+                try:
+
+                    initialize_bot_once()
+
+                    retry_delay = (
+                        STARTUP_RETRY_MIN
+                    )
+
+                except Exception as e:
+
+                    bot_live = False
+
+                    logger.exception(
+                        "Bot startup failed: %s",
+                        e
+                    )
+
+                    logger.warning(
+                        "Bot will retry startup "
+                        "in %ss",
+                        retry_delay
+                    )
+
+                    safe_sleep(
+                        retry_delay
+                    )
+
+                    retry_delay = min(
+
+                        retry_delay * 2,
+
+                        STARTUP_RETRY_MAX
+                    )
+
+                    continue
+
+            # ------------------------------------------------
+            # Bot is live
+            # ------------------------------------------------
+
+            safe_sleep(10)
+
+        except Exception as e:
+
+            logger.exception(
+                "SUPERVISOR ERROR: %s",
+                e
             )
+
+            bot_live = False
+
+            safe_sleep(
+                STARTUP_RETRY_MIN
+            )
+
+    logger.info(
+        "BOT SUPERVISOR STOPPED"
+    )
+
+
+# ============================================================
+# START WATCHDOG
+# ============================================================
+
+def start_watchdog():
+
+    global watchdog_thread
+
+    with state_lock:
+
+        if (
+            watchdog_thread
+            and watchdog_thread.is_alive()
+        ):
 
             return
 
-        time.sleep(1)
+        watchdog_thread = threading.Thread(
 
-        # ----------------------------------------------------
-        # TOP SYMBOLS
-        # ----------------------------------------------------
+            target=websocket_watchdog,
 
-        if not load_top_symbols():
+            daemon=True,
 
-            logger.error(
-                "BOT STOPPED: symbol selection failed"
-            )
+            name="WS-WATCHDOG"
+        )
+
+        watchdog_thread.start()
+
+    logger.info(
+        "WebSocket watchdog started"
+    )
+
+
+# ============================================================
+# BOT START
+# ============================================================
+
+def start_bot_background():
+
+    global bot_started
+
+    with startup_lock:
+
+        if bot_started:
 
             return
 
-        # ----------------------------------------------------
-        # ACCOUNT
-        # ----------------------------------------------------
+        bot_started = True
 
-        if not check_account_connection():
+    thread = threading.Thread(
 
-            logger.error(
-                "BOT STOPPED: account connection failed"
-            )
+        target=bot_supervisor,
 
-            return
+        daemon=True,
 
-        time.sleep(1)
+        name="BOT-SUPERVISOR"
+    )
 
-        # ----------------------------------------------------
-        # RECOVERY
-        # ----------------------------------------------------
+    thread.start()
 
-        recover_positions()
+    logger.info(
+        "Bot supervisor background thread started"
+    )
 
-        time.sleep(1)
 
-        # ----------------------------------------------------
-        # HISTORICAL CANDLES
-        # ----------------------------------------------------
+# ============================================================
+# SHUTDOWN HANDLER
+# ============================================================
 
-        if not initialize_candles():
+def handle_shutdown(
+    signum,
+    frame
+):
 
-            logger.error(
-                "BOT STOPPED: historical candle "
-                "initialization failed"
-            )
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # We DO NOT ignore SIGTERM.
+    #
+    # Render/Gunicorn may intentionally send SIGTERM during
+    # deployment/restart.
+    #
+    # Python cannot safely keep the process alive after Render
+    # decides to terminate the container.
+    #
+    # We only perform graceful cleanup here.
+    # --------------------------------------------------------
 
-            return
+    logger.warning(
+        "Received shutdown signal: %s",
+        signum
+    )
 
-        # ----------------------------------------------------
-        # WEBSOCKETS
-        # ----------------------------------------------------
+    shutdown_event.set()
 
-        start_websockets()
+    with state_lock:
 
-        bot_live = True
+        bot_live = False
 
-        logger.info(
-            "=================================================="
+        websocket_objects = list(
+            ws_objects.values()
         )
 
-        logger.info(
-            "🚀 BOT IS LIVE"
-        )
+    # Close WebSockets
+    for ws in websocket_objects:
 
-        logger.info(
-            "Scanning %d symbols in %d WebSocket groups",
-            len(symbols),
-            (
-                len(symbols)
-                + GROUP_SIZE
-                - 1
-            ) // GROUP_SIZE
-        )
+        try:
 
-        logger.info(
-            "=================================================="
-        )
+            ws.close()
 
-    except Exception as e:
+        except Exception:
 
-        logger.exception(
-            "BOT STARTUP ERROR: %s",
-            e
-        )
+            pass
+
+    logger.warning(
+        "Graceful shutdown initiated"
+    )
+
+
+# ============================================================
+# SIGNAL REGISTRATION
+# ============================================================
+
+try:
+
+    signal.signal(
+        signal.SIGTERM,
+        handle_shutdown
+    )
+
+    signal.signal(
+        signal.SIGINT,
+        handle_shutdown
+    )
+
+except Exception as e:
+
+    logger.warning(
+        "Signal handler registration failed: %s",
+        e
+    )
 
 
 # ============================================================
@@ -2518,14 +3646,34 @@ def home():
                 f"{STOP_LOSS_PERCENT}%"
             ),
 
-            "dry_run": DRY_RUN
+            "dry_run": DRY_RUN,
+
+            "websocket_groups": len(
+                ws_thread_map
+            ),
+
+            "reserved_usdt": fmt_decimal(
+                reserved_usdt
+            )
         })
 
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.route("/health")
 def health():
 
     with state_lock:
+
+        alive_groups = 0
+
+        for thread in ws_thread_map.values():
+
+            if thread.is_alive():
+
+                alive_groups += 1
 
         return jsonify({
 
@@ -2538,7 +3686,13 @@ def health():
             "positions": len(positions),
 
             "websocket_groups": len(
-                ws_threads
+                ws_thread_map
+            ),
+
+            "websocket_alive": alive_groups,
+
+            "reserved_usdt": fmt_decimal(
+                reserved_usdt
             ),
 
             "timestamp": int(
@@ -2546,6 +3700,10 @@ def health():
             )
         })
 
+
+# ============================================================
+# POSITIONS
+# ============================================================
 
 @app.route("/positions")
 def get_positions():
@@ -2577,6 +3735,13 @@ def get_positions():
                         "stop_price",
                         "0"
                     )
+                ),
+
+                "recovered": bool(
+                    position.get(
+                        "recovered",
+                        False
+                    )
                 )
             }
 
@@ -2584,32 +3749,25 @@ def get_positions():
 
 
 # ============================================================
-# GUNICORN / RENDER START
+# MAIN
 # ============================================================
-
-def start_bot_background():
-
-    thread = threading.Thread(
-        target=start_bot,
-        daemon=True,
-        name="BOT-MAIN"
-    )
-
-    thread.start()
-
 
 if __name__ == "__main__":
 
     start_bot_background()
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
             os.getenv(
                 "PORT",
                 "10000"
             )
-        )
+        ),
+
+        threaded=True
     )
 
 else:
